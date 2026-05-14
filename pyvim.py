@@ -229,117 +229,110 @@ def _is_markdown(filename):
     return bool(filename and filename.rsplit('.',1)[-1].lower() in ('md','markdown','mkd'))
 
 # ── Markdown rich-text rendering ─────────────────────────────────────────────
-# Cursor line always shows raw markdown (so editing column positions are exact).
-# Every other line is "rendered": syntax markers are dimmed, content is styled.
-# Fenced code blocks maintain state across lines.
+# Returns (visual_line, spans) per row — markers are physically removed from
+# visual_line so the terminal shows rendered text. Caller passes raw line for
+# cursor row and visual-selected rows (no mismatch with buffer col positions).
 
 _md_cache: dict = {}
 
-def _md_highlight(buf, cursor_row=-1):
-    key = (id(buf), buf._gen, cursor_row)
+def _md_highlight(buf):
+    key = (id(buf), buf._gen)
     if key in _md_cache: return _md_cache[key]
     stale = [k for k in _md_cache if k[0] == id(buf)]
     for k in stale: del _md_cache[k]
     if len(_md_cache) > 20: _md_cache.clear()
 
-    # Defer curses attr resolution to draw time — store (pair_idx, extra) tuples.
-    DIM   = (11, 1048576)   # pair 11 + A_DIM  (1048576 == curses.A_DIM)
-    BOLD  = (0,  2097152)   # pair 0  + A_BOLD
-    ITAL  = (0,  131072)    # pair 0  + A_UNDERLINE
-    CODE  = (10, 0)         # green — inline code
-    HEAD  = (9,  2097152)   # yellow bold — headings
-    QUOTE = (11, 0)         # dim white — blockquotes
-    LINK  = (13, 0)         # cyan — link text
-    FENCE = (14, 0)         # blue — fenced code block content
-    MDIM  = (11, 1048576)   # marker dim (same as DIM)
+    # (pair_idx, extra_attr) — resolved to curses attrs at draw time
+    DIM   = (11, curses.A_DIM)
+    BOLD  = (0,  curses.A_BOLD)
+    ITAL  = (0,  curses.A_UNDERLINE)
+    CODE  = (10, 0)
+    HEAD  = (9,  curses.A_BOLD)
+    QUOTE = (11, 0)
+    LINK  = (13, 0)
+    FENCE = (14, 0)
 
-    # Inline patterns: (compiled_re, open_marker_len, close_marker_len, content_style)
-    # close_marker_len=None means pattern handles its own end (links)
-    INLINE = [
-        (re.compile(r'\*\*(.+?)\*\*'), 2, 2, BOLD),
-        (re.compile(r'__(.+?)__'),      2, 2, BOLD),
-        (re.compile(r'\*([^*\n]+)\*'),  1, 1, ITAL),
-        (re.compile(r'_([^_\n]+)_'),    1, 1, ITAL),
-        (re.compile(r'`([^`]+)`'),      1, 1, CODE),
-        (re.compile(r'~~(.+?)~~'),      2, 2, DIM),
-    ]
     LINK_RE = re.compile(r'\[([^\]\n]+)\]\(([^)\n]*)\)')
+    INLINE  = [
+        (re.compile(r'\*\*(.+?)\*\*'),           2, 2, BOLD),
+        (re.compile(r'__(.+?)__'),               2, 2, BOLD),
+        (re.compile(r'(?<!\*)\*([^*\n]+)\*(?!\*)'), 1, 1, ITAL),
+        (re.compile(r'(?<!_)_([^_\n]+)_(?!_)'), 1, 1, ITAL),
+        (re.compile(r'`([^`\n]+)`'),             1, 1, CODE),
+        (re.compile(r'~~(.+?)~~'),               2, 2, DIM),
+    ]
 
-    by_row = []
+    by_row = []  # list of (visual_line, spans_in_visual_coords)
     in_fence = False
 
-    for row, line in enumerate(buf.lines):
-        # Fence-boundary detection runs even on the cursor line (state must stay correct)
-        is_fence_marker = bool(re.match(r'^(`{3,}|~{3,})', line))
-        if is_fence_marker:
+    for line in buf.lines:
+        # ── fence boundary ───────────────────────────────────────────────────
+        is_fence = bool(re.match(r'^(`{3,}|~{3,})', line))
+        if is_fence:
             in_fence = not in_fence
-
-        if row == cursor_row:
-            by_row.append([])   # raw line — no styling so editing feels like plain text
-            continue
-
-        spans = []
-
-        if is_fence_marker:
-            spans.append((0, len(line), MDIM))
-            by_row.append(spans); continue
+            by_row.append((line, [(0, len(line), DIM)])); continue
 
         if in_fence:
-            spans.append((0, len(line), FENCE))
-            by_row.append(spans); continue
+            by_row.append((line, [(0, len(line), FENCE)])); continue
 
-        # ATX headings: # / ## / ### etc.
-        hm = re.match(r'^(#{1,6})(\s)', line)
+        # ── ATX heading ──────────────────────────────────────────────────────
+        hm = re.match(r'^(#{1,6})\s+', line)
         if hm:
-            spans.append((0, len(hm.group(1)), MDIM))
-            spans.append((len(hm.group(1)), len(line), HEAD))
-            by_row.append(spans); continue
+            vis = line[hm.end():]          # strip leading "## "
+            by_row.append((vis, [(0, len(vis), HEAD)])); continue
 
-        # Horizontal rules
-        if re.match(r'^(\s*[-*_]){3,}\s*$', line):
-            ruler = '─' * len(line)
-            spans.append((0, len(line), (11, 131072)))  # A_UNDERLINE
-            by_row.append(spans); continue
+        # ── horizontal rule ──────────────────────────────────────────────────
+        if re.match(r'^(\s*[-*_]\s*){3,}\s*$', line) and line.strip():
+            vis = '─' * max(len(line), 3)
+            by_row.append((vis, [(0, len(vis), (11, curses.A_UNDERLINE))])); continue
 
-        # Blockquotes
-        if re.match(r'^>+', line):
-            m = re.match(r'^(>+\s?)', line)
-            spans.append((0, len(m.group(1)), MDIM))
-            spans.append((len(m.group(1)), len(line), QUOTE))
-            by_row.append(spans); continue
+        # ── blockquote ───────────────────────────────────────────────────────
+        bm = re.match(r'^(>+\s?)', line)
+        if bm:
+            vis = '│ ' + line[bm.end():]
+            by_row.append((vis, [(0, 2, DIM), (2, len(vis), QUOTE)])); continue
 
-        # Inline patterns — track covered ranges to avoid double-styling
-        covered = [False] * len(line)
+        # ── inline concealment ───────────────────────────────────────────────
+        # Build replacement list: (buf_start, buf_end, vis_text, style|None)
+        repls = []
+        covered = set()
 
-        def add(s, e, style):
-            spans.append((s, e, style))
-            for i in range(s, e): covered[i] = True
+        def _claim(s, e, text, style):
+            repls.append((s, e, text, style))
+            covered.update(range(s, e))
 
-        def already(s, e):
-            return any(covered[i] for i in range(s, e))
-
-        # Links first (greedy, contain brackets which might fool italic)
+        # Links before italic (brackets would confuse * _ patterns)
         for m in LINK_RE.finditer(line):
-            if already(m.start(), m.end()): continue
-            add(m.start(),   m.start()+1,  MDIM)   # [
-            add(m.start(1),  m.end(1),     LINK)   # text
-            add(m.end(1),    m.end(),      MDIM)   # ](url)
+            if not covered.isdisjoint(range(m.start(), m.end())): continue
+            _claim(m.start(), m.end(), m.group(1), LINK)
 
-        # Inline bold/italic/code/strikethrough
         for pat, olen, clen, style in INLINE:
             for m in pat.finditer(line):
                 s, e = m.start(), m.end()
-                if already(s, e): continue
-                add(s,        s+olen,    MDIM)      # opening marker
-                add(s+olen,   e-clen,    style)     # content
-                add(e-clen,   e,         MDIM)      # closing marker
+                if not covered.isdisjoint(range(s, e)): continue
+                _claim(s, e, line[s+olen:e-clen], style)
 
-        # List bullet / ordered marker — dim just the marker
-        lm = re.match(r'^(\s*)([-*+]|\d+\.)(\s)', line)
-        if lm and not already(lm.start(2), lm.end(2)):
-            add(lm.start(2), lm.end(2), MDIM)
+        # List bullet: - / * / + → •
+        lm = re.match(r'^(\s*)([-*+])(\s)', line)
+        if lm:
+            bs, be = lm.start(2), lm.end(2)
+            if covered.isdisjoint(range(bs, be)):
+                _claim(bs, be, '•', None)
 
-        by_row.append(spans)
+        if not repls:
+            by_row.append((line, [])); continue
+
+        repls.sort(key=lambda r: r[0])
+        parts, spans, pos = [], [], 0
+        for bs, be, repl, style in repls:
+            if pos < bs: parts.append(line[pos:bs])
+            vs = sum(len(p) for p in parts)
+            if repl:
+                parts.append(repl)
+                if style: spans.append((vs, vs + len(repl), style))
+            pos = be
+        if pos < len(line): parts.append(line[pos:])
+        by_row.append((''.join(parts), spans))
 
     _md_cache[key] = by_row
     return by_row
@@ -494,12 +487,10 @@ class Editor:
                     elif r == er:    vis_range[r] = (0, ec)
                     else:            vis_range[r] = None
 
-        if _is_markdown(pane.buf.filename):
-            hl_table = _md_highlight(pane.buf, pane.cursor.row if is_active else -1)
-        elif _detect_lang(pane.buf.filename):
-            hl_table = _pg_highlight(pane.buf)
-        else:
-            hl_table = None
+        is_md = _is_markdown(pane.buf.filename)
+        md_table = _md_highlight(pane.buf) if is_md else None
+        hl_table = (None if is_md else
+                    _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
 
         try:
             spat = re.compile(self.search_pat,
@@ -524,8 +515,16 @@ class Editor:
                 self._as(scr_y, scr_x, ns, na)
 
             line = pane.buf.get_line(br)
-            hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
-            self._render_line(scr_y, scr_x + lnw, line, lc, tw,
+            if md_table:
+                # Reveal raw for cursor line and visually-selected lines —
+                # buffer col positions stay valid, no mapping needed.
+                raw = (is_active and br == pane.cursor.row) or br in vis_rows
+                display, hl_row = (line, []) if raw else (
+                    md_table[br] if br < len(md_table) else (line, []))
+            else:
+                display = line
+                hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
+            self._render_line(scr_y, scr_x + lnw, display, lc, tw,
                               vis_rows, vis_range, br, spat, hl_row, is_active)
 
     def _render_line(self, sy, sx, line, lc, tw, vis_rows, vis_range, br,
@@ -945,14 +944,10 @@ class Editor:
 
     def _goto_pane_dir(self, d):
         cur=self._pane; best=None; best_score=10**9
-        with open('/tmp/pyvim_nav.log','a') as _f:
-            _f.write(f"nav {d}: cur={self._pane_i} y={cur.y} h={cur.height} x={cur.x} w={cur.width} npanes={len(self._panes)}\n")
         for i, p in enumerate(self._panes):
             if p is cur: continue
             ov_h = p.y < cur.y+cur.height and p.y+p.height > cur.y
             ov_v = p.x < cur.x+cur.width  and p.x+p.width  > cur.x
-            with open('/tmp/pyvim_nav.log','a') as _f:
-                _f.write(f"  cand {i}: y={p.y} h={p.height} x={p.x} w={p.width} ov_h={ov_h} ov_v={ov_v}\n")
             if   d=='h' and p.x+p.width < cur.x and ov_h:
                 score = cur.x - (p.x+p.width)
             elif d=='l' and p.x > cur.x+cur.width and ov_h:
@@ -963,8 +958,6 @@ class Editor:
                 score = p.y - (cur.y+cur.height)
             else: continue
             if score < best_score: best_score=score; best=i
-        with open('/tmp/pyvim_nav.log','a') as _f:
-            _f.write(f"  -> best={best}\n")
         if best is not None: self._pane_i=best
 
     # ── Mode transitions ──────────────────────────────────────────────────────
