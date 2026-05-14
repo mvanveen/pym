@@ -1398,9 +1398,35 @@ class Editor:
         self._py_ns.update({'ed': self, 'buf': self.buf, 'pane': self._pane})
         return self._py_ns
 
+    def _seed_imports(self, buf):
+        """Run top-level import statements from buf into the eval namespace.
+
+        Called once per buffer (tracked by id+gen-at-seed). This means opening
+        any .py file and hitting Ctrl-E on any block Just Works — imports are
+        already available, same as if you'd run the file from scratch.
+        """
+        import ast
+        if not hasattr(self, '_seeded'):
+            self._seeded = {}
+        key = (id(buf), buf._gen)
+        if key in self._seeded:
+            return
+        self._seeded = {key: True}  # evict stale keys for other bufs
+
+        ns = self._eval_ns()
+        for line in buf.lines:
+            s = line.strip()
+            if not (s.startswith('import ') or s.startswith('from ')):
+                continue
+            try:
+                exec(compile(s, '<imports>', 'exec'), ns)
+            except Exception:
+                pass  # silently skip unresolvable imports
+
     def _eval_region(self, r1, r2):
         """Eval lines r1..r2 (inclusive), insert captured output after r2."""
         import io, contextlib, traceback
+        self._seed_imports(self.buf)
         code = '\n'.join(self.buf.get_line(r) for r in range(r1, r2+1))
         out = io.StringIO()
         try:
@@ -1422,6 +1448,7 @@ class Editor:
     def _py_repl(self):
         """Drop into an interactive Python REPL, then return to pyvim."""
         import code as _code
+        self._seed_imports(self.buf)
         curses.endwin()
         print(f'\n  pyvim REPL  —  locals: ed, buf, pane  —  Ctrl-D to return\n')
         _code.interact(local=self._eval_ns(), banner='')
