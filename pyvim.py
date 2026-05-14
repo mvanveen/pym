@@ -1022,6 +1022,7 @@ class Editor:
                 self.cursor.row,self.cursor.col=self.marks[chr(k2)]
         elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
         elif ch=='z': self._normal_z()
+        elif key==5:  self._eval_region(self.cursor.row, self.cursor.row)  # Ctrl-E
         elif key==23: self._ctrl_w()   # Ctrl-W
         elif key==26:                  # Ctrl-Z suspend
             import signal
@@ -1261,6 +1262,10 @@ class Editor:
             return
         if ch==':':
             self.mode=Mode.COMMAND; self.cmd_line=":'<,'>"; return
+        if key==5:   # Ctrl-E — eval selection
+            sr,sc=self.visual_start; er,ec=self.cursor.row,self.cursor.col
+            if (sr,sc)>(er,ec): sr,sc,er,ec=er,ec,sr,sc
+            self._eval_region(sr, er); self._enter_normal(); return
         if ch=='n': self._search_next(self.search_dir); return
         if ch=='N': self._search_next(-self.search_dir); return
         if self._vmove(key, count): return
@@ -1324,6 +1329,9 @@ class Editor:
             self.mode=Mode.COMMAND; self.cmd_line=":'<,'>"; return
         if ch=='n': self._search_next(self.search_dir); return
         if ch=='N': self._search_next(-self.search_dir); return
+        if key==5:   # Ctrl-E — eval selection (line-wise)
+            r1,r2=self._vis_lrange()
+            self._eval_region(r1, r2); self._enter_normal(); return
 
         # All motions (line-mode cares about row movement mainly)
         moved=self._vmove(key, count)
@@ -1381,9 +1389,70 @@ class Editor:
             else: self.mode=Mode.NORMAL; self.cmd_line=''
         elif 32<=key<=126: self.cmd_line+=chr(key)
 
+    # ── Python eval integration ───────────────────────────────────────────────
+
+    def _eval_ns(self):
+        """Return the persistent eval namespace, seeded with live editor refs."""
+        if not hasattr(self, '_py_ns'):
+            self._py_ns = {}
+        self._py_ns.update({'ed': self, 'buf': self.buf, 'pane': self._pane})
+        return self._py_ns
+
+    def _eval_region(self, r1, r2):
+        """Eval lines r1..r2 (inclusive), insert captured output after r2."""
+        import io, contextlib, traceback
+        code = '\n'.join(self.buf.get_line(r) for r in range(r1, r2+1))
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                exec(compile(code, '<pyvim>', 'exec'), self._eval_ns())
+            result = out.getvalue()
+            self.status_msg = 'eval ok'
+        except Exception:
+            result = traceback.format_exc()
+            self.status_err = True
+            self.status_msg = result.splitlines()[-1]
+        if result.strip():
+            self.buf.save_undo()
+            lines = result.rstrip('\n').splitlines()
+            for i, line in enumerate(lines):
+                self.buf.insert_line(r2 + 1 + i, '# >> ' + line)
+            self.cursor.row = r2 + 1
+
+    def _py_repl(self):
+        """Drop into an interactive Python REPL, then return to pyvim."""
+        import code as _code
+        curses.endwin()
+        print(f'\n  pyvim REPL  —  locals: ed, buf, pane  —  Ctrl-D to return\n')
+        _code.interact(local=self._eval_ns(), banner='')
+        self.stdscr.refresh()
+        self.status_msg = 'returned from REPL'
+
+    def _py_exec(self, expr):
+        """Eval a single expression from command line, show result in status."""
+        import io, contextlib, traceback
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                result = eval(compile(expr, '<cmd>', 'eval'), self._eval_ns())
+            self.status_msg = repr(result) if result is not None else (out.getvalue().rstrip() or 'ok')
+        except SyntaxError:
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                    exec(compile(expr, '<cmd>', 'exec'), self._eval_ns())
+                self.status_msg = out.getvalue().rstrip() or 'ok'
+            except Exception:
+                self.status_msg = traceback.format_exc().splitlines()[-1]; self.status_err = True
+        except Exception:
+            self.status_msg = traceback.format_exc().splitlines()[-1]; self.status_err = True
+
     def _exec_cmd(self, cmd):
         cmd=cmd.strip()
         if not cmd: return
+        if cmd in ('py','python'):
+            self._py_repl(); return
+        elif cmd.startswith('py ') or cmd.startswith('python '):
+            self._py_exec(cmd.split(None,1)[1]); return
         if cmd in ('qa','qall'):
             dirty=[p for p in self._panes if p.buf.modified]
             if dirty:
