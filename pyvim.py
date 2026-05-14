@@ -225,6 +225,125 @@ def _detect_lang(filename):
     except ClassNotFound:
         return None
 
+def _is_markdown(filename):
+    return bool(filename and filename.rsplit('.',1)[-1].lower() in ('md','markdown','mkd'))
+
+# ── Markdown rich-text rendering ─────────────────────────────────────────────
+# Cursor line always shows raw markdown (so editing column positions are exact).
+# Every other line is "rendered": syntax markers are dimmed, content is styled.
+# Fenced code blocks maintain state across lines.
+
+_md_cache: dict = {}
+
+def _md_highlight(buf, cursor_row=-1):
+    key = (id(buf), buf._gen, cursor_row)
+    if key in _md_cache: return _md_cache[key]
+    stale = [k for k in _md_cache if k[0] == id(buf)]
+    for k in stale: del _md_cache[k]
+    if len(_md_cache) > 20: _md_cache.clear()
+
+    # Defer curses attr resolution to draw time — store (pair_idx, extra) tuples.
+    DIM   = (11, 1048576)   # pair 11 + A_DIM  (1048576 == curses.A_DIM)
+    BOLD  = (0,  2097152)   # pair 0  + A_BOLD
+    ITAL  = (0,  131072)    # pair 0  + A_UNDERLINE
+    CODE  = (10, 0)         # green — inline code
+    HEAD  = (9,  2097152)   # yellow bold — headings
+    QUOTE = (11, 0)         # dim white — blockquotes
+    LINK  = (13, 0)         # cyan — link text
+    FENCE = (14, 0)         # blue — fenced code block content
+    MDIM  = (11, 1048576)   # marker dim (same as DIM)
+
+    # Inline patterns: (compiled_re, open_marker_len, close_marker_len, content_style)
+    # close_marker_len=None means pattern handles its own end (links)
+    INLINE = [
+        (re.compile(r'\*\*(.+?)\*\*'), 2, 2, BOLD),
+        (re.compile(r'__(.+?)__'),      2, 2, BOLD),
+        (re.compile(r'\*([^*\n]+)\*'),  1, 1, ITAL),
+        (re.compile(r'_([^_\n]+)_'),    1, 1, ITAL),
+        (re.compile(r'`([^`]+)`'),      1, 1, CODE),
+        (re.compile(r'~~(.+?)~~'),      2, 2, DIM),
+    ]
+    LINK_RE = re.compile(r'\[([^\]\n]+)\]\(([^)\n]*)\)')
+
+    by_row = []
+    in_fence = False
+
+    for row, line in enumerate(buf.lines):
+        # Fence-boundary detection runs even on the cursor line (state must stay correct)
+        is_fence_marker = bool(re.match(r'^(`{3,}|~{3,})', line))
+        if is_fence_marker:
+            in_fence = not in_fence
+
+        if row == cursor_row:
+            by_row.append([])   # raw line — no styling so editing feels like plain text
+            continue
+
+        spans = []
+
+        if is_fence_marker:
+            spans.append((0, len(line), MDIM))
+            by_row.append(spans); continue
+
+        if in_fence:
+            spans.append((0, len(line), FENCE))
+            by_row.append(spans); continue
+
+        # ATX headings: # / ## / ### etc.
+        hm = re.match(r'^(#{1,6})(\s)', line)
+        if hm:
+            spans.append((0, len(hm.group(1)), MDIM))
+            spans.append((len(hm.group(1)), len(line), HEAD))
+            by_row.append(spans); continue
+
+        # Horizontal rules
+        if re.match(r'^(\s*[-*_]){3,}\s*$', line):
+            ruler = '─' * len(line)
+            spans.append((0, len(line), (11, 131072)))  # A_UNDERLINE
+            by_row.append(spans); continue
+
+        # Blockquotes
+        if re.match(r'^>+', line):
+            m = re.match(r'^(>+\s?)', line)
+            spans.append((0, len(m.group(1)), MDIM))
+            spans.append((len(m.group(1)), len(line), QUOTE))
+            by_row.append(spans); continue
+
+        # Inline patterns — track covered ranges to avoid double-styling
+        covered = [False] * len(line)
+
+        def add(s, e, style):
+            spans.append((s, e, style))
+            for i in range(s, e): covered[i] = True
+
+        def already(s, e):
+            return any(covered[i] for i in range(s, e))
+
+        # Links first (greedy, contain brackets which might fool italic)
+        for m in LINK_RE.finditer(line):
+            if already(m.start(), m.end()): continue
+            add(m.start(),   m.start()+1,  MDIM)   # [
+            add(m.start(1),  m.end(1),     LINK)   # text
+            add(m.end(1),    m.end(),      MDIM)   # ](url)
+
+        # Inline bold/italic/code/strikethrough
+        for pat, olen, clen, style in INLINE:
+            for m in pat.finditer(line):
+                s, e = m.start(), m.end()
+                if already(s, e): continue
+                add(s,        s+olen,    MDIM)      # opening marker
+                add(s+olen,   e-clen,    style)     # content
+                add(e-clen,   e,         MDIM)      # closing marker
+
+        # List bullet / ordered marker — dim just the marker
+        lm = re.match(r'^(\s*)([-*+]|\d+\.)(\s)', line)
+        if lm and not already(lm.start(2), lm.end(2)):
+            add(lm.start(2), lm.end(2), MDIM)
+
+        by_row.append(spans)
+
+    _md_cache[key] = by_row
+    return by_row
+
 # ── Editor ───────────────────────────────────────────────────────────────────
 
 class Editor:
@@ -375,7 +494,12 @@ class Editor:
                     elif r == er:    vis_range[r] = (0, ec)
                     else:            vis_range[r] = None
 
-        hl_table = _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None
+        if _is_markdown(pane.buf.filename):
+            hl_table = _md_highlight(pane.buf, pane.cursor.row if is_active else -1)
+        elif _detect_lang(pane.buf.filename):
+            hl_table = _pg_highlight(pane.buf)
+        else:
+            hl_table = None
 
         try:
             spat = re.compile(self.search_pat,
