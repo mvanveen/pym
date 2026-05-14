@@ -1398,35 +1398,95 @@ class Editor:
         self._py_ns.update({'ed': self, 'buf': self.buf, 'pane': self._pane})
         return self._py_ns
 
-    def _seed_imports(self, buf):
-        """Run top-level import statements from buf into the eval namespace.
+    def _resolve_deps(self, r1, r2):
+        """Return statements needed before running lines r1..r2.
 
-        Called once per buffer (tracked by id+gen-at-seed). This means opening
-        any .py file and hitting Ctrl-E on any block Just Works — imports are
-        already available, same as if you'd run the file from scratch.
+        Parses the selection to find free variable names, then walks the
+        file's top-level AST to find the imports and definitions that supply
+        them. Returns a list of source strings to exec in order, skipping
+        anything already present in the eval namespace.
         """
         import ast
-        if not hasattr(self, '_seeded'):
-            self._seeded = {}
-        key = (id(buf), buf._gen)
-        if key in self._seeded:
-            return
-        self._seeded = {key: True}  # evict stale keys for other bufs
-
         ns = self._eval_ns()
-        for line in buf.lines:
-            s = line.strip()
-            if not (s.startswith('import ') or s.startswith('from ')):
+        builtins = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
+
+        # 1. Find names the selection uses but doesn't define locally.
+        sel_src = '\n'.join(self.buf.get_line(r) for r in range(r1, r2+1))
+        try:
+            sel_tree = ast.parse(sel_src)
+        except SyntaxError:
+            return []
+
+        used = set()
+        for node in ast.walk(sel_tree):
+            if isinstance(node, ast.Name):
+                used.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                # dotted access: collect root name (random.gauss → random)
+                n = node
+                while isinstance(n, ast.Attribute): n = n.value
+                if isinstance(n, ast.Name): used.add(n.id)
+
+        local_defs = set()
+        for node in ast.walk(sel_tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                local_defs.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name): local_defs.add(t.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for a in node.names:
+                    local_defs.add(a.asname or a.name.split('.')[0])
+
+        free = used - local_defs - builtins - set(ns)
+        if not free:
+            return []
+
+        # 2. Walk the file's top-level nodes to find what supplies each free name.
+        full_src = '\n'.join(self.buf.lines)
+        try:
+            full_tree = ast.parse(full_src)
+        except SyntaxError:
+            return []
+
+        deps = []
+        seen_names = set()
+        for node in ast.iter_child_nodes(full_tree):
+            node_r1 = node.lineno - 1  # convert to 0-indexed
+            if node_r1 >= r1:          # don't look at or past the selection
                 continue
-            try:
-                exec(compile(s, '<imports>', 'exec'), ns)
-            except Exception:
-                pass  # silently skip unresolvable imports
+
+            provided = set()
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    provided.add(a.asname or a.name.split('.')[0])
+            elif isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    provided.add(a.asname or (a.name if a.name != '*' else ''))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                provided.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name): provided.add(t.id)
+
+            needed = provided & free - seen_names
+            if needed:
+                end = getattr(node, 'end_lineno', node.lineno) - 1
+                src = '\n'.join(self.buf.lines[node_r1:end+1])
+                deps.append(src)
+                seen_names |= needed
+
+        return deps
 
     def _eval_region(self, r1, r2):
         """Eval lines r1..r2 (inclusive), insert captured output after r2."""
         import io, contextlib, traceback
-        self._seed_imports(self.buf)
+        ns = self._eval_ns()
+        for dep in self._resolve_deps(r1, r2):
+            try:
+                exec(compile(dep, '<dep>', 'exec'), ns)
+            except Exception:
+                pass
         code = '\n'.join(self.buf.get_line(r) for r in range(r1, r2+1))
         out = io.StringIO()
         try:
@@ -1445,10 +1505,30 @@ class Editor:
                 self.buf.insert_line(r2 + 1 + i, '# >> ' + line)
             self.cursor.row = r2 + 1
 
+    def _exec_file_toplevel(self):
+        """Run every top-level statement in the current buffer into _py_ns.
+        Used to pre-populate the REPL so all imports and defs are available.
+        """
+        import ast
+        ns = self._eval_ns()
+        full_src = '\n'.join(self.buf.lines)
+        try:
+            full_tree = ast.parse(full_src)
+        except SyntaxError:
+            return
+        for node in ast.iter_child_nodes(full_tree):
+            r1 = node.lineno - 1
+            end = getattr(node, 'end_lineno', node.lineno) - 1
+            src = '\n'.join(self.buf.lines[r1:end+1])
+            try:
+                exec(compile(src, '<toplevel>', 'exec'), ns)
+            except Exception:
+                pass
+
     def _py_repl(self):
         """Drop into an interactive Python REPL, then return to pyvim."""
         import code as _code
-        self._seed_imports(self.buf)
+        self._exec_file_toplevel()
         curses.endwin()
         print(f'\n  pyvim REPL  —  locals: ed, buf, pane  —  Ctrl-D to return\n')
         _code.interact(local=self._eval_ns(), banner='')
