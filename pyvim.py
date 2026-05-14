@@ -1398,6 +1398,21 @@ class Editor:
         self._py_ns.update({'ed': self, 'buf': self.buf, 'pane': self._pane})
         return self._py_ns
 
+    @staticmethod
+    def _buf_is_python(buf):
+        """True if the buffer looks like Python — .py extension or valid ast.parse."""
+        import ast
+        if buf.filename and buf.filename.endswith(('.py', '.pyw')):
+            return True
+        if buf.filename:
+            return False  # named non-Python file — don't even try
+        # Unnamed buffer: try parsing first non-blank lines as a heuristic
+        sample = '\n'.join(l for l in buf.lines[:20] if l.strip())
+        try:
+            ast.parse(sample); return True
+        except SyntaxError:
+            return False
+
     def _resolve_deps(self, r1, r2):
         """Return statements needed before running lines r1..r2.
 
@@ -1407,6 +1422,8 @@ class Editor:
         anything already present in the eval namespace.
         """
         import ast
+        if not self._buf_is_python(self.buf):
+            return []
         ns = self._eval_ns()
         builtins = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
 
@@ -1510,6 +1527,8 @@ class Editor:
         Used to pre-populate the REPL so all imports and defs are available.
         """
         import ast
+        if not self._buf_is_python(self.buf):
+            return
         ns = self._eval_ns()
         full_src = '\n'.join(self.buf.lines)
         try:
