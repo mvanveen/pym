@@ -31,6 +31,7 @@ class Buffer:
         self.filename = None
         self.modified = False
         self._undo = []; self._redo = []
+        self._gen = 0  # incremented on every mutation; used as highlight cache key
 
     def save_undo(self):
         self._undo.append(copy.deepcopy(self.lines))
@@ -40,48 +41,48 @@ class Buffer:
     def undo(self):
         if not self._undo: return False
         self._redo.append(copy.deepcopy(self.lines))
-        self.lines = self._undo.pop(); self.modified = True; return True
+        self.lines = self._undo.pop(); self.modified = True; self._gen += 1; return True
 
     def redo(self):
         if not self._redo: return False
         self._undo.append(copy.deepcopy(self.lines))
-        self.lines = self._redo.pop(); self.modified = True; return True
+        self.lines = self._redo.pop(); self.modified = True; self._gen += 1; return True
 
     def line_count(self): return len(self.lines)
     def get_line(self, r): return self.lines[r] if 0 <= r < len(self.lines) else ''
 
     def set_line(self, r, t):
-        if 0 <= r < len(self.lines): self.lines[r] = t; self.modified = True
+        if 0 <= r < len(self.lines): self.lines[r] = t; self.modified = True; self._gen += 1
 
     def insert_line(self, r, t=''):
-        self.lines.insert(max(0, min(r, len(self.lines))), t); self.modified = True
+        self.lines.insert(max(0, min(r, len(self.lines))), t); self.modified = True; self._gen += 1
 
     def delete_line(self, r):
         if 0 <= r < len(self.lines):
             l = self.lines.pop(r)
             if not self.lines: self.lines = ['']
-            self.modified = True; return l
+            self.modified = True; self._gen += 1; return l
         return ''
 
     def insert_char(self, r, c, ch):
         if 0 <= r < len(self.lines):
-            s = self.lines[r]; self.lines[r] = s[:c] + ch + s[c:]; self.modified = True
+            s = self.lines[r]; self.lines[r] = s[:c] + ch + s[c:]; self.modified = True; self._gen += 1
 
     def delete_char(self, r, c):
         if 0 <= r < len(self.lines):
             s = self.lines[r]
             if 0 <= c < len(s):
-                self.lines[r] = s[:c] + s[c+1:]; self.modified = True; return s[c]
+                self.lines[r] = s[:c] + s[c+1:]; self.modified = True; self._gen += 1; return s[c]
         return ''
 
     def split_line(self, r, c):
         if 0 <= r < len(self.lines):
             s = self.lines[r]; self.lines[r] = s[:c]
-            self.lines.insert(r+1, s[c:]); self.modified = True
+            self.lines.insert(r+1, s[c:]); self.modified = True; self._gen += 1
 
     def join_lines(self, r):
         if 0 <= r < len(self.lines)-1:
-            self.lines[r] += self.lines[r+1]; self.lines.pop(r+1); self.modified = True
+            self.lines[r] += self.lines[r+1]; self.lines.pop(r+1); self.modified = True; self._gen += 1
 
     @classmethod
     def from_file(cls, filename):
@@ -152,222 +153,77 @@ def _lc_close(node, target):
     if nb is None: return na
     n = copy.copy(node); n.a = na; n.b = nb; return n
 
-# ── Syntax highlighting ──────────────────────────────────────────────────────
+# ── Syntax highlighting (pygments) ───────────────────────────────────────────
 
-_KW='kw'; _ST='st'; _CM='cm'; _NM='nm'; _TY='ty'; _BL='bl'; _DC='dc'; _SP='sp'
+from pygments import lex
+from pygments.lexers import get_lexer_for_filename, guess_lexer, get_lexer_by_name
+from pygments.lexers import TextLexer
+from pygments.token import Token
+from pygments.util import ClassNotFound
 
-def _kw(*w): return (r'\b(?:' + '|'.join(re.escape(x) for x in w) + r')\b', _KW)
-def _bl(*w): return (r'\b(?:' + '|'.join(re.escape(x) for x in w) + r')\b', _BL)
+# pygments ttype → (color_pair_index, extra_attr)
+# Color pairs 9-15 are initialized in Editor.__init__ to match the old scheme.
+def _pg_attr(ttype):
+    if ttype in Token.Keyword:                             return (9,  curses.A_BOLD)
+    if ttype in Token.Literal.String or ttype in Token.String: return (10, 0)
+    if ttype in Token.Comment:                             return (11, curses.A_DIM)
+    if ttype in Token.Literal.Number or ttype in Token.Number: return (12, 0)
+    if ttype in Token.Name.Class or ttype in Token.Name.Exception \
+            or ttype in Token.Name.Namespace:              return (13, 0)
+    if ttype in Token.Name.Function:                       return (13, 0)
+    if ttype in Token.Name.Builtin:                        return (14, 0)
+    if ttype in Token.Name.Decorator:                      return (15, curses.A_BOLD)
+    if ttype in Token.Operator.Word:                       return (9,  0)
+    return None
 
-SYNTAX = {
-  'python': [
-    (r'#.*$', _CM),
-    (r'"""[\s\S]*?"""', _ST), (r"'''[\s\S]*?'''", _ST),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    _kw('False','None','True','and','as','assert','async','await','break',
-        'class','continue','def','del','elif','else','except','finally',
-        'for','from','global','if','import','in','is','lambda','nonlocal',
-        'not','or','pass','raise','return','try','while','with','yield'),
-    _bl('abs','all','any','bin','bool','bytes','callable','chr','dict',
-        'dir','enumerate','eval','exec','filter','float','format',
-        'frozenset','getattr','globals','hasattr','hash','hex','id',
-        'input','int','isinstance','issubclass','iter','len','list',
-        'locals','map','max','min','next','object','oct','open','ord',
-        'pow','print','property','range','repr','reversed','round','set',
-        'setattr','slice','sorted','staticmethod','str','sum','super',
-        'tuple','type','vars','zip','self','cls'),
-    (r'@\w+', _DC),
-    (r'\b0x[0-9a-fA-F]+\b', _NM), (r'\b\d+\.?\d*[jJ]?\b', _NM),
-  ],
-  'js': [
-    (r'//.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r'`(?:[^`\\]|\\.)*`', _ST),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    _kw('break','case','catch','class','const','continue','debugger',
-        'default','delete','do','else','export','extends','finally',
-        'for','function','if','import','in','instanceof','let','new',
-        'of','return','static','super','switch','this','throw','try',
-        'typeof','var','void','while','with','yield','async','await',
-        'from','as','true','false','null','undefined'),
-    _bl('console','document','window','Array','Object','String','Number',
-        'Boolean','Promise','Map','Set','Math','JSON','Date','Error',
-        'parseInt','parseFloat','isNaN','setTimeout','setInterval',
-        'clearTimeout','clearInterval','fetch','require','module',
-        'exports','process','Symbol','RegExp'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'c': [
-    (r'//.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    (r'#\s*\w+', _DC),
-    _kw('auto','break','case','char','const','continue','default','do',
-        'double','else','enum','extern','float','for','goto','if',
-        'inline','int','long','register','restrict','return','short',
-        'signed','sizeof','static','struct','switch','typedef','union',
-        'unsigned','void','volatile','while','NULL','nullptr',
-        'true','false'),
-    (r'\b0x[0-9a-fA-F]+[uUlL]*\b', _NM), (r'\b\d+\.?\d*[uUlLfF]*\b', _NM),
-  ],
-  'go': [
-    (r'//.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r'`[^`]*`', _ST), (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    _kw('break','case','chan','const','continue','default','defer','else',
-        'fallthrough','for','func','go','goto','if','import','interface',
-        'map','package','range','return','select','struct','switch','type',
-        'var','true','false','nil','iota'),
-    _bl('append','cap','close','complex','copy','delete','imag','len',
-        'make','new','panic','print','println','real','recover',
-        'bool','byte','complex64','complex128','error','float32','float64',
-        'int','int8','int16','int32','int64','rune','string',
-        'uint','uint8','uint16','uint32','uint64','uintptr'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'rust': [
-    (r'//.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'[^'\\]'", _ST),
-    (r'#!?\[[\s\S]*?\]', _DC),
-    _kw('as','break','const','continue','crate','dyn','else','enum',
-        'extern','fn','for','if','impl','in','let','loop','match',
-        'mod','move','mut','pub','ref','return','self','Self','static',
-        'struct','super','trait','true','false','type','unsafe','use',
-        'where','while','async','await'),
-    _bl('bool','char','f32','f64','i8','i16','i32','i64','i128','isize',
-        'str','u8','u16','u32','u64','u128','usize','Box','String','Vec',
-        'Option','Result','Some','None','Ok','Err','println','print',
-        'eprintln','panic','assert','assert_eq','todo','unreachable',
-        'dbg','format','vec'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'sh': [
-    (r'#.*$', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'[^']*'", _ST),
-    _kw('if','then','else','elif','fi','for','while','do','done',
-        'case','esac','in','function','return','local','export',
-        'readonly','declare','unset','shift','source','true','false',
-        'exit','break','continue'),
-    _bl('echo','printf','read','cd','ls','grep','sed','awk','find',
-        'cat','rm','mv','cp','mkdir','chmod','chown','curl','wget',
-        'git','make','test','eval','exec'),
-    (r'\$\{?[\w@#?*!-]+\}?', _DC),
-    (r'\b\d+\b', _NM),
-  ],
-  'json': [
-    (r'"(?:[^"\\]|\\.)*"\s*:', _KW),
-    (r'"(?:[^"\\]|\\.)*"', _ST),
-    (r'\b(?:true|false|null)\b', _BL),
-    (r'-?\b\d+\.?\d*(?:[eE][+-]?\d+)?\b', _NM),
-  ],
-  'html': [
-    (r'<!--[\s\S]*?-->', _CM),
-    (r'</?!?\w[\w.-]*', _KW), (r'/?>',  _KW),
-    (r'"[^"]*"', _ST), (r"'[^']*'", _ST),
-    (r'&[a-zA-Z#\d]+;', _SP),
-  ],
-  'css': [
-    (r'/\*[\s\S]*?\*/', _CM),
-    (r'"[^"]*"', _ST), (r"'[^']*'", _ST),
-    (r'@\w[\w-]*', _DC),
-    (r'#[0-9a-fA-F]{3,8}\b', _NM),
-    (r'\b\d+\.?\d*(?:px|em|rem|vh|vw|%|pt|ex|ch|vmin|vmax)?\b', _NM),
-    (r'[.#:][\w-]+', _KW),
-  ],
-  'markdown': [
-    (r'^#{1,6} .*$', _KW),
-    (r'\*\*[^*]+\*\*', _TY), (r'\*[^*\n]+\*', _ST),
-    (r'`[^`]+`', _BL),
-    (r'^>.*$', _CM),
-    (r'^\s*[-*+] ', _SP), (r'^\s*\d+\. ', _SP),
-    (r'\[[^\]]+\]\([^)]+\)', _DC),
-  ],
-  'yaml': [
-    (r'#.*$', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'[^']*'", _ST),
-    (r'^[ \t]*[\w][\w\s]*\s*:', _KW),
-    (r'\b(?:true|false|null|yes|no|on|off)\b', _BL),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'toml': [
-    (r'#.*$', _CM),
-    (r'"""[\s\S]*?"""', _ST), (r'"(?:[^"\\]|\\.)*"', _ST),
-    (r"'''[^']*'''", _ST), (r"'[^']*'", _ST),
-    (r'^\[[\w."\' ]+\]', _KW),
-    (r'\b(?:true|false)\b', _BL), (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'sql': [
-    (r'--.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r"'(?:[^'\\]|\\.)*'", _ST), (r'"(?:[^"\\]|\\.)*"', _ST),
-    _kw('SELECT','FROM','WHERE','JOIN','LEFT','RIGHT','INNER','OUTER','FULL',
-        'ON','AS','AND','OR','NOT','IN','IS','NULL','LIKE','BETWEEN',
-        'ORDER','BY','GROUP','HAVING','LIMIT','OFFSET','UNION','ALL',
-        'DISTINCT','INSERT','INTO','VALUES','UPDATE','SET','DELETE',
-        'CREATE','TABLE','ALTER','DROP','INDEX','VIEW','WITH','CASE',
-        'WHEN','THEN','ELSE','END','COUNT','SUM','AVG','MIN','MAX',
-        'OVER','PARTITION','ROWS','RANGE','CAST','COALESCE','EXISTS',
-        'select','from','where','join','left','right','inner','outer',
-        'on','as','and','or','not','in','is','null','like','between',
-        'order','by','group','having','limit','offset','union','all',
-        'distinct','insert','into','values','update','set','delete',
-        'create','table','alter','drop','index','view','with','case',
-        'when','then','else','end','count','sum','avg','min','max'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'lua': [
-    (r'--\[\[[\s\S]*?\]\]', _CM), (r'--.*$', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    (r'\[\[[\s\S]*?\]\]', _ST),
-    _kw('and','break','do','else','elseif','end','false','for',
-        'function','goto','if','in','local','nil','not','or',
-        'repeat','return','then','true','until','while'),
-    _bl('assert','error','ipairs','load','next','pairs','pcall',
-        'print','rawget','rawset','require','select','setmetatable',
-        'tonumber','tostring','type','xpcall',
-        'io','os','math','string','table','coroutine'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-}
-SYNTAX['ts']  = SYNTAX['js']
-SYNTAX['cpp'] = SYNTAX['c']
-SYNTAX['jsx'] = SYNTAX['js']
-SYNTAX['tsx'] = SYNTAX['ts']
-SYNTAX['bash'] = SYNTAX['zsh'] = SYNTAX['sh']
-SYNTAX['htm'] = SYNTAX['html']
+# (id(buf), gen) → list[list[(start, end, curses_attr)]] indexed by row
+_pg_cache: dict = {}
 
-EXTS = {
-  'py':'python','pyw':'python',
-  'js':'js','jsx':'jsx','mjs':'js',
-  'ts':'ts','tsx':'tsx',
-  'c':'c','h':'c','cpp':'cpp','cc':'cpp','cxx':'cpp','hpp':'cpp','hh':'cpp',
-  'go':'go','rs':'rust','rb':'ruby','java':'java',
-  'sh':'sh','bash':'sh','zsh':'sh',
-  'json':'json','html':'html','htm':'htm','css':'css',
-  'md':'markdown','markdown':'markdown',
-  'yaml':'yaml','yml':'yaml','toml':'toml','sql':'sql','lua':'lua',
-}
+def _pg_highlight(buf):
+    key = (id(buf), buf._gen)
+    if key in _pg_cache:
+        return _pg_cache[key]
+    # Evict stale entries for this buffer (different gen)
+    stale = [k for k in _pg_cache if k[0] == id(buf)]
+    for k in stale: del _pg_cache[k]
+    # Cap total cache size
+    if len(_pg_cache) > 40:
+        _pg_cache.clear()
+
+    text = '\n'.join(buf.lines)
+    try:
+        if buf.filename:
+            lexer = get_lexer_for_filename(buf.filename, stripnl=False, ensurenl=False)
+        else:
+            lexer = guess_lexer(text[:2048], stripnl=False, ensurenl=False)
+    except ClassNotFound:
+        lexer = TextLexer()
+
+    # Build per-row span lists — store (start, end, (pair_idx, extra)) to defer
+    # curses.color_pair() until draw time (requires initscr to have been called).
+    by_row: list[list] = [[] for _ in buf.lines]
+    row = 0; col = 0
+    for ttype, value in lex(text, lexer):
+        pg_attr = _pg_attr(ttype)
+        lines = value.split('\n')
+        for li, part in enumerate(lines):
+            if li > 0:
+                row += 1; col = 0
+                if row >= len(by_row): break
+            if pg_attr and part:
+                by_row[row].append((col, col + len(part), pg_attr))
+            col += len(part)
+
+    _pg_cache[key] = by_row
+    return by_row
 
 def _detect_lang(filename):
     if not filename: return None
-    ext = filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
-    return EXTS.get(ext)
-
-# Token type → color-pair index (pairs 9-15)
-_TOK_PAIR = {_KW:9, _ST:10, _CM:11, _NM:12, _TY:13, _BL:14, _DC:15, _SP:15}
-
-def _tokenize(line, lang):
-    rules = SYNTAX.get(lang)
-    if not rules: return []
-    toks = []
-    for pat, tok in rules:
-        try:
-            for m in re.finditer(pat, line, re.MULTILINE):
-                if m.end() > m.start():
-                    toks.append((m.start(), m.end(), tok))
-        except re.error:
-            pass
-    toks.sort(key=lambda t: (t[0], -(t[1]-t[0])))
-    out = []; pos = 0
-    for s, e, tok in toks:
-        if s >= pos: out.append((s, e, tok)); pos = e
-    return out
+    try:
+        get_lexer_for_filename(filename)
+        return filename  # truthy — used only to decide "do we highlight?"
+    except ClassNotFound:
+        return None
 
 # ── Editor ───────────────────────────────────────────────────────────────────
 
@@ -519,7 +375,7 @@ class Editor:
                     elif r == er:    vis_range[r] = (0, ec)
                     else:            vis_range[r] = None
 
-        lang = _detect_lang(pane.buf.filename)
+        hl_table = _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None
 
         try:
             spat = re.compile(self.search_pat,
@@ -544,22 +400,19 @@ class Editor:
                 self._as(scr_y, scr_x, ns, na)
 
             line = pane.buf.get_line(br)
+            hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
             self._render_line(scr_y, scr_x + lnw, line, lc, tw,
-                              vis_rows, vis_range, br, spat, lang, is_active)
+                              vis_rows, vis_range, br, spat, hl_row, is_active)
 
     def _render_line(self, sy, sx, line, lc, tw, vis_rows, vis_range, br,
-                     spat, lang, is_active):
-        """Render one line: syntax + search + visual selection, clipped to [lc, lc+tw)."""
+                     spat, hl_row, is_active):
         # Build span list: (start_in_line, end_in_line, attr)
         spans = []
 
-        # 1. Syntax tokens (lowest priority)
-        if lang:
-            for ts, te, tok in _tokenize(line, lang):
-                a = curses.color_pair(_TOK_PAIR[tok])
-                if tok == _CM: a |= curses.A_DIM
-                elif tok == _KW: a |= curses.A_BOLD
-                spans.append((ts, te, a))
+        # 1. Syntax tokens from pygments (lowest priority)
+        # hl_row entries: (start, end, (pair_idx, extra_attr)) — resolve here
+        for ts, te, pg in hl_row:
+            spans.append((ts, te, curses.color_pair(pg[0]) | pg[1]))
 
         # 2. Search matches (override syntax)
         if spat:
