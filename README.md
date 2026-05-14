@@ -150,5 +150,4 @@ Requires Python 3.9+ (uses `ast.unparse`). The only dependency is `pygments`, wh
 - No macros (`q` register) yet
 - No `%` bracket matching
 - Ctrl-W navigation has been through several iterations of geometry bugs and may still have edge cases
-- The debug log `/tmp/pyvim_nav.log` is still being written on every pane navigation (`_goto_pane_dir`) — remove the logging calls if it bothers you
-- Concealment in markdown mode (truly hiding `**` markers) is not implemented; markers are dimmed but visible
+- No `%` bracket matching yet
