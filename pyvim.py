@@ -234,6 +234,48 @@ def _is_markdown(filename):
 # cursor row and visual-selected rows (no mismatch with buffer col positions).
 
 _md_cache: dict = {}
+_TABLE_ROW_RE = re.compile(r'^\s*\|.*\|\s*$')
+_TABLE_SEP_RE = re.compile(r'^\s*\|[-:| ]+\|\s*$')
+
+def _md_table_block(raw_rows, DIM, BOLD):
+    """Render a contiguous table block. raw_rows = list of (row_idx, line)."""
+    def cells(line):
+        parts = line.strip().split('|')
+        if parts and not parts[0].strip(): parts = parts[1:]
+        if parts and not parts[-1].strip(): parts = parts[:-1]
+        return [p.strip() for p in parts]
+
+    parsed = [(ri, ln, bool(_TABLE_SEP_RE.match(ln)), cells(ln)) for ri, ln in raw_rows]
+    ncols  = max((len(c) for _, _, _, c in parsed), default=1)
+    widths = [1] * ncols
+    for _, _, sep, c in parsed:
+        if sep: continue
+        for ci in range(min(len(c), ncols)):
+            widths[ci] = max(widths[ci], len(c[ci]))
+
+    result = {}
+    header_done = False
+    for ri, ln, sep, c in parsed:
+        if sep:
+            inner = '┼'.join('─' * (w + 2) for w in widths)
+            vis   = '├' + inner + '┤'
+            result[ri] = (vis, [(0, len(vis), DIM)])
+            header_done = True
+            continue
+
+        parts, spans, pos = ['│'], [(0, 1, DIM)], 1
+        for ci in range(ncols):
+            cell    = c[ci] if ci < len(c) else ''
+            padded  = ' ' + cell.ljust(widths[ci]) + ' '
+            if not header_done:
+                spans.append((pos, pos + len(padded), BOLD))
+            parts.append(padded)
+            pos += len(padded)
+            parts.append('│')
+            spans.append((pos, pos + 1, DIM))
+            pos += 1
+        result[ri] = (''.join(parts), spans)
+    return result
 
 def _md_highlight(buf):
     key = (id(buf), buf._gen)
@@ -242,22 +284,33 @@ def _md_highlight(buf):
     for k in stale: del _md_cache[k]
     if len(_md_cache) > 20: _md_cache.clear()
 
-    # (pair_idx, extra_attr) — resolved to curses attrs at draw time
     DIM   = (11, curses.A_DIM)
     BOLD  = (0,  curses.A_BOLD)
     ITAL  = (0,  curses.A_UNDERLINE)
     CODE  = (10, 0)
-    HEAD  = (9,  curses.A_BOLD)
+    HEAD1 = (9,  curses.A_BOLD | curses.A_UNDERLINE)
+    HEAD2 = (9,  curses.A_BOLD)
+    HEAD3 = (9,  0)
     QUOTE = (11, 0)
     LINK  = (13, 0)
     FENCE = (14, 0)
 
+    # ── pre-render table blocks (need full block to compute column widths) ────
+    tbl: dict = {}
+    i, lines = 0, buf.lines
+    while i < len(lines):
+        if _TABLE_ROW_RE.match(lines[i]):
+            j = i
+            while j < len(lines) and _TABLE_ROW_RE.match(lines[j]):
+                j += 1
+            tbl.update(_md_table_block([(k, lines[k]) for k in range(i, j)], DIM, BOLD))
+            i = j
+        else:
+            i += 1
+
     LINK_RE   = re.compile(r'\[([^\]\n]+)\]\(([^)\n]*)\)')
-    _BTICK_RE = re.compile(r'`([^`\n]+)`')
-    # Bold/italic run before code so **`key`** → key (bold), not **key** (code+bold-markers).
-    # When bold/italic claims a span it also strips any inner backtick pairs so
-    # nested **`Ctrl-E`** renders clean.
-    INLINE  = [
+    BTICK_RE  = re.compile(r'`([^`\n]+)`')
+    INLINE = [
         (re.compile(r'\*\*(.+?)\*\*'),               2, 2, BOLD),
         (re.compile(r'__(.+?)__'),                   2, 2, BOLD),
         (re.compile(r'(?<!\*)\*([^*\n]+)\*(?!\*)'), 1, 1, ITAL),
@@ -266,54 +319,42 @@ def _md_highlight(buf):
         (re.compile(r'~~(.+?)~~'),                   2, 2, DIM),
     ]
 
-    by_row = []  # list of (visual_line, spans_in_visual_coords)
+    by_row = []
     in_fence = False
 
-    for line in buf.lines:
-        # ── fence boundary ───────────────────────────────────────────────────
+    for row, line in enumerate(lines):
+        if row in tbl:
+            by_row.append(tbl[row]); continue
+
         is_fence = bool(re.match(r'^(`{3,}|~{3,})', line))
         if is_fence:
             in_fence = not in_fence
             by_row.append((line, [(0, len(line), DIM)])); continue
-
         if in_fence:
             by_row.append((line, [(0, len(line), FENCE)])); continue
 
-        # ── ATX heading ──────────────────────────────────────────────────────
         hm = re.match(r'^(#{1,6})\s+', line)
         if hm:
-            vis = line[hm.end():]
-            by_row.append((vis, [(0, len(vis), HEAD)])); continue
+            level = len(hm.group(1))
+            vis   = line[hm.end():]
+            style = HEAD1 if level == 1 else HEAD2 if level == 2 else HEAD3
+            by_row.append((vis, [(0, len(vis), style)])); continue
 
-        # ── horizontal rule ──────────────────────────────────────────────────
         if re.match(r'^(\s*[-*_]\s*){3,}\s*$', line) and line.strip():
             vis = '─' * max(len(line), 3)
-            by_row.append((vis, [(0, len(vis), (11, curses.A_UNDERLINE))])); continue
+            by_row.append((vis, [(0, len(vis), DIM)])); continue
 
-        # ── blockquote ───────────────────────────────────────────────────────
         bm = re.match(r'^(>+\s?)', line)
         if bm:
             vis = '│ ' + line[bm.end():]
             by_row.append((vis, [(0, 2, DIM), (2, len(vis), QUOTE)])); continue
 
-        # ── table row — style pipes/separator, never remove chars (keeps alignment) ──
-        if re.match(r'^\s*\|.*\|\s*$', line):
-            if re.match(r'^\s*\|[-:| ]+\|\s*$', line):
-                # separator row |---|---| — dim whole line
-                by_row.append((line, [(0, len(line), DIM)])); continue
-            # data row — dim each | character, leave cell content unstyled
-            spans = [(m.start(), m.start()+1, DIM) for m in re.finditer(r'\|', line)]
-            by_row.append((line, spans)); continue
-
-        # ── inline concealment ───────────────────────────────────────────────
-        repls = []
-        covered = set()
+        repls, covered = [], set()
 
         def _claim(s, e, text, style):
             repls.append((s, e, text, style))
             covered.update(range(s, e))
 
-        # Links first (brackets would confuse * _ patterns)
         for m in LINK_RE.finditer(line):
             if not covered.isdisjoint(range(m.start(), m.end())): continue
             _claim(m.start(), m.end(), m.group(1), LINK)
@@ -323,12 +364,10 @@ def _md_highlight(buf):
                 s, e = m.start(), m.end()
                 if not covered.isdisjoint(range(s, e)): continue
                 content = line[s+olen:e-clen]
-                # Bold and italic eat any inner backtick pairs so **`key`** → key
                 if style in (BOLD, ITAL):
-                    content = _BTICK_RE.sub(r'\1', content)
+                    content = BTICK_RE.sub(r'\1', content)
                 _claim(s, e, content, style)
 
-        # List bullet: - / * / + → •
         lm = re.match(r'^(\s*)([-*+])(\s)', line)
         if lm:
             bs, be = lm.start(2), lm.end(2)
