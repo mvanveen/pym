@@ -228,54 +228,125 @@ def _detect_lang(filename):
 def _is_markdown(filename):
     return bool(filename and filename.rsplit('.',1)[-1].lower() in ('md','markdown','mkd'))
 
-# ── Markdown rich-text rendering ─────────────────────────────────────────────
-# Returns (visual_line, spans) per row — markers are physically removed from
-# visual_line so the terminal shows rendered text. Caller passes raw line for
-# cursor row and visual-selected rows (no mismatch with buffer col positions).
+# ── Markdown rendering via markdown-it-py ────────────────────────────────────
+# Parses with a proper GFM parser so nested inline styles (bold+code, etc.)
+# are handled correctly. Each buffer row gets (visual_line, spans) where
+# markers are removed and spans carry (color_pair_idx, extra_attr) tuples.
+# Cursor row / visual-selected rows are shown raw by the caller.
+
+try:
+    from markdown_it import MarkdownIt as _MdIt
+    _MD = _MdIt("gfm-like").disable("linkify")
+except ImportError:
+    _MD = None
 
 _md_cache: dict = {}
-_TABLE_ROW_RE = re.compile(r'^\s*\|.*\|\s*$')
 _TABLE_SEP_RE = re.compile(r'^\s*\|[-:| ]+\|\s*$')
 
-def _md_table_block(raw_rows, DIM, BOLD):
-    """Render a contiguous table block. raw_rows = list of (row_idx, line)."""
-    def cells(line):
-        parts = line.strip().split('|')
-        if parts and not parts[0].strip(): parts = parts[1:]
-        if parts and not parts[-1].strip(): parts = parts[:-1]
-        return [p.strip() for p in parts]
 
-    parsed = [(ri, ln, bool(_TABLE_SEP_RE.match(ln)), cells(ln)) for ri, ln in raw_rows]
-    ncols  = max((len(c) for _, _, _, c in parsed), default=1)
+def _inline_render(children):
+    """Walk markdown-it inline token children → (visual_line, spans).
+    Uses a per-character style array so nested bold+code etc. work cleanly."""
+    active = set()
+    chars: list = []
+    styles: list = []
+
+    def cur():
+        if not active: return None
+        p, a = 0, 0
+        if 'bold'   in active: a |= curses.A_BOLD
+        if 'italic' in active: a |= curses.A_UNDERLINE
+        if 'strike' in active: a |= curses.A_DIM
+        if 'link'   in active: p  = 13
+        return (p, a) if (p or a) else None
+
+    for tok in (children or []):
+        t = tok.type
+        if   t == 'strong_open':  active.add('bold')
+        elif t == 'strong_close': active.discard('bold')
+        elif t == 'em_open':      active.add('italic')
+        elif t == 'em_close':     active.discard('italic')
+        elif t == 'link_open':    active.add('link')
+        elif t == 'link_close':   active.discard('link')
+        elif t == 's_open':       active.add('strike')
+        elif t == 's_close':      active.discard('strike')
+        elif t == 'text':
+            st = cur()
+            for ch in tok.content: chars.append(ch); styles.append(st)
+        elif t == 'code_inline':
+            for ch in tok.content: chars.append(ch); styles.append((10, 0))
+        elif t == 'image':
+            alt = tok.content or (tok.attrs or {}).get('alt', '')
+            st  = cur()
+            for ch in f'[{alt}]': chars.append(ch); styles.append(st)
+        # softbreak / hardbreak / html_inline: skip
+
+    vis = ''.join(chars)
+    spans, i = [], 0
+    while i < len(styles):
+        st = styles[i]
+        if st is None: i += 1; continue
+        j = i + 1
+        while j < len(styles) and styles[j] == st: j += 1
+        spans.append((i, j, st))
+        i = j
+    return vis, spans
+
+
+def _inline_text(children) -> str:
+    """Extract plain text from inline token children (used for headings/cells)."""
+    return ''.join(tok.content for tok in (children or [])
+                   if tok.type in ('text', 'code_inline'))
+
+
+def _render_table_tokens(toks, lines):
+    """Render a table token slice → {row_idx: (visual_line, spans)}."""
+    DIM  = (11, curses.A_DIM)
+    HEAD = (9,  curses.A_BOLD)
+    in_head = False
+    cur_ri = cur_hdr = None
+    cur_cells: list = []
+    rows = []
+
+    for tok in toks:
+        if   tok.type == 'thead_open':  in_head = True
+        elif tok.type == 'thead_close': in_head = False
+        elif tok.type == 'tr_open':
+            cur_ri = tok.map[0] if tok.map else None
+            cur_hdr = in_head; cur_cells = []
+        elif tok.type == 'tr_close':
+            if cur_ri is not None: rows.append((cur_ri, cur_hdr, cur_cells[:]))
+        elif tok.type == 'inline' and cur_cells is not None:
+            cur_cells.append(_inline_text(tok.children))
+
+    if not rows: return {}
+    ncols  = max(len(r[2]) for r in rows)
     widths = [1] * ncols
-    for _, _, sep, c in parsed:
-        if sep: continue
-        for ci in range(min(len(c), ncols)):
-            widths[ci] = max(widths[ci], len(c[ci]))
+    for _, _, cells in rows:
+        for ci, c in enumerate(cells[:ncols]):
+            widths[ci] = max(widths[ci], len(c))
 
     result = {}
-    header_done = False
-    for ri, ln, sep, c in parsed:
-        if sep:
-            inner = '┼'.join('─' * (w + 2) for w in widths)
-            vis   = '├' + inner + '┤'
-            result[ri] = (vis, [(0, len(vis), DIM)])
-            header_done = True
-            continue
-
-        parts, spans, pos = ['│'], [(0, 1, DIM)], 1
+    for ri, hdr, cells in rows:
+        parts = ['│']; spans = [(0, 1, DIM)]; pos = 1
         for ci in range(ncols):
-            cell    = c[ci] if ci < len(c) else ''
-            padded  = ' ' + cell.ljust(widths[ci]) + ' '
-            if not header_done:
-                spans.append((pos, pos + len(padded), BOLD))
-            parts.append(padded)
-            pos += len(padded)
-            parts.append('│')
-            spans.append((pos, pos + 1, DIM))
-            pos += 1
+            cell   = cells[ci] if ci < len(cells) else ''
+            padded = ' ' + cell.ljust(widths[ci]) + ' '
+            if hdr: spans.append((pos, pos + len(padded), HEAD))
+            parts.append(padded); pos += len(padded)
+            parts.append('│'); spans.append((pos, pos + 1, DIM)); pos += 1
         result[ri] = (''.join(parts), spans)
+
+    # Separator row sits between last header row and first body row in the buffer
+    hdrs  = [r for r in rows if     r[1]]
+    bodys = [r for r in rows if not r[1]]
+    if hdrs and bodys:
+        for r in range(hdrs[-1][0] + 1, bodys[0][0]):
+            if r < len(lines) and _TABLE_SEP_RE.match(lines[r]):
+                vis = '├' + '┼'.join('─' * (w + 2) for w in widths) + '┤'
+                result[r] = (vis, [(0, len(vis), DIM)]); break
     return result
+
 
 def _md_highlight(buf):
     key = (id(buf), buf._gen)
@@ -284,110 +355,90 @@ def _md_highlight(buf):
     for k in stale: del _md_cache[k]
     if len(_md_cache) > 20: _md_cache.clear()
 
-    DIM   = (11, curses.A_DIM)
-    BOLD  = (0,  curses.A_BOLD)
-    ITAL  = (0,  curses.A_UNDERLINE)
-    CODE  = (10, 0)
-    HEAD1 = (9,  curses.A_BOLD | curses.A_UNDERLINE)
-    HEAD2 = (9,  curses.A_BOLD)
-    HEAD3 = (9,  0)
-    QUOTE = (11, 0)
-    LINK  = (13, 0)
-    FENCE = (14, 0)
+    lines  = buf.lines
+    by_row = [(ln, []) for ln in lines]   # default: raw, no styling
 
-    # ── pre-render table blocks (need full block to compute column widths) ────
-    tbl: dict = {}
-    i, lines = 0, buf.lines
-    while i < len(lines):
-        if _TABLE_ROW_RE.match(lines[i]):
-            j = i
-            while j < len(lines) and _TABLE_ROW_RE.match(lines[j]):
+    if _MD is None:
+        _md_cache[key] = by_row; return by_row
+
+    H1 = (9, curses.A_BOLD | curses.A_UNDERLINE)
+    H2 = (9, curses.A_BOLD)
+    H3 = (9, 0)
+    DM = (11, curses.A_DIM)
+    FC = (14, 0)
+    QU = (11, 0)
+
+    tokens = _MD.parse('\n'.join(lines))
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if tok.type == 'heading_open' and tok.map:
+            lv  = int(tok.tag[1]) if tok.tag and len(tok.tag) > 1 and tok.tag[1].isdigit() else 2
+            inl = tokens[i + 1] if i + 1 < len(tokens) and tokens[i + 1].type == 'inline' else None
+            vis = _inline_text(inl.children if inl else [])
+            r   = tok.map[0]
+            if r < len(by_row):
+                by_row[r] = (vis, [(0, len(vis), H1 if lv == 1 else H2 if lv == 2 else H3)])
+            i += 3; continue
+
+        if tok.type == 'hr' and tok.map:
+            r = tok.map[0]
+            if r < len(by_row):
+                vis = '─' * max(len(lines[r]), 3)
+                by_row[r] = (vis, [(0, len(vis), DM)])
+            i += 1; continue
+
+        if tok.type in ('fence', 'code_block') and tok.map:
+            r0, r1 = tok.map
+            for r in range(r0, min(r1, len(by_row))):
+                style = DM if (r == r0 or r == r1 - 1) else FC
+                by_row[r] = (lines[r], [(0, len(lines[r]), style)])
+            i += 1; continue
+
+        if tok.type == 'table_open' and tok.map:
+            j, d = i + 1, 1
+            while j < len(tokens):
+                if tokens[j].type == 'table_open':  d += 1
+                if tokens[j].type == 'table_close':
+                    d -= 1
+                    if d == 0: break
                 j += 1
-            tbl.update(_md_table_block([(k, lines[k]) for k in range(i, j)], DIM, BOLD))
-            i = j
-        else:
-            i += 1
+            for r, v in _render_table_tokens(tokens[i:j + 1], lines).items():
+                if r < len(by_row): by_row[r] = v
+            i = j + 1; continue
 
-    LINK_RE   = re.compile(r'\[([^\]\n]+)\]\(([^)\n]*)\)')
-    BTICK_RE  = re.compile(r'`([^`\n]+)`')
-    INLINE = [
-        (re.compile(r'\*\*(.+?)\*\*'),               2, 2, BOLD),
-        (re.compile(r'__(.+?)__'),                   2, 2, BOLD),
-        (re.compile(r'(?<!\*)\*([^*\n]+)\*(?!\*)'), 1, 1, ITAL),
-        (re.compile(r'(?<!_)_([^_\n]+)_(?!_)'),     1, 1, ITAL),
-        (re.compile(r'`([^`\n]+)`'),                 1, 1, CODE),
-        (re.compile(r'~~(.+?)~~'),                   2, 2, DIM),
-    ]
+        if tok.type == 'inline' and tok.map:
+            r0 = tok.map[0]
+            # Split children by softbreak → one visual line per source row
+            groups: list = [[]]
+            for child in (tok.children or []):
+                if child.type in ('softbreak', 'hardbreak'): groups.append([])
+                else: groups[-1].append(child)
 
-    by_row = []
-    in_fence = False
+            for gi, group in enumerate(groups):
+                r = r0 + gi
+                if r >= len(by_row): break
+                vis, spans = _inline_render(group)
+                raw = lines[r]
+                # Detect block context from the raw buffer line, add visual prefix
+                bm = re.match(r'^(>+\s?)', raw)
+                lm = re.match(r'^(\s*)([-*+]|\d+\.)(\s)', raw)
+                if bm:
+                    vis   = '│ ' + vis
+                    spans = [(0, 2, DM)] + [(s + 2, e + 2, st) for s, e, st in spans]
+                    # re-apply quote color to unmarked text segments
+                    spans = [(s, e, QU if st is None else st) for s, e, st in spans]
+                elif lm:
+                    indent = lm.group(1)
+                    marker = lm.group(2)
+                    pre    = indent + ('• ' if marker in '-*+' else marker + ' ')
+                    vis    = pre + vis
+                    spans  = [(s + len(pre), e + len(pre), st) for s, e, st in spans]
+                by_row[r] = (vis, spans)
+            i += 1; continue
 
-    for row, line in enumerate(lines):
-        if row in tbl:
-            by_row.append(tbl[row]); continue
-
-        is_fence = bool(re.match(r'^(`{3,}|~{3,})', line))
-        if is_fence:
-            in_fence = not in_fence
-            by_row.append((line, [(0, len(line), DIM)])); continue
-        if in_fence:
-            by_row.append((line, [(0, len(line), FENCE)])); continue
-
-        hm = re.match(r'^(#{1,6})\s+', line)
-        if hm:
-            level = len(hm.group(1))
-            vis   = line[hm.end():]
-            style = HEAD1 if level == 1 else HEAD2 if level == 2 else HEAD3
-            by_row.append((vis, [(0, len(vis), style)])); continue
-
-        if re.match(r'^(\s*[-*_]\s*){3,}\s*$', line) and line.strip():
-            vis = '─' * max(len(line), 3)
-            by_row.append((vis, [(0, len(vis), DIM)])); continue
-
-        bm = re.match(r'^(>+\s?)', line)
-        if bm:
-            vis = '│ ' + line[bm.end():]
-            by_row.append((vis, [(0, 2, DIM), (2, len(vis), QUOTE)])); continue
-
-        repls, covered = [], set()
-
-        def _claim(s, e, text, style):
-            repls.append((s, e, text, style))
-            covered.update(range(s, e))
-
-        for m in LINK_RE.finditer(line):
-            if not covered.isdisjoint(range(m.start(), m.end())): continue
-            _claim(m.start(), m.end(), m.group(1), LINK)
-
-        for pat, olen, clen, style in INLINE:
-            for m in pat.finditer(line):
-                s, e = m.start(), m.end()
-                if not covered.isdisjoint(range(s, e)): continue
-                content = line[s+olen:e-clen]
-                if style in (BOLD, ITAL):
-                    content = BTICK_RE.sub(r'\1', content)
-                _claim(s, e, content, style)
-
-        lm = re.match(r'^(\s*)([-*+])(\s)', line)
-        if lm:
-            bs, be = lm.start(2), lm.end(2)
-            if covered.isdisjoint(range(bs, be)):
-                _claim(bs, be, '•', None)
-
-        if not repls:
-            by_row.append((line, [])); continue
-
-        repls.sort(key=lambda r: r[0])
-        parts, spans, pos = [], [], 0
-        for bs, be, repl, style in repls:
-            if pos < bs: parts.append(line[pos:bs])
-            vs = sum(len(p) for p in parts)
-            if repl:
-                parts.append(repl)
-                if style: spans.append((vs, vs + len(repl), style))
-            pos = be
-        if pos < len(line): parts.append(line[pos:])
-        by_row.append((''.join(parts), spans))
+        i += 1
 
     _md_cache[key] = by_row
     return by_row
