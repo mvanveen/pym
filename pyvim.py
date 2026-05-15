@@ -5,6 +5,9 @@ import os
 import re
 import sys
 import copy
+import select
+import termios
+import tty
 from enum import Enum, auto
 
 # ── Modes ────────────────────────────────────────────────────────────────────
@@ -2145,7 +2148,42 @@ class Editor:
         self.mode=Mode.NORMAL; self.status_msg=f'"{path}"'
 
 
+def _probe_sixel() -> bool:
+    """Send DA1 (ESC[c) and return True if the terminal reports sixel support
+    (capability code 4 in the response: ESC[?<n>;4;...c).
+    Must be called before curses.wrapper() takes over the terminal."""
+    if not sys.stdout.isatty():
+        return False
+    try:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            sys.stdout.write('\033[c')
+            sys.stdout.flush()
+            resp = ''
+            while True:
+                r, _, _ = select.select([fd], [], [], 0.3)
+                if not r:
+                    break
+                ch = os.read(fd, 1).decode('latin-1')
+                resp += ch
+                if ch == 'c':
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        m = re.search(r'\[\?([0-9;]+)c', resp)
+        if m:
+            return '4' in m.group(1).split(';')
+    except Exception:
+        pass
+    return False
+
+HAS_SIXEL: bool = False   # populated by main() before curses takes over
+
 def main():
+    global HAS_SIXEL
+    HAS_SIXEL = _probe_sixel()
     filename=sys.argv[1] if len(sys.argv)>1 else None
     curses.wrapper(lambda s: Editor(s, filename).run())
 
