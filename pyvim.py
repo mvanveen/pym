@@ -421,9 +421,21 @@ def _md_highlight(buf):
 
         if tok.type in ('fence', 'code_block') and tok.map:
             r0, r1 = tok.map
+            is_fence = tok.type == 'fence'
+            lang = tok.info.strip() if (is_fence and tok.info) else ''
+            LB = (13, curses.A_BOLD)   # language badge: cyan bold
             for r in range(r0, min(r1, len(by_row))):
-                style = DM if (r == r0 or r == r1 - 1) else FC
-                by_row[r] = (lines[r], [(0, len(lines[r]), style)])
+                if is_fence and r == r0:
+                    label = f' {lang}' if lang else ''
+                    vis = '╭─' + label
+                    spans = [(0, 2, DM)]
+                    if lang: spans.append((2, len(vis), LB))
+                    by_row[r] = (vis, spans)
+                elif is_fence and r == r1 - 1:
+                    by_row[r] = ('╰─', [(0, 2, DM)])
+                else:
+                    vis = '│ ' + lines[r]
+                    by_row[r] = (vis, [(0, 2, DM), (2, len(vis), FC)])
             i += 1; continue
 
         if tok.type == 'table_open' and tok.map:
