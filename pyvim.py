@@ -296,9 +296,14 @@ def _md_highlight(buf):
             vis = '│ ' + line[bm.end():]
             by_row.append((vis, [(0, 2, DIM), (2, len(vis), QUOTE)])); continue
 
-        # ── table row — pass through unmodified (preserve column alignment) ────
+        # ── table row — style pipes/separator, never remove chars (keeps alignment) ──
         if re.match(r'^\s*\|.*\|\s*$', line):
-            by_row.append((line, [])); continue
+            if re.match(r'^\s*\|[-:| ]+\|\s*$', line):
+                # separator row |---|---| — dim whole line
+                by_row.append((line, [(0, len(line), DIM)])); continue
+            # data row — dim each | character, leave cell content unstyled
+            spans = [(m.start(), m.start()+1, DIM) for m in re.finditer(r'\|', line)]
+            by_row.append((line, spans)); continue
 
         # ── inline concealment ───────────────────────────────────────────────
         repls = []
