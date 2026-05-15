@@ -757,8 +757,23 @@ class Editor:
             return
         p = self._pane
         lnw = self._pane_lnw(p)
-        sy = p.y + p.cursor.row - p.top_row
-        sx = p.x + lnw + p.cursor.col - p.left_col
+        sy  = p.y + p.cursor.row - p.top_row
+        col = p.cursor.col
+        # TABLE mode: cursor.col is a buffer col, but the screen shows rendered
+        # box-drawing where cells are padded to equal widths.  Map to visual col.
+        if (self.mode == Mode.NORMAL and _is_markdown(p.buf.filename)):
+            raw = p.buf.get_line(p.cursor.row)
+            if _is_table_row(raw):
+                md = _md_highlight(p.buf)
+                if p.cursor.row < len(md):
+                    vis_line, _ = md[p.cursor.row]
+                    info = _table_cell_at(raw, col)
+                    if info:
+                        pipes = [i for i, c in enumerate(vis_line) if c == '│']
+                        ci = info[0]
+                        if ci + 1 < len(pipes):
+                            col = pipes[ci] + 2  # land after '│ '
+        sx = p.x + lnw + col - p.left_col
         try:
             self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)),
                              max(p.x, min(sx, p.x+p.width-1)))
