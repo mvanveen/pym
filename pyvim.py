@@ -244,6 +244,8 @@ except ImportError:
     _MD = None
 
 _md_cache: dict = {}
+_md_img_cache: dict = {}   # same key as _md_cache → {row: (abs_path, alt)}
+_sixel_cache: dict = {}    # (path, mtime, max_w, max_h) → (sixel_str, w_cells, h_cells)
 _TABLE_SEP_RE = re.compile(r'^\s*\|[-:| ]+\|\s*$')
 
 
@@ -275,6 +277,96 @@ def _table_cell_at(line, col):
         if a < col <= b and i < len(cells):
             return (i, cells[i][0], cells[i][1])
     return None
+
+
+def _extract_img_src(children, buf_filename) -> tuple[str, str] | None:
+    """Return (abs_path, alt) for the first image token, or None."""
+    for tok in (children or []):
+        if tok.type == 'image':
+            src = (tok.attrs or {}).get('src', '') if tok.attrs else ''
+            alt = tok.content or ''
+            if not src or src.startswith(('http://', 'https://', 'data:')):
+                continue
+            if buf_filename:
+                base = os.path.dirname(os.path.abspath(buf_filename))
+                path = os.path.normpath(os.path.join(base, src))
+            else:
+                path = os.path.abspath(src)
+            if os.path.isfile(path):
+                return (path, alt)
+    return None
+
+
+def _encode_sixel(path: str, max_w: int, max_h: int):
+    """Encode image as DCS sixel string.  Returns (sixel_str, w_cells, h_cells) or None.
+    max_w/max_h are in terminal cells; assumes 8×16 px per cell."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = (path, mtime, max_w, max_h)
+    if key in _sixel_cache:
+        return _sixel_cache[key]
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        CW, CH = 8, 16
+        img = Image.open(path).convert('RGB')
+        img.thumbnail((max_w * CW, max_h * CH), Image.LANCZOS)
+        w, h = img.size
+        w_cells = max(1, (w + CW - 1) // CW)
+        h_cells = max(1, (h + CH - 1) // CH)
+
+        qimg = img.quantize(colors=256)
+        pal  = qimg.getpalette()
+        data = list(qimg.getdata())  # type: ignore[attr-defined]
+
+        out = ['\033Pq']
+        for ci in range(min(256, len(pal) // 3)):
+            r = pal[ci*3] * 100 // 255
+            g = pal[ci*3+1] * 100 // 255
+            b = pal[ci*3+2] * 100 // 255
+            out.append(f'#{ci};2;{r};{g};{b}')
+
+        for y0 in range(0, h, 6):
+            bh = min(6, h - y0)
+            col_bits: dict = {}
+            for x in range(w):
+                for dy in range(bh):
+                    ci = data[(y0 + dy) * w + x]
+                    if ci not in col_bits:
+                        col_bits[ci] = bytearray(w)
+                    col_bits[ci][x] |= 1 << dy
+            first = True
+            for ci, bits in col_bits.items():
+                if not first: out.append('$')
+                first = False
+                out.append(f'#{ci}')
+                prev = None; run = 0
+                for v in bits:
+                    c = chr(63 + v)
+                    if c == prev:
+                        run += 1
+                    else:
+                        if prev: out.append(f'!{run}{prev}' if run > 3 else prev * run)
+                        prev, run = c, 1
+                if prev: out.append(f'!{run}{prev}' if run > 3 else prev * run)
+            out.append('-')
+
+        out.append('\033\\')
+        result = (''.join(out), w_cells, h_cells)
+        _sixel_cache[key] = result
+        return result
+    except Exception:
+        return None
+
+
+def _md_images(buf) -> dict:
+    """Return {row: (abs_path, alt)} for the last-parsed generation of buf."""
+    key = (id(buf), buf._gen)
+    return _md_img_cache.get(key, {})
 
 
 def _inline_render(children):
@@ -385,14 +477,17 @@ def _md_highlight(buf):
     key = (id(buf), buf._gen)
     if key in _md_cache: return _md_cache[key]
     stale = [k for k in _md_cache if k[0] == id(buf)]
-    for k in stale: del _md_cache[k]
-    if len(_md_cache) > 20: _md_cache.clear()
+    for k in stale:
+        del _md_cache[k]
+        _md_img_cache.pop(k, None)
+    if len(_md_cache) > 20: _md_cache.clear(); _md_img_cache.clear()
 
     lines  = buf.lines
     by_row = [(ln, []) for ln in lines]   # default: raw, no styling
+    images: dict = {}                      # row → (abs_path, alt)
 
     if _MD is None:
-        _md_cache[key] = by_row; return by_row
+        _md_cache[key] = by_row; _md_img_cache[key] = images; return by_row
 
     H1 = (9, curses.A_BOLD | curses.A_UNDERLINE)
     H2 = (9, curses.A_BOLD)
@@ -464,6 +559,10 @@ def _md_highlight(buf):
             for gi, group in enumerate(groups):
                 r = r0 + gi
                 if r >= len(by_row): break
+                # Record image metadata before rendering the placeholder
+                img_info = _extract_img_src(group, buf.filename)
+                if img_info:
+                    images[r] = img_info
                 vis, spans = _inline_render(group)
                 raw = lines[r]
                 # Detect block context from the raw buffer line, add visual prefix
@@ -486,6 +585,7 @@ def _md_highlight(buf):
         i += 1
 
     _md_cache[key] = by_row
+    _md_img_cache[key] = images
     return by_row
 
 # ── Editor ───────────────────────────────────────────────────────────────────
@@ -521,6 +621,7 @@ class Editor:
         self.last_f_till   = False
         self.marks   = {}
         self.running = True
+        self._pending_sixels: list = []   # [(scr_y, scr_x, path, max_w, max_h)]
 
         # Explorer state
         self.ex_dir     = os.getcwd()
@@ -586,6 +687,7 @@ class Editor:
         self.height, self.width = self.stdscr.getmaxyx()
         if self.mode == Mode.EXPLORER:
             self._draw_explorer(); return
+        self._pending_sixels = []
         self.stdscr.erase()
 
         avail_h = self.height - 2
@@ -615,6 +717,21 @@ class Editor:
         self._draw_statusbar()
         self._place_cursor()
         self.stdscr.refresh()
+        self._flush_sixels()
+
+    def _flush_sixels(self):
+        if not HAS_SIXEL or not self._pending_sixels:
+            return
+        buf = []
+        for scr_y, scr_x, path, max_w, max_h in self._pending_sixels:
+            result = _encode_sixel(path, max_w, max_h)
+            if result:
+                sixel_str, _wc, _hc = result
+                # Position cursor via raw ANSI (1-based), output sixel DCS
+                buf.append(f'\033[{scr_y + 1};{scr_x + 1}H{sixel_str}')
+        if buf:
+            sys.stdout.write(''.join(buf))
+            sys.stdout.flush()
 
     def _draw_pane(self, pane, is_active):
         lnw = self._pane_lnw(pane)
@@ -641,6 +758,7 @@ class Editor:
         is_md = _is_markdown(pane.buf.filename)
         in_insert = is_active and self.mode == Mode.INSERT
         md_table = (_md_highlight(pane.buf) if is_md else None)
+        img_map  = (_md_images(pane.buf) if is_md and HAS_SIXEL else {})
         hl_table = (None if is_md else
                     _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
 
@@ -667,6 +785,10 @@ class Editor:
                 self._as(scr_y, scr_x, ns, na)
 
             line = pane.buf.get_line(br)
+            if br in img_map and not (is_active and br == pane.cursor.row):
+                path, _alt = img_map[br]
+                self._pending_sixels.append(
+                    (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
             if md_table:
                 is_cur = is_active and br == pane.cursor.row
                 # Table rows in normal mode: always show rendered (cell nav keeps
