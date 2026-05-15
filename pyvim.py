@@ -244,6 +244,36 @@ _md_cache: dict = {}
 _TABLE_SEP_RE = re.compile(r'^\s*\|[-:| ]+\|\s*$')
 
 
+def _is_table_row(line):
+    s = line.strip()
+    return s.startswith('|') and s.endswith('|') and not _TABLE_SEP_RE.match(line)
+
+
+def _table_cells(line):
+    """Return list of (content_start, content_end) for each cell in a raw table line."""
+    if not _is_table_row(line): return []
+    pipes = [i for i, c in enumerate(line) if c == '|']
+    if len(pipes) < 2: return []
+    cells = []
+    for a, b in zip(pipes, pipes[1:]):
+        s = a + 1
+        while s < b and line[s] == ' ': s += 1
+        e = b - 1
+        while e > a and line[e] == ' ': e -= 1
+        cells.append((s, e + 1))
+    return cells
+
+
+def _table_cell_at(line, col):
+    """Return (cell_idx, content_start, content_end) for the cell containing col, or None."""
+    pipes = [i for i, c in enumerate(line) if c == '|']
+    cells = _table_cells(line)
+    for i, (a, b) in enumerate(zip(pipes, pipes[1:])):
+        if a < col <= b and i < len(cells):
+            return (i, cells[i][0], cells[i][1])
+    return None
+
+
 def _inline_render(children):
     """Walk markdown-it inline token children → (visual_line, spans).
     Uses a per-character style array so nested bold+code etc. work cleanly."""
@@ -692,8 +722,11 @@ class Editor:
             self._as(sy, scr_col, rest)
 
     def _draw_statusbar(self):
+        _tbl_nm = (self.mode == Mode.NORMAL and
+                   _is_table_row(self.buf.get_line(self.cursor.row)))
         ml = {
-            Mode.NORMAL:' NORMAL ', Mode.INSERT:' INSERT ',
+            Mode.NORMAL:' TABLE  ' if _tbl_nm else ' NORMAL ',
+            Mode.INSERT:' INSERT ',
             Mode.VISUAL:' VISUAL ', Mode.VISUAL_LINE:' V-LINE ',
             Mode.COMMAND:' COMMAND', Mode.SEARCH:' SEARCH ',
         }.get(self.mode, ' NORMAL ')
@@ -770,6 +803,68 @@ class Editor:
             mc = max(0, len(line)-(0 if self.mode==Mode.INSERT else 1))
             p.cursor.col = max(0, min(p.cursor.col+dc, mc))
             p.cursor.col_want = p.cursor.col
+
+    def _cell_next(self):
+        line = self.buf.get_line(self.cursor.row)
+        cells = _table_cells(line)
+        if not cells: return
+        info = _table_cell_at(line, self.cursor.col)
+        idx = info[0] if info else -1
+        if idx + 1 < len(cells):
+            self.cursor.col = cells[idx + 1][0]
+        else:
+            nr = self.cursor.row + 1
+            if nr < self.buf.line_count():
+                self.cursor.row = nr
+                c2 = _table_cells(self.buf.get_line(nr))
+                if c2: self.cursor.col = c2[0][0]
+
+    def _cell_prev(self):
+        line = self.buf.get_line(self.cursor.row)
+        cells = _table_cells(line)
+        if not cells: return
+        info = _table_cell_at(line, self.cursor.col)
+        idx = info[0] if info else len(cells)
+        if idx > 0:
+            self.cursor.col = cells[idx - 1][0]
+        else:
+            nr = self.cursor.row - 1
+            if nr >= 0:
+                self.cursor.row = nr
+                c2 = _table_cells(self.buf.get_line(nr))
+                if c2: self.cursor.col = c2[-1][0]
+
+    def _cell_down(self):
+        line = self.buf.get_line(self.cursor.row)
+        info = _table_cell_at(line, self.cursor.col)
+        idx = info[0] if info else 0
+        nr = self.cursor.row + 1
+        while nr < self.buf.line_count():
+            nl = self.buf.get_line(nr)
+            if _TABLE_SEP_RE.match(nl): nr += 1; continue
+            c2 = _table_cells(nl)
+            if c2:
+                self.cursor.row = nr
+                self.cursor.col = c2[min(idx, len(c2) - 1)][0]
+                return
+            break
+        self._move(1, 0)
+
+    def _cell_up(self):
+        line = self.buf.get_line(self.cursor.row)
+        info = _table_cell_at(line, self.cursor.col)
+        idx = info[0] if info else 0
+        nr = self.cursor.row - 1
+        while nr >= 0:
+            nl = self.buf.get_line(nr)
+            if _TABLE_SEP_RE.match(nl): nr -= 1; continue
+            c2 = _table_cells(nl)
+            if c2:
+                self.cursor.row = nr
+                self.cursor.col = c2[min(idx, len(c2) - 1)][0]
+                return
+            break
+        self._move(-1, 0)
 
     def _first_nonblank(self, row=None):
         r = self.cursor.row if row is None else row
@@ -1109,10 +1204,21 @@ class Editor:
         count=int(self.pending_count) if self.pending_count else 1
         self.pending_count=''
 
-        if   key in (curses.KEY_LEFT,)  or ch=='h': [self._move(0,-1) for _ in range(count)]
-        elif key in (curses.KEY_RIGHT,) or ch=='l': [self._move(0,1)  for _ in range(count)]
-        elif key in (curses.KEY_UP,)    or ch=='k': [self._move(-1,0) for _ in range(count)]
-        elif key in (curses.KEY_DOWN,)  or ch=='j': [self._move(1,0)  for _ in range(count)]
+        _on_tbl = _is_table_row(self.buf.get_line(self.cursor.row))
+        if   key in (curses.KEY_LEFT,)  or ch=='h':
+            if _on_tbl: [self._cell_prev() for _ in range(count)]
+            else: [self._move(0,-1) for _ in range(count)]
+        elif key in (curses.KEY_RIGHT,) or ch=='l':
+            if _on_tbl: [self._cell_next() for _ in range(count)]
+            else: [self._move(0,1) for _ in range(count)]
+        elif key in (curses.KEY_UP,)    or ch=='k':
+            if _on_tbl: [self._cell_up()   for _ in range(count)]
+            else: [self._move(-1,0) for _ in range(count)]
+        elif key in (curses.KEY_DOWN,)  or ch=='j':
+            if _on_tbl: [self._cell_down() for _ in range(count)]
+            else: [self._move(1,0)  for _ in range(count)]
+        elif key==9 and _on_tbl: [self._cell_next() for _ in range(count)]
+        elif key==353 and _on_tbl: [self._cell_prev() for _ in range(count)]  # Shift-Tab
         elif ch=='0': self.cursor.col=0; self.cursor.col_want=0
         elif ch=='^': self._first_nonblank()
         elif ch=='$':
@@ -1376,7 +1482,11 @@ class Editor:
             self.cursor.row+=1; self.cursor.col=len(ind)
             self.buf.set_line(self.cursor.row,ind+self.buf.get_line(self.cursor.row))
         elif key==9:
-            for _ in range(4): self.buf.insert_char(self.cursor.row,self.cursor.col,' '); self.cursor.col+=1
+            if _is_table_row(self.buf.get_line(self.cursor.row)): self._cell_next()
+            else:
+                for _ in range(4): self.buf.insert_char(self.cursor.row,self.cursor.col,' '); self.cursor.col+=1
+        elif key==353:  # Shift-Tab
+            if _is_table_row(self.buf.get_line(self.cursor.row)): self._cell_prev()
         elif key==23:  # Ctrl-W delete word back
             line=self.buf.get_line(self.cursor.row); c=self.cursor.col
             while c>0 and line[c-1]==' ': c-=1
