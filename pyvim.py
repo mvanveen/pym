@@ -252,15 +252,17 @@ def _md_highlight(buf):
     LINK  = (13, 0)
     FENCE = (14, 0)
 
-    LINK_RE = re.compile(r'\[([^\]\n]+)\]\(([^)\n]*)\)')
-    # Code spans first — CommonMark priority: backtick code beats bold/italic.
-    # Bold/italic markers inside a code span are not processed.
+    LINK_RE   = re.compile(r'\[([^\]\n]+)\]\(([^)\n]*)\)')
+    _BTICK_RE = re.compile(r'`([^`\n]+)`')
+    # Bold/italic run before code so **`key`** → key (bold), not **key** (code+bold-markers).
+    # When bold/italic claims a span it also strips any inner backtick pairs so
+    # nested **`Ctrl-E`** renders clean.
     INLINE  = [
-        (re.compile(r'`([^`\n]+)`'),                 1, 1, CODE),
         (re.compile(r'\*\*(.+?)\*\*'),               2, 2, BOLD),
         (re.compile(r'__(.+?)__'),                   2, 2, BOLD),
         (re.compile(r'(?<!\*)\*([^*\n]+)\*(?!\*)'), 1, 1, ITAL),
         (re.compile(r'(?<!_)_([^_\n]+)_(?!_)'),     1, 1, ITAL),
+        (re.compile(r'`([^`\n]+)`'),                 1, 1, CODE),
         (re.compile(r'~~(.+?)~~'),                   2, 2, DIM),
     ]
 
@@ -280,7 +282,7 @@ def _md_highlight(buf):
         # ── ATX heading ──────────────────────────────────────────────────────
         hm = re.match(r'^(#{1,6})\s+', line)
         if hm:
-            vis = line[hm.end():]          # strip leading "## "
+            vis = line[hm.end():]
             by_row.append((vis, [(0, len(vis), HEAD)])); continue
 
         # ── horizontal rule ──────────────────────────────────────────────────
@@ -299,7 +301,6 @@ def _md_highlight(buf):
             by_row.append((line, [])); continue
 
         # ── inline concealment ───────────────────────────────────────────────
-        # Build replacement list: (buf_start, buf_end, vis_text, style|None)
         repls = []
         covered = set()
 
@@ -307,7 +308,7 @@ def _md_highlight(buf):
             repls.append((s, e, text, style))
             covered.update(range(s, e))
 
-        # Links before italic (brackets would confuse * _ patterns)
+        # Links first (brackets would confuse * _ patterns)
         for m in LINK_RE.finditer(line):
             if not covered.isdisjoint(range(m.start(), m.end())): continue
             _claim(m.start(), m.end(), m.group(1), LINK)
@@ -316,7 +317,11 @@ def _md_highlight(buf):
             for m in pat.finditer(line):
                 s, e = m.start(), m.end()
                 if not covered.isdisjoint(range(s, e)): continue
-                _claim(s, e, line[s+olen:e-clen], style)
+                content = line[s+olen:e-clen]
+                # Bold and italic eat any inner backtick pairs so **`key`** → key
+                if style in (BOLD, ITAL):
+                    content = _BTICK_RE.sub(r'\1', content)
+                _claim(s, e, content, style)
 
         # List bullet: - / * / + → •
         lm = re.match(r'^(\s*)([-*+])(\s)', line)
