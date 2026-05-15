@@ -624,10 +624,8 @@ class Editor:
                     else:            vis_range[r] = None
 
         is_md = _is_markdown(pane.buf.filename)
-        # In insert mode show everything plain — no jarring render/raw flipping
-        # as the cursor moves line to line while typing.
         in_insert = is_active and self.mode == Mode.INSERT
-        md_table = (_md_highlight(pane.buf) if is_md and not in_insert else None)
+        md_table = (_md_highlight(pane.buf) if is_md else None)
         hl_table = (None if is_md else
                     _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
 
@@ -655,9 +653,12 @@ class Editor:
 
             line = pane.buf.get_line(br)
             if md_table:
-                # Reveal raw for cursor line and visually-selected lines —
-                # buffer col positions stay valid, no mapping needed.
-                raw = (is_active and br == pane.cursor.row) or br in vis_rows
+                is_cur = is_active and br == pane.cursor.row
+                # Table rows in normal mode: always show rendered (cell nav keeps
+                # cursor at cell-start so column accuracy isn't needed).
+                # Insert mode or non-table cursor row: show raw for accurate editing.
+                show_raw_cur = is_cur and (in_insert or not _is_table_row(line))
+                raw = show_raw_cur or br in vis_rows
                 display, hl_row = (line, []) if raw else (
                     md_table[br] if br < len(md_table) else (line, []))
             else:
