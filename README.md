@@ -2,6 +2,8 @@
 
 A vim clone in a single Python file, because why not.
 
+**bold** 
+
 ```
 uv run pyvim.py [file]
 ```
@@ -127,7 +129,7 @@ Editor          mode state machine + all keybindings + draw loop
 
 Syntax highlighting: `_pg_highlight(buf)` tokenizes the full buffer once with pygments, maps character offsets to (row, col), caches by `(id(buf), buf._gen)`.
 
-Markdown rendering: `_md_highlight(buf, cursor_row)` — separate path from pygments, cursor-aware so the active line is always raw.
+Markdown rendering: `_md_highlight(buf)` — separate path from pygments, returns `(visual_line, spans)` per row. Cursor row and visual-selected rows shown raw so buffer column positions stay valid.
 
 Python eval: `_resolve_deps(r1, r2)` does AST analysis to find what a selection's free variables need, then runs exactly those imports/defs in order.
 

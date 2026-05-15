@@ -253,13 +253,15 @@ def _md_highlight(buf):
     FENCE = (14, 0)
 
     LINK_RE = re.compile(r'\[([^\]\n]+)\]\(([^)\n]*)\)')
+    # Code spans first — CommonMark priority: backtick code beats bold/italic.
+    # Bold/italic markers inside a code span are not processed.
     INLINE  = [
-        (re.compile(r'\*\*(.+?)\*\*'),           2, 2, BOLD),
-        (re.compile(r'__(.+?)__'),               2, 2, BOLD),
+        (re.compile(r'`([^`\n]+)`'),                 1, 1, CODE),
+        (re.compile(r'\*\*(.+?)\*\*'),               2, 2, BOLD),
+        (re.compile(r'__(.+?)__'),                   2, 2, BOLD),
         (re.compile(r'(?<!\*)\*([^*\n]+)\*(?!\*)'), 1, 1, ITAL),
-        (re.compile(r'(?<!_)_([^_\n]+)_(?!_)'), 1, 1, ITAL),
-        (re.compile(r'`([^`\n]+)`'),             1, 1, CODE),
-        (re.compile(r'~~(.+?)~~'),               2, 2, DIM),
+        (re.compile(r'(?<!_)_([^_\n]+)_(?!_)'),     1, 1, ITAL),
+        (re.compile(r'~~(.+?)~~'),                   2, 2, DIM),
     ]
 
     by_row = []  # list of (visual_line, spans_in_visual_coords)
@@ -291,6 +293,10 @@ def _md_highlight(buf):
         if bm:
             vis = '│ ' + line[bm.end():]
             by_row.append((vis, [(0, 2, DIM), (2, len(vis), QUOTE)])); continue
+
+        # ── table row — pass through unmodified (preserve column alignment) ────
+        if re.match(r'^\s*\|.*\|\s*$', line):
+            by_row.append((line, [])); continue
 
         # ── inline concealment ───────────────────────────────────────────────
         # Build replacement list: (buf_start, buf_end, vis_text, style|None)
@@ -488,7 +494,10 @@ class Editor:
                     else:            vis_range[r] = None
 
         is_md = _is_markdown(pane.buf.filename)
-        md_table = _md_highlight(pane.buf) if is_md else None
+        # In insert mode show everything plain — no jarring render/raw flipping
+        # as the cursor moves line to line while typing.
+        in_insert = is_active and self.mode == Mode.INSERT
+        md_table = (_md_highlight(pane.buf) if is_md and not in_insert else None)
         hl_table = (None if is_md else
                     _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
 
