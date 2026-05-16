@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """pyvim - A pure Python vim-like editor"""
+import ast
 import curses
+import difflib
 import os
 import re
 import sys
 import copy
 import select
 import termios
+import time
 import tty
 from enum import Enum, auto
 
@@ -20,6 +23,8 @@ class Mode(Enum):
     COMMAND = auto()
     SEARCH = auto()
     EXPLORER = auto()
+    HISTORY = auto()
+    PICKER = auto()
 
 # ── Core data ────────────────────────────────────────────────────────────────
 
@@ -35,21 +40,22 @@ class Buffer:
         self.modified = False
         self._undo = []; self._redo = []
         self._gen = 0  # incremented on every mutation; used as highlight cache key
+        self._disk_mtime = 0.0
 
     def save_undo(self):
-        self._undo.append(copy.deepcopy(self.lines))
+        self._undo.append((copy.deepcopy(self.lines), time.time()))
         self._redo.clear()
         if len(self._undo) > 500: self._undo.pop(0)
 
     def undo(self):
         if not self._undo: return False
-        self._redo.append(copy.deepcopy(self.lines))
-        self.lines = self._undo.pop(); self.modified = True; self._gen += 1; return True
+        self._redo.append((copy.deepcopy(self.lines), time.time()))
+        self.lines, _ = self._undo.pop(); self.modified = True; self._gen += 1; return True
 
     def redo(self):
         if not self._redo: return False
-        self._undo.append(copy.deepcopy(self.lines))
-        self.lines = self._redo.pop(); self.modified = True; self._gen += 1; return True
+        self._undo.append((copy.deepcopy(self.lines), time.time()))
+        self.lines, _ = self._redo.pop(); self.modified = True; self._gen += 1; return True
 
     def line_count(self): return len(self.lines)
     def get_line(self, r): return self.lines[r] if 0 <= r < len(self.lines) else ''
@@ -93,7 +99,14 @@ class Buffer:
         try:
             with open(filename, 'r', errors='replace') as f: content = f.read()
             lines = content.splitlines(); b.lines = lines if lines else ['']
+            b._disk_mtime = os.path.getmtime(filename)
         except FileNotFoundError: b.lines = ['']
+        b.modified = False; return b
+
+    @classmethod
+    def from_string(cls, content, filename=None):
+        b = cls(); b.filename = filename
+        lines = content.splitlines(); b.lines = lines if lines else ['']
         b.modified = False; return b
 
     def save(self, filename=None):
@@ -101,6 +114,7 @@ class Buffer:
         if not fname: raise ValueError('No file name')
         with open(fname, 'w') as f: f.write('\n'.join(self.lines) + '\n')
         self.filename = fname; self.modified = False
+        self._disk_mtime = os.path.getmtime(fname)
 
 class Pane:
     def __init__(self, buf=None):
@@ -665,14 +679,19 @@ def _md_highlight(buf):
 # ── Editor ───────────────────────────────────────────────────────────────────
 
 class Editor:
-    def __init__(self, stdscr, filename=None):
+    def __init__(self, stdscr, filename=None, stdin_content=None, follow=False, follow_fd=None):
         self.stdscr = stdscr
         self.mode   = Mode.NORMAL
         self.height = 0
         self.width  = 0
 
         # Pane management
-        initial_buf = Buffer.from_file(filename) if filename else Buffer()
+        if stdin_content is not None:
+            initial_buf = Buffer.from_string(stdin_content, filename='[stdin]')
+        elif filename:
+            initial_buf = Buffer.from_file(filename)
+        else:
+            initial_buf = Buffer()
         p = Pane(initial_buf)
         self._layout  = _Leaf(p)
         self._panes   = [p]
@@ -696,6 +715,14 @@ class Editor:
         self.marks   = {}
         self.running = True
         self._pending_sixels: list = []   # [(scr_y, scr_x, path, max_w, max_h)]
+        self._confirm_cb  = None
+        self._confirm_msg = ''
+        self.hist_sel = 0
+        self.hist_top = 0
+        self.hist_preview_scroll = 0
+        self.hist_diff_mode = True
+        self._hist_git_cache: list = []
+        self._hist_preview_cache: dict = {}
 
         # Explorer state
         self.ex_dir     = os.getcwd()
@@ -706,6 +733,31 @@ class Editor:
         self._prev_cursor = None
         self.ex_search_query  = ''
         self.ex_searching     = False
+
+        # Jump stack + picker state
+        self._jump_stack    = []   # list of (row, col) for Ctrl-O
+        self.picker_entries = []   # list of (label, row, col)
+        self.picker_sel     = 0
+        self.picker_top     = 0
+        self.picker_title   = ''
+
+        # Follow mode (tail -f)
+        self._follow         = follow
+        self._follow_fd      = follow_fd  # duped non-blocking stdin fd, or None
+        self._follow_file    = None       # open file handle for file-follow
+        self._follow_partial = ''         # incomplete last line not yet ended with \n
+        if follow:
+            stdscr.timeout(250)           # getch returns -1 after 250 ms
+            if follow_fd is not None:
+                # stdin follow: start with empty buffer labelled [stdin]
+                self.buf.filename = '[stdin]'
+                self.buf.lines = []
+            elif filename:
+                try:
+                    self._follow_file = open(filename, 'r', errors='replace')
+                    self._follow_file.seek(0, 2)   # start at current EOF
+                except OSError:
+                    pass
 
         curses.start_color()
         curses.use_default_colors()
@@ -727,6 +779,19 @@ class Editor:
         curses.init_pair(13, curses.COLOR_CYAN,   -1)   # type
         curses.init_pair(14, curses.COLOR_BLUE,   -1)   # builtin
         curses.init_pair(15, curses.COLOR_YELLOW, -1)   # decorator
+        # Diff viewer: green-bg for added, red-bg for removed
+        _diff_256=False
+        if HAS_256COLOR:
+            try:
+                curses.init_pair(20, 255, 22)   # white on dark green
+                curses.init_pair(21, 255, 52)   # white on dark red
+                curses.init_pair(22, 255, 17)   # white on dark blue (hunk header)
+                _diff_256=True
+            except Exception: pass
+        if not _diff_256:
+            curses.init_pair(20, curses.COLOR_GREEN,   -1)
+            curses.init_pair(21, curses.COLOR_RED,     -1)
+            curses.init_pair(22, curses.COLOR_CYAN,    -1)
 
         self.stdscr.keypad(True)
         curses.raw(); curses.noecho(); curses.curs_set(1)
@@ -765,6 +830,10 @@ class Editor:
         self.height, self.width = self.stdscr.getmaxyx()
         if self.mode == Mode.EXPLORER:
             self._draw_explorer(); return
+        if self.mode == Mode.HISTORY:
+            self._draw_history(); return
+        if self.mode == Mode.PICKER:
+            self._draw_picker(); return
         self._pending_sixels = []
         self.stdscr.erase()
 
@@ -955,7 +1024,9 @@ class Editor:
         mod   = ' [+]' if self.buf.modified else ''
         pos   = f' {self.cursor.row+1}:{self.cursor.col+1} '
 
-        if self.mode in (Mode.COMMAND, Mode.SEARCH):
+        if self._confirm_cb is not None:
+            self._as(self.height-1, 0, (self._confirm_msg+' '*self.width)[:self.width-1], curses.color_pair(4))
+        elif self.mode in (Mode.COMMAND, Mode.SEARCH):
             self._as(self.height-1, 0, (self.cmd_line+' '*self.width)[:self.width-1])
         elif self.status_msg:
             self._as(self.height-1, 0,
@@ -1419,10 +1490,64 @@ class Editor:
         while self.running:
             self._clamp(); self._scroll(); self.draw()
             key=self.stdscr.getch()
+            if key == -1:
+                if self._follow: self._follow_check()
+                continue
             self.status_msg=''; self.status_err=False
             self._dispatch(key)
 
+    def _follow_check(self):
+        new_text = ''
+        if self._follow_file:
+            chunk = self._follow_file.read()
+            if chunk: new_text = chunk
+        elif self._follow_fd is not None:
+            r, _, _ = select.select([self._follow_fd], [], [], 0)
+            if r:
+                raw_chunks = []
+                try:
+                    while True:
+                        chunk = os.read(self._follow_fd, 65536)
+                        if not chunk:
+                            os.close(self._follow_fd); self._follow_fd = None; break
+                        raw_chunks.append(chunk)
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    pass
+                if raw_chunks:
+                    new_text = b''.join(raw_chunks).decode('utf-8', errors='replace')
+        if not new_text: return
+        near_bottom = self.cursor.row >= self.buf.line_count() - 2
+        # Partial-line state machine:
+        #   _follow_partial holds content of current incomplete last line.
+        #   buf.lines[-1] == _follow_partial when it's non-empty.
+        #   Split incoming text prepended with the old partial to get complete lines.
+        full = self._follow_partial + new_text
+        parts = full.split('\n')
+        new_partial = parts[-1]   # '' if new_text ended with \n
+        complete    = parts[:-1]  # every part that had a trailing \n
+        # Remove old partial from buf (it was sitting as the last line)
+        if self._follow_partial and self.buf.lines:
+            self.buf.lines.pop()
+        self.buf.lines.extend(complete)
+        if new_partial:
+            self.buf.lines.append(new_partial)
+        if not self.buf.lines:
+            self.buf.lines = ['']
+        self._follow_partial = new_partial
+        self.buf._gen += 1
+        if near_bottom:
+            self.cursor.row = self.buf.line_count() - 1; self._clamp()
+
     def _dispatch(self, key):
+        if self._confirm_cb is not None:
+            if key in (ord('y'), ord('Y')):
+                cb=self._confirm_cb; self._confirm_cb=None; self._confirm_msg=''; cb()
+            else:
+                self._confirm_cb=None; self._confirm_msg=''
+                self.status_msg='Cancelled'; self.status_err=False
+            return
         if   self.mode==Mode.NORMAL:      self._normal(key)
         elif self.mode==Mode.INSERT:      self._insert(key)
         elif self.mode==Mode.VISUAL:      self._visual(key)
@@ -1430,6 +1555,8 @@ class Editor:
         elif self.mode==Mode.COMMAND:     self._command_key(key)
         elif self.mode==Mode.SEARCH:      self._search_key(key)
         elif self.mode==Mode.EXPLORER:    self._explorer_key(key)
+        elif self.mode==Mode.HISTORY:     self._history_key(key)
+        elif self.mode==Mode.PICKER:      self._picker_key(key)
 
     # ── Normal mode ───────────────────────────────────────────────────────────
 
@@ -1591,6 +1718,7 @@ class Editor:
         elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
         elif ch=='z': self._normal_z()
         elif key==5:  self._eval_region(self.cursor.row, self.cursor.row)  # Ctrl-E
+        elif key==15: self._jump_back()   # Ctrl-O
         elif key==23: self._ctrl_w()   # Ctrl-W
         elif key==26:                  # Ctrl-Z suspend
             import signal
@@ -1602,6 +1730,149 @@ class Editor:
         elif key==curses.KEY_END:
             self.cursor.col=max(0,len(self.buf.get_line(self.cursor.row))-1)
 
+    # ── Jump stack ────────────────────────────────────────────────────────────
+
+    def _push_jump(self):
+        self._jump_stack.append((self.cursor.row, self.cursor.col))
+
+    def _jump_back(self):
+        if self._jump_stack:
+            row, col = self._jump_stack.pop()
+            self.cursor.row = row; self.cursor.col = col; self._clamp()
+        else:
+            self.status_msg = 'Already at oldest position'
+
+    # ── AST navigation ────────────────────────────────────────────────────────
+
+    def _ast_defs(self, name, src):
+        try: tree = ast.parse(src)
+        except SyntaxError: return []
+        results = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == name:
+                    results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    n = alias.asname or alias.name.split('.')[0]
+                    if n == name:
+                        results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    n = alias.asname or alias.name
+                    if n == name:
+                        results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, ast.NamedExpr):
+                if node.target.id == name:
+                    results.append((node.target.lineno-1, node.target.col_offset))
+            elif isinstance(node, ast.comprehension):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+        results.sort()
+        return list(dict.fromkeys(results))
+
+    def _ast_refs(self, name, src):
+        try: tree = ast.parse(src)
+        except SyntaxError: return []
+        results = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == name:
+                results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == name:
+                    results.append((node.lineno-1, node.col_offset))
+        results.sort()
+        return list(dict.fromkeys(results))
+
+    def _py_file(self):
+        return bool(self.buf.filename and self.buf.filename.endswith(('.py', '.pyw')))
+
+    def _gd(self):
+        if not self._py_file():
+            self.status_msg = 'gd: Python files only'; self.status_err = True; return
+        word = self._word_under_cursor()
+        if not word: self.status_msg = 'No word under cursor'; return
+        src = '\n'.join(self.buf.lines)
+        defs = self._ast_defs(word, src)
+        if not defs:
+            self.status_msg = f'No definition: {word!r}'; self.status_err = True; return
+        self._push_jump()
+        if len(defs) == 1:
+            self.cursor.row, self.cursor.col = defs[0]; self._first_nonblank(); return
+        entries = [(f'L{r+1}: {self.buf.get_line(r).strip()[:60]}', r, 0) for r, _ in defs]
+        self._open_picker(f'Definitions of {word!r}', entries)
+
+    def _gr(self):
+        if not self._py_file():
+            self.status_msg = 'gr: Python files only'; self.status_err = True; return
+        word = self._word_under_cursor()
+        if not word: self.status_msg = 'No word under cursor'; return
+        src = '\n'.join(self.buf.lines)
+        refs = self._ast_refs(word, src)
+        if not refs:
+            self.status_msg = f'No references: {word!r}'; self.status_err = True; return
+        entries = [(f'L{r+1}: {self.buf.get_line(r).strip()[:60]}', r, c) for r, c in refs]
+        self._push_jump()
+        self._open_picker(f'References to {word!r} ({len(refs)})', entries)
+
+    # ── Picker (multi-result navigation) ─────────────────────────────────────
+
+    def _open_picker(self, title, entries):
+        self.picker_title = title
+        self.picker_entries = entries
+        self.picker_sel = 0; self.picker_top = 0
+        self.mode = Mode.PICKER
+
+    def _draw_picker(self):
+        self.stdscr.erase(); w = self.width
+        self._as(0, 0, f' {self.picker_title} '[:w-1].ljust(w-1), curses.color_pair(1)|curses.A_BOLD)
+        self._as(1, 0, '─'*(w-1), curses.A_DIM)
+        body_h = self.height - 4; n = len(self.picker_entries)
+        if self.picker_sel < self.picker_top: self.picker_top = self.picker_sel
+        elif self.picker_sel >= self.picker_top+body_h: self.picker_top = self.picker_sel-body_h+1
+        for i in range(body_h):
+            idx = self.picker_top+i
+            if idx >= n: break
+            label, row, col = self.picker_entries[idx]
+            display = ('  '+label)[:w-1].ljust(w-1)
+            attr = (curses.color_pair(8)|curses.A_BOLD if idx == self.picker_sel else 0)
+            self._as(2+i, 0, display, attr)
+        footer = ' j/k:move  Enter:jump  q/Esc:close  Ctrl-O:back '
+        self._as(self.height-2, 0, footer[:w-1].ljust(w-1), curses.color_pair(1))
+        if self.status_msg:
+            self._as(self.height-1, 0, self.status_msg[:w-1],
+                     curses.color_pair(4) if self.status_err else 0)
+        self.stdscr.refresh()
+
+    def _picker_key(self, key):
+        ch = chr(key) if 32<=key<=126 else None
+        n = len(self.picker_entries)
+        if   key==curses.KEY_UP   or ch=='k': self.picker_sel = max(0, self.picker_sel-1)
+        elif key==curses.KEY_DOWN or ch=='j': self.picker_sel = min(n-1, self.picker_sel+1)
+        elif key==6  or key==curses.KEY_NPAGE: self.picker_sel=min(n-1,self.picker_sel+max(1,self.height-6))
+        elif key==2  or key==curses.KEY_PPAGE: self.picker_sel=max(0,self.picker_sel-max(1,self.height-6))
+        elif key==curses.KEY_HOME: self.picker_sel = 0
+        elif key==curses.KEY_END:  self.picker_sel = n-1
+        elif key in (10, 13) or key==curses.KEY_RIGHT:
+            if self.picker_entries:
+                _, row, col = self.picker_entries[self.picker_sel]
+                self.mode = Mode.NORMAL; self.cursor.row = row; self.cursor.col = col; self._clamp()
+        elif ch=='q' or key==27 or key==15:   # q / Esc / Ctrl-O
+            self.mode = Mode.NORMAL; self._jump_back()
+
     def _normal_g(self, count):
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
         if ch2=='g': self.cursor.row=max(0,count-1); self._first_nonblank()
@@ -1609,6 +1880,8 @@ class Editor:
             line=self.buf.get_line(self.cursor.row); self.cursor.col=max(0,len(line.rstrip())-1)
         elif ch2=='e': self._word_end(False)
         elif ch2=='E': self._word_end(True)
+        elif ch2=='d': self._gd()
+        elif ch2=='r': self._gr()
 
     def _normal_z(self):
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
@@ -2144,6 +2417,13 @@ class Editor:
         except Exception:
             self.status_msg = traceback.format_exc().splitlines()[-1]; self.status_err = True
 
+    def _disk_changed(self, fname=None):
+        """Return True if the file on disk has been modified since we last read/wrote it."""
+        target=fname or self.buf.filename
+        if not target: return False
+        try: return os.path.getmtime(target) != self.buf._disk_mtime
+        except OSError: return False
+
     def _exec_cmd(self, cmd):
         cmd=cmd.strip()
         if not cmd: return
@@ -2169,14 +2449,32 @@ class Editor:
             self._close_pane(force=True)
         elif re.match(r'^wq?!?$',cmd) or cmd in ('x','wq','x!'):
             parts=cmd.split(None,1); fname=parts[1] if len(parts)>1 else None
-            try: self.buf.save(fname); self._close_pane(force=True)
-            except Exception as e: self.status_msg=str(e); self.status_err=True
+            force='!' in cmd or cmd=='x'
+            if not force and self._disk_changed(fname):
+                def _do_wq(f=fname):
+                    try: self.buf.save(f); self._close_pane(force=True)
+                    except Exception as e: self.status_msg=str(e); self.status_err=True
+                self._confirm_cb=_do_wq
+                self._confirm_msg=f'"{fname or self.buf.filename}" changed on disk. Overwrite? [y/N] '
+            else:
+                try: self.buf.save(fname); self._close_pane(force=True)
+                except Exception as e: self.status_msg=str(e); self.status_err=True
         elif cmd.startswith('w') and (len(cmd)==1 or cmd[1] in ' !'):
             parts=cmd.split(None,1); fname=parts[1] if len(parts)>1 else None
-            try:
-                self.buf.save(fname)
-                self.status_msg=f'"{self.buf.filename}" {self.buf.line_count()}L written'
-            except Exception as e: self.status_msg=str(e); self.status_err=True
+            force='!' in cmd
+            if not force and self._disk_changed(fname):
+                def _do_w(f=fname):
+                    try:
+                        self.buf.save(f)
+                        self.status_msg=f'"{self.buf.filename}" {self.buf.line_count()}L written'
+                    except Exception as e: self.status_msg=str(e); self.status_err=True
+                self._confirm_cb=_do_w
+                self._confirm_msg=f'"{fname or self.buf.filename}" changed on disk. Overwrite? [y/N] '
+            else:
+                try:
+                    self.buf.save(fname)
+                    self.status_msg=f'"{self.buf.filename}" {self.buf.line_count()}L written'
+                except Exception as e: self.status_msg=str(e); self.status_err=True
         elif cmd.startswith('e ') or cmd.startswith('edit '):
             parts=cmd.split(None,1)
             if len(parts)>1: self._load_file(parts[1].strip())
@@ -2204,6 +2502,14 @@ class Editor:
         elif re.match(r'^[Ee]x(plore)?(\s|$)',cmd) or re.match(r'^[Ll]ex(plore)?(\s|$)',cmd):
             parts=cmd.split(None,1); path=parts[1].strip() if len(parts)>1 else None
             self._open_explorer(path)
+        elif cmd in ('history','historyw','undolist'):
+            self.hist_sel=0; self.hist_top=0; self.hist_preview_scroll=0
+            self._hist_git_cache=self._git_hist(); self._hist_preview_cache={}
+            self.mode=Mode.HISTORY
+        elif re.match(r'^earlier\b',cmd):
+            self._cmd_earlier_later(cmd, forward=False)
+        elif re.match(r'^later\b',cmd):
+            self._cmd_earlier_later(cmd, forward=True)
         elif re.match(r'^[vV]?sp(lit)?(\s|$)',cmd,re.IGNORECASE):
             m=re.match(r'^([vV]?)sp(?:lit)?\s*(.*)',cmd,re.IGNORECASE)
             if m:
@@ -2258,6 +2564,243 @@ class Editor:
             if len(self.cmd_line)>1: self.cmd_line=self.cmd_line[:-1]
             else: self.mode=Mode.NORMAL; self.cmd_line=''; self.search_pat=''
         elif 32<=key<=126: self.cmd_line+=chr(key)
+
+    # ── History ───────────────────────────────────────────────────────────────
+
+    def _cmd_earlier_later(self, cmd, forward):
+        parts=cmd.split(None,1); arg=parts[1].strip() if len(parts)>1 else '1'
+        m=re.match(r'^(\d+)([smh]?)$',arg)
+        if not m: self.status_msg=f'Invalid argument: {arg}'; self.status_err=True; return
+        n=int(m.group(1)); unit=m.group(2)
+        if unit:
+            secs={'s':1,'m':60,'h':3600}[unit]*n; target=time.time()-secs; steps=0
+            if forward:
+                while self.buf._redo and self.buf._redo[-1][1]>target: self.buf.redo(); steps+=1
+            else:
+                while self.buf._undo and self.buf._undo[-1][1]>=target: self.buf.undo(); steps+=1
+            self.status_msg=f'{"later" if forward else "earlier"} {n}{unit}: {steps} change{"s" if steps!=1 else ""}'
+        else:
+            steps=0
+            for _ in range(n):
+                ok=self.buf.redo() if forward else self.buf.undo()
+                if not ok: break
+                steps+=1
+            self.status_msg=f'{"Later" if forward else "Earlier"} {steps} change{"s" if steps!=1 else ""}'
+        self._clamp()
+
+    @staticmethod
+    def _rel_time(ts):
+        d=int(time.time()-ts)
+        if d<60:    return f'{d}s ago'
+        if d<3600:  return f'{d//60}m ago'
+        if d<86400: return f'{d//3600}h ago'
+        return f'{d//86400}d ago'
+
+    def _git_root_relpath(self):
+        """Return (git_root, relpath) for the current buffer, or (None, None)."""
+        fname=self.buf.filename
+        if not fname: return None,None
+        import subprocess
+        try:
+            r=subprocess.run(['git','rev-parse','--show-toplevel'],
+                capture_output=True,text=True,timeout=3,
+                cwd=os.path.dirname(os.path.abspath(fname)) or '.')
+            if r.returncode!=0: return None,None
+            root=r.stdout.strip()
+            return root,os.path.relpath(os.path.abspath(fname),root)
+        except Exception: return None,None
+
+    def _git_file_at(self, commit_hash):
+        """Return list[str] of the current file's lines at commit_hash, or []."""
+        if commit_hash in self._hist_preview_cache:
+            return self._hist_preview_cache[commit_hash]
+        root,relpath=self._git_root_relpath()
+        if root is None: return []
+        import subprocess
+        try:
+            r=subprocess.run(['git','show',f'{commit_hash}:{relpath}'],
+                capture_output=True,text=True,timeout=5,cwd=root)
+            lines=r.stdout.splitlines() if r.returncode==0 else []
+        except Exception: lines=[]
+        self._hist_preview_cache[commit_hash]=lines
+        return lines
+
+    def _git_hist(self):
+        fname=self.buf.filename
+        if not fname: return []
+        import subprocess
+        try:
+            r=subprocess.run(
+                ['git','log','--pretty=format:%h\t%at\t%s','--follow','--',fname],
+                capture_output=True,text=True,timeout=3,
+                cwd=os.path.dirname(os.path.abspath(fname)) or '.')
+            if r.returncode!=0 or not r.stdout.strip(): return []
+            out=[]
+            for line in r.stdout.strip().splitlines():
+                parts=line.split('\t',2)
+                if len(parts)==3:
+                    out.append({'hash':parts[0],'ts':float(parts[1]),'subject':parts[2]})
+            return out
+        except Exception: return []
+
+    def _git_load(self, commit_hash):
+        lines=self._git_file_at(commit_hash)
+        if not lines and not self.buf.filename: return
+        import subprocess
+        root,relpath=self._git_root_relpath()
+        if root is None:
+            self.status_msg='Not in a git repo'; self.status_err=True; return
+        self.buf.save_undo()
+        self.buf.lines=lines or ['']
+        self.buf._gen+=1; self.buf.modified=True
+        self.status_msg=f'Loaded {commit_hash}'
+
+    def _hist_entries(self):
+        entries=[]
+        entries.append({'kind':'undo','step':0,'nlines':len(self.buf.lines),'ts':time.time()})
+        for i,(snap,ts) in enumerate(reversed(self.buf._undo),1):
+            entries.append({'kind':'undo','step':i,'nlines':len(snap),'ts':ts})
+        if self._hist_git_cache:
+            entries.append({'kind':'divider','label':'── git history '})
+            for g in self._hist_git_cache:
+                entries.append({'kind':'git','hash':g['hash'],'ts':g['ts'],'subject':g['subject']})
+        return entries
+
+    def _hist_preview_lines(self, entry):
+        """Return (lines, is_diff) for the preview pane."""
+        try:
+            if entry['kind']=='undo':
+                step=entry['step']
+                if step==0:
+                    if self.hist_diff_mode and self.buf._undo:
+                        # Show what changed to get to current state
+                        prev_lines=list(self.buf._undo[-1][0])
+                        diff=list(difflib.unified_diff(prev_lines,self.buf.lines,
+                            fromfile='prev',tofile='now',lineterm='',n=3))
+                        return diff or ['(no changes)'],True
+                    return list(self.buf.lines),False
+                idx=len(self.buf._undo)-step
+                target=list(self.buf._undo[idx][0]) if 0<=idx<len(self.buf._undo) else list(self.buf.lines)
+            elif entry['kind']=='git':
+                target=self._git_file_at(entry['hash'])
+            else:
+                return [],False
+            if self.hist_diff_mode:
+                diff=list(difflib.unified_diff(target,self.buf.lines,
+                    fromfile=entry.get('hash',f'step {entry.get("step","")}'),tofile='now',
+                    lineterm='',n=3))
+                return diff or ['(no changes)'],True
+            return target,False
+        except Exception as exc:
+            return [f'Error: {exc}'],False
+
+    def _draw_history(self):
+        self.stdscr.erase(); w=self.width; h=self.height
+        entries=self._hist_entries(); n=len(entries); body_h=h-4
+
+        # Layout: left list | divider | right preview (only when wide enough)
+        has_preview=(w>=55)
+        left_w=min(36,w//2) if has_preview else w
+        rx=left_w+1; right_w=w-rx
+
+        # Header
+        fname=self.buf.filename or '[No Name]'
+        mode_lbl='diff' if self.hist_diff_mode else 'content'
+        self._as(0,0,f' History — {fname}  [{mode_lbl}]'[:w-1].ljust(w-1),curses.color_pair(1)|curses.A_BOLD)
+        self._as(1,0,'─'*(w-1),curses.A_DIM)
+
+        # Scroll list
+        if self.hist_sel<self.hist_top: self.hist_top=self.hist_sel
+        elif self.hist_sel>=self.hist_top+body_h: self.hist_top=self.hist_sel-body_h+1
+
+        # Left: history list
+        for i in range(body_h):
+            idx=self.hist_top+i; sy=2+i
+            if idx>=n: break
+            e=entries[idx]; sel=(idx==self.hist_sel); lw=left_w-1
+            if e['kind']=='divider':
+                self._as(sy,0,(e['label']+'─'*w)[:lw].ljust(lw),curses.A_DIM)
+            elif e['kind']=='undo':
+                ts_str=time.strftime('%H:%M:%S',time.localtime(e['ts']))
+                if e['step']==0:
+                    row=f'  {"now":<6}  {ts_str}  {e["nlines"]}L'
+                else:
+                    prev=entries[e['step']-1]['nlines']
+                    d=e['nlines']-prev
+                    row=f'  {e["step"]:<6}  {ts_str}  {e["nlines"]}L'+(f'  {"+"+str(d) if d>0 else str(d)}' if d else '')
+                self._as(sy,0,row[:lw].ljust(lw),curses.color_pair(8)|curses.A_BOLD if sel else 0)
+            elif e['kind']=='git':
+                rel=self._rel_time(e['ts'])
+                row=f'  {e["hash"]}  {rel:<9}  {e["subject"]}'
+                self._as(sy,0,row[:lw].ljust(lw),curses.color_pair(8)|curses.A_BOLD if sel else curses.color_pair(7))
+
+        # Right: preview pane
+        if has_preview:
+            for sy in range(2,h-2): self._as(sy,left_w,'│',curses.A_DIM)
+            cur_e=entries[self.hist_sel] if 0<=self.hist_sel<n else None
+            preview,is_diff=(self._hist_preview_lines(cur_e) if cur_e and cur_e['kind']!='divider' else ([],False))
+            max_scroll=max(0,len(preview)-body_h)
+            self.hist_preview_scroll=min(self.hist_preview_scroll,max_scroll)
+            def _diff_style(line):
+                """Return (line_attr, prefix_attr) for a unified diff line."""
+                if not line: return curses.A_DIM, 0
+                if line.startswith('---') or line.startswith('+++'):
+                    return curses.A_DIM, curses.A_DIM
+                c=line[0]
+                if c=='+': return curses.color_pair(20), curses.color_pair(20)|curses.A_BOLD
+                if c=='-': return curses.color_pair(21), curses.color_pair(21)|curses.A_BOLD
+                if c=='@': return curses.color_pair(22)|curses.A_BOLD, curses.color_pair(22)|curses.A_BOLD
+                return curses.A_DIM, curses.A_DIM  # context
+            for i in range(body_h):
+                sy=2+i; pidx=self.hist_preview_scroll+i
+                if pidx<len(preview):
+                    line=preview[pidx]
+                    if is_diff:
+                        la,pa=_diff_style(line)
+                        pad=right_w-1
+                        if line and len(line)>1 and pa!=la:
+                            self._as(sy,rx,line[0],pa)
+                            self._as(sy,rx+1,(line[1:pad]).ljust(pad-1),la)
+                        else:
+                            self._as(sy,rx,line[:pad].ljust(pad),la)
+                    else:
+                        self._as(sy,rx,line[:right_w-1].ljust(right_w-1),0)
+                else:
+                    self._as(sy,rx,' '*(right_w-1))
+
+        footer=' j/k:history  J/K:scroll preview  d:diff/content  Enter:restore  q:close'
+        self._as(h-2,0,footer[:w-1].ljust(w-1),curses.color_pair(1))
+        try: self.stdscr.move(h-1,0)
+        except curses.error: pass
+        self.stdscr.refresh()
+
+    def _history_key(self, key):
+        ch=chr(key) if 32<=key<=126 else None
+        entries=self._hist_entries(); n=len(entries)
+        def _skip(idx,step):
+            while 0<=idx<n and entries[idx]['kind']=='divider': idx+=step
+            return max(0,min(n-1,idx))
+        def _nav(new_sel):
+            self.hist_sel=new_sel; self.hist_preview_scroll=0
+        if   key==curses.KEY_UP   or ch=='k': _nav(_skip(self.hist_sel-1,-1))
+        elif key==curses.KEY_DOWN or ch=='j': _nav(_skip(self.hist_sel+1,1))
+        elif key==6  or key==curses.KEY_NPAGE: _nav(_skip(self.hist_sel+max(1,self.height-6),1))
+        elif key==2  or key==curses.KEY_PPAGE: _nav(_skip(self.hist_sel-max(1,self.height-6),-1))
+        elif key==curses.KEY_HOME: _nav(0)
+        elif key==curses.KEY_END:  _nav(_skip(n-1,-1))
+        elif ch=='J': self.hist_preview_scroll+=3
+        elif ch=='K': self.hist_preview_scroll=max(0,self.hist_preview_scroll-3)
+        elif ch=='d': self.hist_diff_mode=not self.hist_diff_mode; self.hist_preview_scroll=0
+        elif key in (10,13):
+            e=entries[self.hist_sel]
+            if e['kind']=='undo':
+                steps=e['step']
+                for _ in range(steps): self.buf.undo()
+                self._clamp(); self.mode=Mode.NORMAL
+                self.status_msg=f'Restored {steps} step{"s" if steps!=1 else ""} back' if steps else ''
+            elif e['kind']=='git':
+                self._git_load(e['hash']); self._clamp(); self.mode=Mode.NORMAL
+        elif ch=='q' or key==27: self.mode=Mode.NORMAL
 
     # ── Explorer ──────────────────────────────────────────────────────────────
 
@@ -2422,9 +2965,38 @@ HAS_256COLOR: bool = False   # populated by Editor.__init__ after curses.start_c
 
 def main():
     global HAS_SIXEL
+    import argparse, fcntl
+    parser = argparse.ArgumentParser(prog='pym', description='pyvim editor')
+    parser.add_argument('filename', nargs='?', default=None)
+    parser.add_argument('-f', '--follow', action='store_true',
+                        help='follow mode: tail new content as it arrives')
+    args = parser.parse_args()
+
+    stdin_content = None
+    follow_fd = None
+
+    if not sys.stdin.isatty():
+        if args.follow:
+            # Dup the pipe fd before redirecting stdin to /dev/tty
+            follow_fd = os.dup(sys.stdin.fileno())
+            flags = fcntl.fcntl(follow_fd, fcntl.F_GETFL)
+            fcntl.fcntl(follow_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        else:
+            stdin_content = sys.stdin.buffer.read().decode('utf-8', errors='replace')
+        # Hand /dev/tty to curses for keyboard input
+        try:
+            tty_fd = os.open('/dev/tty', os.O_RDONLY)
+            os.dup2(tty_fd, sys.stdin.fileno())
+            os.close(tty_fd)
+            sys.stdin = open('/dev/tty', 'r')
+        except OSError as e:
+            sys.exit(f'pym: cannot open /dev/tty: {e}')
+
     HAS_SIXEL = _probe_sixel()
-    filename=sys.argv[1] if len(sys.argv)>1 else None
-    curses.wrapper(lambda s: Editor(s, filename).run())
+    curses.wrapper(lambda s: Editor(s, args.filename,
+                                    stdin_content=stdin_content,
+                                    follow=args.follow,
+                                    follow_fd=follow_fd).run())
 
 if __name__=='__main__':
     main()
