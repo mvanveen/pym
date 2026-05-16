@@ -6,9 +6,79 @@ import re
 import sys
 import copy
 import select
+import sqlite3
 import termios
+import time
 import tty
 from enum import Enum, auto
+
+# ── ~/.pym/ config and archive ────────────────────────────────────────────────
+
+PYM_DIR  = os.path.expanduser('~/.pym')
+PYM_TOML = os.path.join(PYM_DIR, 'pym.toml')
+PYM_DB   = os.path.join(PYM_DIR, 'archive.db')
+
+def _ensure_pym_dir():
+    os.makedirs(PYM_DIR, exist_ok=True)
+
+def _db():
+    """Return a connection to the archive DB, creating schema if needed."""
+    _ensure_pym_dir()
+    con = sqlite3.connect(PYM_DB)
+    con.execute('''CREATE TABLE IF NOT EXISTS archive (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        path      TEXT NOT NULL,
+        saved_at  REAL NOT NULL,
+        content   TEXT NOT NULL
+    )''')
+    con.execute('CREATE INDEX IF NOT EXISTS archive_path ON archive(path, saved_at)')
+    con.commit()
+    return con
+
+def archive_write(path: str, content: str):
+    """Append a snapshot of content to the archive."""
+    try:
+        with _db() as con:
+            con.execute('INSERT INTO archive (path, saved_at, content) VALUES (?,?,?)',
+                        (os.path.abspath(path), time.time(), content))
+    except Exception:
+        pass
+
+def archive_latest(path: str) -> tuple[float, str] | None:
+    """Return (saved_at, content) of the most recent snapshot, or None."""
+    try:
+        with _db() as con:
+            row = con.execute(
+                'SELECT saved_at, content FROM archive WHERE path=? ORDER BY saved_at DESC LIMIT 1',
+                (os.path.abspath(path),)).fetchone()
+        return row
+    except Exception:
+        return None
+
+def archive_purge(path: str, keep: int = 50):
+    """Keep only the most recent `keep` snapshots for a path."""
+    try:
+        with _db() as con:
+            con.execute('''DELETE FROM archive WHERE path=? AND id NOT IN (
+                SELECT id FROM archive WHERE path=? ORDER BY saved_at DESC LIMIT ?)''',
+                (os.path.abspath(path), os.path.abspath(path), keep))
+    except Exception:
+        pass
+
+def _load_pym_toml() -> dict:
+    """Parse ~/.pym/pym.toml into a flat dict of key=value strings."""
+    cfg = {}
+    try:
+        with open(PYM_TOML) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'): continue
+                if '=' in line:
+                    k, _, v = line.partition('=')
+                    cfg[k.strip()] = v.strip().strip('"\'')
+    except FileNotFoundError:
+        pass
+    return cfg
 
 # ── Modes ────────────────────────────────────────────────────────────────────
 
@@ -35,6 +105,7 @@ class Buffer:
         self.modified = False
         self._undo = []; self._redo = []
         self._gen = 0  # incremented on every mutation; used as highlight cache key
+        self._archive_newer = None  # set by from_file if archive has newer snapshot
 
     def save_undo(self):
         self._undo.append(copy.deepcopy(self.lines))
@@ -94,13 +165,27 @@ class Buffer:
             with open(filename, 'r', errors='replace') as f: content = f.read()
             lines = content.splitlines(); b.lines = lines if lines else ['']
         except FileNotFoundError: b.lines = ['']
-        b.modified = False; return b
+        b.modified = False
+        # Check archive for a newer unsaved snapshot
+        b._archive_newer = None
+        try:
+            snap = archive_latest(filename)
+            if snap:
+                disk_mtime = os.path.getmtime(filename) if os.path.exists(filename) else 0
+                if snap[0] > disk_mtime:
+                    b._archive_newer = snap   # (saved_at, content) — caller may offer recovery
+        except Exception:
+            pass
+        return b
 
     def save(self, filename=None):
         fname = filename or self.filename
         if not fname: raise ValueError('No file name')
-        with open(fname, 'w') as f: f.write('\n'.join(self.lines) + '\n')
+        content = '\n'.join(self.lines) + '\n'
+        with open(fname, 'w') as f: f.write(content)
         self.filename = fname; self.modified = False
+        archive_write(fname, content)
+        archive_purge(fname)
 
 class Pane:
     def __init__(self, buf=None):
@@ -703,6 +788,10 @@ class Editor:
         self.last_f_till   = False
         self.marks   = {}
         self.running = True
+        self._cfg    = _load_pym_toml()
+        # Apply config
+        if self._cfg.get('line_numbers', 'true').lower() in ('false', '0', 'off'):
+            self.show_numbers = False
         self._pending_sixels: list = []   # [(scr_y, scr_x, path, max_w, max_h)]
 
         # Explorer state
@@ -1580,6 +1669,25 @@ class Editor:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
+        # Offer archive recovery for any buffer that has a newer snapshot
+        for p in _lc_panes(self._layout):
+            if p.buf._archive_newer and p.buf.filename:
+                snap_at, snap_content = p.buf._archive_newer
+                import datetime
+                age = datetime.datetime.fromtimestamp(snap_at).strftime('%Y-%m-%d %H:%M:%S')
+                self._clamp(); self._scroll(); self.draw()
+                self._as(self.height-1, 0,
+                    f' Archive snapshot {age} — [r]ecover [d]iscard '[:self.width-1],
+                    curses.color_pair(2))
+                self.stdscr.refresh()
+                k = self.stdscr.getch()
+                if chr(k) if 32<=k<=126 else '' == 'r':
+                    p.buf.save_undo()
+                    p.buf.lines = snap_content.splitlines() or ['']
+                    p.buf._gen += 1; p.buf.modified = True
+                    self.status_msg = 'Recovered from archive'
+                p.buf._archive_newer = None
+
         # Use a 250 ms timeout so getch() returns -1 periodically for tail checks
         any_following = any(p.following for p in _lc_panes(self._layout))
         if any_following:
@@ -2425,6 +2533,10 @@ class Editor:
             else:
                 self.running=False
         elif cmd in ('qa!','qall!'):
+            # Archive any dirty buffers before force-quitting
+            for p in self._panes:
+                if p.buf.modified and p.buf.filename:
+                    archive_write(p.buf.filename, '\n'.join(p.buf.lines) + '\n')
             self.running=False
         elif cmd in ('q','quit'):
             if self.buf.modified:
@@ -2432,6 +2544,9 @@ class Editor:
             else:
                 self._close_pane()
         elif cmd in ('q!','quit!'):
+            p = self._cur_pane()
+            if p.buf.modified and p.buf.filename:
+                archive_write(p.buf.filename, '\n'.join(p.buf.lines) + '\n')
             self._close_pane(force=True)
         elif re.match(r'^wq?!?$',cmd) or cmd in ('x','wq','x!'):
             parts=cmd.split(None,1); fname=parts[1] if len(parts)>1 else None
