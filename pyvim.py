@@ -365,8 +365,27 @@ def _encode_sixel(path: str, max_w: int, max_h: int):
 
 
 def _rgb_to_256(r: int, g: int, b: int) -> int:
-    """Nearest xterm-256 index for an RGB value using the 6x6x6 color cube."""
+    """Nearest xterm-256 index using the 6x6x6 color cube (indices 16-231)."""
     return 16 + 36 * round(r * 5 / 255) + 6 * round(g * 5 / 255) + round(b * 5 / 255)
+
+
+def _rgb_to_8(r: int, g: int, b: int) -> int:
+    """Nearest ANSI 8-color index (0-7) for terminals without 256-color support."""
+    bright = (r * 299 + g * 587 + b * 114) // 1000
+    if bright < 48:  return 0  # black
+    if bright > 200: return 7  # white
+    hi = max(r, g, b)
+    rd = r > hi * 0.5
+    gr = g > hi * 0.5
+    bl = b > hi * 0.5
+    if rd and gr and bl: return 7   # white-ish
+    if rd and gr:        return 3   # yellow
+    if rd and bl:        return 5   # magenta
+    if gr and bl:        return 6   # cyan
+    if rd:               return 1
+    if gr:               return 2
+    if bl:               return 4
+    return 0
 
 
 def _encode_color_text(path: str, max_w: int, max_h: int):
@@ -377,7 +396,7 @@ def _encode_color_text(path: str, max_w: int, max_h: int):
         mtime = os.path.getmtime(path)
     except OSError:
         return None
-    key = (path, mtime, max_w, max_h)
+    key = (path, mtime, max_w, max_h, HAS_256COLOR)
     if key in _colortext_cache:
         return _colortext_cache[key]
     try:
@@ -399,7 +418,14 @@ def _encode_color_text(path: str, max_w: int, max_h: int):
             for col in range(w):
                 tr, tg, tb = pix[col, row]
                 br2, bg2, bb2 = pix[col, row + 1]
-                parts.append(f'\033[38;5;{_rgb_to_256(tr,tg,tb)};48;5;{_rgb_to_256(br2,bg2,bb2)}m▀')
+                if HAS_256COLOR:
+                    tc = _rgb_to_256(tr, tg, tb)
+                    bc = _rgb_to_256(br2, bg2, bb2)
+                    parts.append(f'\033[38;5;{tc};48;5;{bc}m▀')
+                else:
+                    tc = _rgb_to_8(tr, tg, tb)
+                    bc = _rgb_to_8(br2, bg2, bb2)
+                    parts.append(f'\033[3{tc};4{bc}m▀')
             parts.append('\033[0m')
             lines.append(''.join(parts))
         result = (lines, w, h // 2)
@@ -681,6 +707,8 @@ class Editor:
 
         curses.start_color()
         curses.use_default_colors()
+        global HAS_256COLOR
+        HAS_256COLOR = curses.COLORS >= 256
         curses.init_pair(1,  curses.COLOR_BLACK,  curses.COLOR_CYAN)
         curses.init_pair(2,  curses.COLOR_BLACK,  curses.COLOR_YELLOW)
         curses.init_pair(3,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
@@ -2354,7 +2382,8 @@ def _probe_sixel() -> bool:
         pass
     return False
 
-HAS_SIXEL: bool = False   # populated by main() before curses takes over
+HAS_SIXEL:    bool = False   # populated by _probe_sixel() in main()
+HAS_256COLOR: bool = False   # populated by Editor.__init__ after curses.start_color()
 
 def main():
     global HAS_SIXEL
