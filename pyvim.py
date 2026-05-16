@@ -2729,6 +2729,8 @@ class Editor:
         elif key==curses.KEY_DOWN or ch=='j': self.ex_sel=min(n-1,self.ex_sel+1)
         elif key==6 or key==curses.KEY_NPAGE: self.ex_sel=min(n-1,self.ex_sel+max(1,self.height-6))
         elif key==2 or key==curses.KEY_PPAGE: self.ex_sel=max(0,self.ex_sel-max(1,self.height-6))
+        elif key==4: self.ex_sel=min(n-1,self.ex_sel+max(1,(self.height-4)//2))  # Ctrl-D
+        elif key==21: self.ex_sel=max(0,self.ex_sel-max(1,(self.height-4)//2))   # Ctrl-U
         elif key==curses.KEY_HOME: self.ex_sel=0
         elif key==curses.KEY_END:  self.ex_sel=n-1
         elif key in (10,13) or key==curses.KEY_RIGHT: self._ex_open()
