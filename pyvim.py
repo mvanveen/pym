@@ -109,6 +109,14 @@ class Pane:
         self.top_row = 0; self.left_col = 0
         # Screen geometry (set by layout engine)
         self.y = 0; self.x = 0; self.height = 24; self.width = 80
+        # Follow-mode state
+        self.following   = False   # True → auto-tail the file
+        self._file_size  = 0       # last known on-disk size for tail detection
+        # Filter state
+        self.filter_pat       = ''    # active substring filter (case-insensitive)
+        self.filter_active    = False # filter is confirmed and in effect
+        self.filter_bar_open  = False # filter input bar is currently shown
+        self.filter_input     = ''    # text being typed in the filter bar
 
 # ── Layout tree ──────────────────────────────────────────────────────────────
 
@@ -852,40 +860,120 @@ class Editor:
         except re.error:
             spat = None
 
-        for sy in range(pane.height):
-            br = pane.top_row + sy
-            scr_y = pane.y + sy
-            scr_x = pane.x
+        # Filter bar: draw at top of pane, reserve one screen row
+        filter_row_offset = 0
+        if pane.filter_bar_open and is_active:
+            filter_row_offset = 1
+            prompt = ('/ ' + pane.filter_input + ' ' * pane.width)[:pane.width - 1]
+            self._as(pane.y, pane.x, prompt, curses.color_pair(2))
 
-            if br >= pane.buf.line_count():
-                self._as(scr_y, scr_x, '~', curses.A_DIM); continue
+        # Determine if lines should be filtered
+        fp_lower = pane.filter_pat.lower() if (pane.filter_active and pane.filter_pat) else ''
 
-            if self.show_numbers:
-                ns = str(br+1).rjust(lnw-1) + ' '
-                na = (curses.color_pair(6)|curses.A_BOLD
-                      if is_active and br == pane.cursor.row
-                      else curses.color_pair(5))
-                self._as(scr_y, scr_x, ns, na)
+        # When filter is active we must iterate buffer rows differently:
+        # we skip non-matching lines and map matching ones to screen rows.
+        avail_sy = pane.height - filter_row_offset
 
-            line = pane.buf.get_line(br)
-            if br in img_map and not (is_active and br == pane.cursor.row):
-                path, _alt = img_map[br]
-                self._pending_sixels.append(
-                    (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
-            if md_table:
-                is_cur = is_active and br == pane.cursor.row
-                # Table rows in normal mode: always show rendered (cell nav keeps
-                # cursor at cell-start so column accuracy isn't needed).
-                # Insert mode or non-table cursor row: show raw for accurate editing.
-                show_raw_cur = is_cur and (in_insert or not _is_table_row(line))
-                raw = show_raw_cur or br in vis_rows
-                display, hl_row = (line, []) if raw else (
-                    md_table[br] if br < len(md_table) else (line, []))
+        if fp_lower:
+            # Build list of matching buffer rows visible starting from top_row
+            # (top_row for filtered view is an index into matching rows)
+            # We scan from row 0 to find the Nth matching row (pane.top_row)
+            # then render avail_sy of them.
+            match_idx = 0
+            br = 0
+            line_count = pane.buf.line_count()
+            # Find the matching row that corresponds to top_row offset
+            # pane.top_row in filtered mode = skip this many matching rows
+            rendered = 0
+            skip = pane.top_row
+            # Walk through buffer, skip first `skip` matching rows
+            scan = 0
+            first_buf_row = 0
+            skipped = 0
+            while scan < line_count:
+                ln = pane.buf.get_line(scan)
+                if fp_lower in ln.lower():
+                    if skipped >= skip:
+                        first_buf_row = scan
+                        break
+                    skipped += 1
+                scan += 1
             else:
-                display = line
-                hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
-            self._render_line(scr_y, scr_x + lnw, display, lc, tw,
-                              vis_rows, vis_range, br, spat, hl_row, is_active)
+                first_buf_row = line_count  # nothing to show
+
+            # Now render from first_buf_row forward
+            sy_offset = 0
+            br = first_buf_row
+            while sy_offset < avail_sy and br < line_count:
+                line = pane.buf.get_line(br)
+                if fp_lower not in line.lower():
+                    br += 1; continue
+                scr_y = pane.y + filter_row_offset + sy_offset
+                scr_x = pane.x
+                if self.show_numbers:
+                    ns = str(br+1).rjust(lnw-1) + ' '
+                    na = (curses.color_pair(6)|curses.A_BOLD
+                          if is_active and br == pane.cursor.row
+                          else curses.color_pair(5))
+                    self._as(scr_y, scr_x, ns, na)
+                if br in img_map and not (is_active and br == pane.cursor.row):
+                    path, _alt = img_map[br]
+                    self._pending_sixels.append(
+                        (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
+                if md_table:
+                    is_cur = is_active and br == pane.cursor.row
+                    show_raw_cur = is_cur and (in_insert or not _is_table_row(line))
+                    raw = show_raw_cur or br in vis_rows
+                    display, hl_row = (line, []) if raw else (
+                        md_table[br] if br < len(md_table) else (line, []))
+                else:
+                    display = line
+                    hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
+                self._render_line(scr_y, scr_x + lnw, display, lc, tw,
+                                  vis_rows, vis_range, br, spat, hl_row, is_active)
+                sy_offset += 1
+                br += 1
+            # Fill remaining rows with ~
+            while sy_offset < avail_sy:
+                scr_y = pane.y + filter_row_offset + sy_offset
+                self._as(scr_y, pane.x, '~', curses.A_DIM)
+                sy_offset += 1
+        else:
+            # Normal (non-filtered) rendering
+            for sy in range(avail_sy):
+                br = pane.top_row + sy
+                scr_y = pane.y + filter_row_offset + sy
+                scr_x = pane.x
+
+                if br >= pane.buf.line_count():
+                    self._as(scr_y, scr_x, '~', curses.A_DIM); continue
+
+                if self.show_numbers:
+                    ns = str(br+1).rjust(lnw-1) + ' '
+                    na = (curses.color_pair(6)|curses.A_BOLD
+                          if is_active and br == pane.cursor.row
+                          else curses.color_pair(5))
+                    self._as(scr_y, scr_x, ns, na)
+
+                line = pane.buf.get_line(br)
+                if br in img_map and not (is_active and br == pane.cursor.row):
+                    path, _alt = img_map[br]
+                    self._pending_sixels.append(
+                        (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
+                if md_table:
+                    is_cur = is_active and br == pane.cursor.row
+                    # Table rows in normal mode: always show rendered (cell nav keeps
+                    # cursor at cell-start so column accuracy isn't needed).
+                    # Insert mode or non-table cursor row: show raw for accurate editing.
+                    show_raw_cur = is_cur and (in_insert or not _is_table_row(line))
+                    raw = show_raw_cur or br in vis_rows
+                    display, hl_row = (line, []) if raw else (
+                        md_table[br] if br < len(md_table) else (line, []))
+                else:
+                    display = line
+                    hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
+                self._render_line(scr_y, scr_x + lnw, display, lc, tw,
+                                  vis_rows, vis_range, br, spat, hl_row, is_active)
 
     def _render_line(self, sy, sx, line, lc, tw, vis_rows, vis_range, br,
                      spat, hl_row, is_active):
@@ -955,6 +1043,12 @@ class Editor:
         mod   = ' [+]' if self.buf.modified else ''
         pos   = f' {self.cursor.row+1}:{self.cursor.col+1} '
 
+        # Follow-mode / filter indicator appended to filename area
+        follow_ind = ' -- FOLLOW --' if self._pane.following else ''
+        filter_ind = ''
+        if self._pane.filter_active and self._pane.filter_pat and not self._pane.filter_bar_open:
+            filter_ind = f'  [/{self._pane.filter_pat}]'
+
         if self.mode in (Mode.COMMAND, Mode.SEARCH):
             self._as(self.height-1, 0, (self.cmd_line+' '*self.width)[:self.width-1])
         elif self.status_msg:
@@ -962,12 +1056,13 @@ class Editor:
                      (self.status_msg+' '*self.width)[:self.width-1],
                      curses.color_pair(4) if self.status_err else 0)
         else:
-            info = f' {ml}  {fname}{mod}'
+            info = f' {ml}  {fname}{mod}{follow_ind}{filter_ind}'
             bar  = info.ljust(self.width-len(pos)-1) + pos
             self._as(self.height-1, 0, bar[:self.width-1], curses.color_pair(1))
 
         cnt  = f' {self.pending_count}' if self.pending_count else ''
-        bar2 = (ml+cnt).ljust(self.width-1)
+        follow_label = ' FOLLOW ' if self._pane.following else ''
+        bar2 = (ml + follow_label + cnt).ljust(self.width-1)
         self._as(self.height-2, 0, bar2[:self.width-1], curses.color_pair(1))
 
     def _place_cursor(self):
@@ -976,8 +1071,14 @@ class Editor:
             except curses.error: pass
             return
         p = self._pane
+        # Filter bar: place cursor in filter input line when open
+        if p.filter_bar_open:
+            try: self.stdscr.move(p.y, min(p.x + 2 + len(p.filter_input), self.width-1))
+            except curses.error: pass
+            return
         lnw = self._pane_lnw(p)
-        sy  = p.y + p.cursor.row - p.top_row
+        filter_row_offset = 1 if p.filter_bar_open else 0
+        sy  = p.y + filter_row_offset + p.cursor.row - p.top_row
         col = p.cursor.col
         # TABLE mode: cursor.col is a buffer col, but the screen shows rendered
         # box-drawing where cells are padded to equal widths.  Map to visual col.
@@ -995,7 +1096,7 @@ class Editor:
                             col = pipes[ci] + 2  # land after '│ '
         sx = p.x + lnw + col - p.left_col
         try:
-            self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)),
+            self.stdscr.move(max(p.y + filter_row_offset, min(sy, p.y+p.height-1)),
                              max(p.x, min(sx, p.x+p.width-1)))
         except curses.error: pass
 
@@ -1022,8 +1123,24 @@ class Editor:
         th = p.height
         lnw = self._pane_lnw(p)
         tw  = p.width - lnw
-        if p.cursor.row < p.top_row: p.top_row = p.cursor.row
-        elif p.cursor.row >= p.top_row + th: p.top_row = p.cursor.row - th + 1
+        fp = p.filter_pat.lower() if (p.filter_active and p.filter_pat) else ''
+        if fp:
+            # In filtered mode top_row is the index of the first *matching* row to show.
+            # Count matching rows up to (and including) cursor.row to find its match index.
+            filter_row_offset = 1 if p.filter_bar_open else 0
+            avail = th - filter_row_offset
+            match_idx = 0  # 0-based index of cursor in matching rows
+            for r in range(p.cursor.row):
+                if fp in p.buf.get_line(r).lower():
+                    match_idx += 1
+            # Cursor row must be in [top_row, top_row + avail - 1]
+            if match_idx < p.top_row:
+                p.top_row = match_idx
+            elif match_idx >= p.top_row + avail:
+                p.top_row = match_idx - avail + 1
+        else:
+            if p.cursor.row < p.top_row: p.top_row = p.cursor.row
+            elif p.cursor.row >= p.top_row + th: p.top_row = p.cursor.row - th + 1
         if p.cursor.col < p.left_col: p.left_col = max(0, p.cursor.col-5)
         elif p.cursor.col >= p.left_col + tw: p.left_col = p.cursor.col - tw + 6
 
@@ -1413,16 +1530,81 @@ class Editor:
             self.cursor.col=max(0,len(line)-1)
         self.status_msg=''
 
+    # ── Follow-mode tail check ────────────────────────────────────────────────
+
+    def _tail_check(self):
+        """Called on each -1 timeout tick.  For every pane that is following,
+        check if the file has grown; if so, append only the new lines."""
+        for pane in _lc_panes(self._layout):
+            if not pane.following:
+                continue
+            fname = pane.buf.filename
+            if not fname:
+                continue
+            try:
+                new_size = os.path.getsize(fname)
+            except OSError:
+                continue
+            if new_size <= pane._file_size:
+                continue
+            # File grew — read only the new bytes
+            try:
+                with open(fname, 'r', errors='replace') as f:
+                    f.seek(pane._file_size)
+                    new_text = f.read(new_size - pane._file_size)
+            except OSError:
+                continue
+            pane._file_size = new_size
+            new_lines = new_text.splitlines()
+            if not new_lines:
+                continue
+            # Apply filter: silently drop non-matching lines
+            if pane.filter_active and pane.filter_pat:
+                fp = pane.filter_pat.lower()
+                new_lines = [l for l in new_lines if fp in l.lower()]
+            if not new_lines:
+                continue
+            # Append to buffer (replace trailing empty sentinel if present)
+            buf = pane.buf
+            if buf.lines == ['']:
+                buf.lines = new_lines
+            else:
+                buf.lines.extend(new_lines)
+            buf._gen += 1
+            # Auto-scroll to bottom
+            last = buf.line_count() - 1
+            pane.cursor.row = last
+            pane.cursor.col = 0
+            pane.top_row = max(0, last - pane.height + 1)
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
+        # Use a 250 ms timeout so getch() returns -1 periodically for tail checks
+        any_following = any(p.following for p in _lc_panes(self._layout))
+        if any_following:
+            self.stdscr.timeout(250)
         while self.running:
+            # Re-evaluate whether we need a timeout each iteration (follow may change)
+            currently_following = any(p.following for p in _lc_panes(self._layout))
+            if currently_following and not any_following:
+                self.stdscr.timeout(250)
+            elif not currently_following and any_following:
+                self.stdscr.timeout(-1)
+            any_following = currently_following
+
             self._clamp(); self._scroll(); self.draw()
             key=self.stdscr.getch()
+            if key == -1:
+                self._tail_check()
+                continue
             self.status_msg=''; self.status_err=False
             self._dispatch(key)
 
     def _dispatch(self, key):
+        # Filter bar takes priority when open
+        if self._pane.filter_bar_open:
+            self._filter_key(key); return
         if   self.mode==Mode.NORMAL:      self._normal(key)
         elif self.mode==Mode.INSERT:      self._insert(key)
         elif self.mode==Mode.VISUAL:      self._visual(key)
@@ -1430,6 +1612,76 @@ class Editor:
         elif self.mode==Mode.COMMAND:     self._command_key(key)
         elif self.mode==Mode.SEARCH:      self._search_key(key)
         elif self.mode==Mode.EXPLORER:    self._explorer_key(key)
+
+    # ── Filter bar ────────────────────────────────────────────────────────────
+
+    def _open_filter_bar(self):
+        p = self._pane
+        p.filter_bar_open = True
+        p.filter_input    = p.filter_pat  # pre-populate with current pattern
+
+    def _filter_key(self, key):
+        """Handle keystrokes when the filter bar is open."""
+        p = self._pane
+        if key == 27:            # Esc — clear filter entirely
+            p.filter_bar_open = False
+            p.filter_input    = ''
+            p.filter_pat      = ''
+            p.filter_active   = False
+        elif key in (10, 13):    # Enter — confirm filter, close bar
+            p.filter_pat     = p.filter_input
+            p.filter_active  = bool(p.filter_input)
+            p.filter_bar_open= False
+            # Adjust top_row so cursor is still visible
+            if p.filter_active and p.filter_pat:
+                self._filtered_scroll()
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            p.filter_input = p.filter_input[:-1]
+            # Live preview: update filter_pat to show matches as user types
+            p.filter_pat    = p.filter_input
+            p.filter_active = bool(p.filter_input)
+        elif 32 <= key <= 126:
+            p.filter_input += chr(key)
+            p.filter_pat    = p.filter_input
+            p.filter_active = bool(p.filter_input)
+
+    def _filtered_scroll(self):
+        """After filter changes, re-anchor top_row so cursor row is visible."""
+        p = self._pane
+        fp = p.filter_pat.lower() if p.filter_pat else ''
+        if not fp:
+            return
+        # Count how many matching rows precede cursor.row
+        match_count = 0
+        for r in range(p.cursor.row):
+            if fp in p.buf.get_line(r).lower():
+                match_count += 1
+        # top_row is the index of the first matching row to display
+        avail = p.height - 1  # one row used by filter bar
+        # Set top_row to show cursor match at bottom if needed
+        if match_count >= p.top_row + avail:
+            p.top_row = max(0, match_count - avail + 1)
+        elif match_count < p.top_row:
+            p.top_row = match_count
+
+    def _filter_next(self, direction):
+        """Jump cursor to the next (direction>0) or previous (direction<0)
+        visible (matching) line when a filter is active."""
+        p = self._pane
+        fp = p.filter_pat.lower() if p.filter_pat else ''
+        if not fp:
+            return
+        row = p.cursor.row
+        lc  = p.buf.line_count()
+        step = 1 if direction > 0 else -1
+        r = row + step
+        while 0 <= r < lc:
+            if fp in p.buf.get_line(r).lower():
+                p.cursor.row = r; p.cursor.col = 0
+                self._filtered_scroll()
+                return
+            r += step
+        self.status_msg = 'No more matches'
 
     # ── Normal mode ───────────────────────────────────────────────────────────
 
@@ -1441,6 +1693,11 @@ class Editor:
         self.pending_count=''
 
         _on_tbl = _is_table_row(self.buf.get_line(self.cursor.row))
+        # Keys that scroll upward stop follow mode
+        _upward = (key in (curses.KEY_UP, curses.KEY_PPAGE) or
+                   ch == 'k' or key == 2 or key == 21)
+        if _upward and self._pane.following:
+            self._pane.following = False
         if   key in (curses.KEY_LEFT,)  or ch=='h':
             if _on_tbl: [self._cell_prev() for _ in range(count)]
             else: [self._move(0,-1) for _ in range(count)]
@@ -1476,8 +1733,17 @@ class Editor:
             k2=self.stdscr.getch()
             if 32<=k2<=126: self._char_search(chr(k2),True,False,count)
         elif ch=='F':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),False,False,count)
+            # Re-enable follow mode (like less's Shift-F); also re-initialise file size
+            p = self._pane
+            if p.buf.filename:
+                try: p._file_size = os.path.getsize(p.buf.filename)
+                except OSError: pass
+            p.following = True
+            # Scroll to bottom
+            last = p.buf.line_count() - 1
+            p.cursor.row = last; p.cursor.col = 0
+            p.top_row = max(0, last - p.height + 1)
+            self.status_msg = '-- FOLLOW --'
         elif ch=='t':
             k2=self.stdscr.getch()
             if 32<=k2<=126: self._char_search(chr(k2),True,True,count)
@@ -1567,10 +1833,10 @@ class Editor:
             else: self.status_msg='Redo'; self._clamp()
         elif ch=='v': self.mode=Mode.VISUAL;      self.visual_start=(self.cursor.row,self.cursor.col)
         elif ch=='V': self.mode=Mode.VISUAL_LINE; self.visual_start=(self.cursor.row,self.cursor.col)
-        elif ch=='/': self.mode=Mode.SEARCH; self.search_dir=1;  self.cmd_line='/'
+        elif ch=='/': self._open_filter_bar()
         elif ch=='?': self.mode=Mode.SEARCH; self.search_dir=-1; self.cmd_line='?'
-        elif ch=='n': self._search_next(self.search_dir)
-        elif ch=='N': self._search_next(-self.search_dir)
+        elif ch=='n': self._filter_next(1) if self._pane.filter_active else self._search_next(self.search_dir)
+        elif ch=='N': self._filter_next(-1) if self._pane.filter_active else self._search_next(-self.search_dir)
         elif ch=='*':
             w=self._word_under_cursor()
             if w: self.search_pat=r'\b'+re.escape(w)+r'\b'; self._search_next(1)
@@ -2421,10 +2687,33 @@ HAS_SIXEL:    bool = False   # populated by _probe_sixel() in main()
 HAS_256COLOR: bool = False   # populated by Editor.__init__ after curses.start_color()
 
 def main():
+    import argparse
     global HAS_SIXEL
     HAS_SIXEL = _probe_sixel()
-    filename=sys.argv[1] if len(sys.argv)>1 else None
-    curses.wrapper(lambda s: Editor(s, filename).run())
+
+    ap = argparse.ArgumentParser(prog='pym', add_help=False)
+    ap.add_argument('-f', '--follow', action='store_true', default=False,
+                    help='Follow mode: open file, jump to bottom, auto-tail')
+    ap.add_argument('filename', nargs='?', default=None)
+    # Pass unknown args through (e.g. bare filenames that argparse might trip over)
+    args, _extra = ap.parse_known_args()
+    filename = args.filename or (_extra[0] if _extra else None)
+    follow   = args.follow
+
+    def _run(stdscr):
+        ed = Editor(stdscr, filename)
+        if follow and filename:
+            p = ed._pane
+            p.following = True
+            try: p._file_size = os.path.getsize(filename)
+            except OSError: pass
+            # Jump to bottom
+            last = p.buf.line_count() - 1
+            p.cursor.row = last; p.cursor.col = 0
+            p.top_row = max(0, last - p.height + 1)
+        ed.run()
+
+    curses.wrapper(_run)
 
 if __name__=='__main__':
     main()
