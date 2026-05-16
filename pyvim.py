@@ -749,9 +749,7 @@ class Editor:
         if follow:
             stdscr.timeout(250)           # getch returns -1 after 250 ms
             if follow_fd is not None:
-                # stdin follow: start with empty buffer labelled [stdin]
                 self.buf.filename = '[stdin]'
-                self.buf.lines = []
             elif filename:
                 try:
                     self._follow_file = open(filename, 'r', errors='replace')
@@ -1496,6 +1494,33 @@ class Editor:
             self.status_msg=''; self.status_err=False
             self._dispatch(key)
 
+    def _apply_follow_text(self, new_text):
+        """Append new_text to the buffer using the partial-line state machine.
+
+        _follow_partial tracks any incomplete last line (no trailing \\n yet).
+        When non-empty it is always the last element of buf.lines.
+        """
+        if not new_text: return
+        near_bottom = self.cursor.row >= self.buf.line_count() - 2
+        # Clear the initial one-line empty-buffer placeholder on first write.
+        if not self._follow_partial and self.buf.lines == ['']:
+            self.buf.lines = []
+        full = self._follow_partial + new_text
+        parts = full.split('\n')
+        new_partial = parts[-1]   # '' when new_text ended with \n
+        complete    = parts[:-1]  # lines that ended with \n
+        if self._follow_partial and self.buf.lines:
+            self.buf.lines.pop()  # remove old partial; will be replaced below
+        self.buf.lines.extend(complete)
+        if new_partial:
+            self.buf.lines.append(new_partial)
+        if not self.buf.lines:
+            self.buf.lines = ['']
+        self._follow_partial = new_partial
+        self.buf._gen += 1
+        if near_bottom:
+            self.cursor.row = self.buf.line_count() - 1; self._clamp()
+
     def _follow_check(self):
         new_text = ''
         if self._follow_file:
@@ -1517,28 +1542,7 @@ class Editor:
                     pass
                 if raw_chunks:
                     new_text = b''.join(raw_chunks).decode('utf-8', errors='replace')
-        if not new_text: return
-        near_bottom = self.cursor.row >= self.buf.line_count() - 2
-        # Partial-line state machine:
-        #   _follow_partial holds content of current incomplete last line.
-        #   buf.lines[-1] == _follow_partial when it's non-empty.
-        #   Split incoming text prepended with the old partial to get complete lines.
-        full = self._follow_partial + new_text
-        parts = full.split('\n')
-        new_partial = parts[-1]   # '' if new_text ended with \n
-        complete    = parts[:-1]  # every part that had a trailing \n
-        # Remove old partial from buf (it was sitting as the last line)
-        if self._follow_partial and self.buf.lines:
-            self.buf.lines.pop()
-        self.buf.lines.extend(complete)
-        if new_partial:
-            self.buf.lines.append(new_partial)
-        if not self.buf.lines:
-            self.buf.lines = ['']
-        self._follow_partial = new_partial
-        self.buf._gen += 1
-        if near_bottom:
-            self.cursor.row = self.buf.line_count() - 1; self._clamp()
+        self._apply_follow_text(new_text)
 
     def _dispatch(self, key):
         if self._confirm_cb is not None:
