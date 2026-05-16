@@ -281,7 +281,8 @@ def _table_cell_at(line, col):
 
 
 def _extract_img_src(children, buf_filename) -> tuple[str, str] | None:
-    """Return (abs_path, alt) for the first image token, or None."""
+    """Return (abs_path, alt) for the first image token, or None.
+    Records the path even if the file doesn't exist yet — encoder will fail gracefully."""
     for tok in (children or []):
         if tok.type == 'image':
             src = (tok.attrs or {}).get('src', '') if tok.attrs else ''
@@ -293,8 +294,7 @@ def _extract_img_src(children, buf_filename) -> tuple[str, str] | None:
                 path = os.path.normpath(os.path.join(base, src))
             else:
                 path = os.path.abspath(src)
-            if os.path.isfile(path):
-                return (path, alt)
+            return (path, alt)   # let encoder handle missing-file case
     return None
 
 
@@ -447,9 +447,11 @@ def _inline_render(children):
         elif t == 'code_inline':
             for ch in tok.content: chars.append(ch); styles.append((10, 0))
         elif t == 'image':
-            alt = tok.content or (tok.attrs or {}).get('alt', '')
+            src = (tok.attrs or {}).get('src', '') if tok.attrs else ''
+            alt = tok.content or (tok.attrs or {}).get('alt', '') if tok.attrs else tok.content or ''
+            label = alt or (os.path.basename(src) if src else 'image')
             st  = cur()
-            for ch in f'[{alt}]': chars.append(ch); styles.append(st)
+            for ch in f'[{label}]': chars.append(ch); styles.append(st)
         # softbreak / hardbreak / html_inline: skip
 
     vis = ''.join(chars)
@@ -782,8 +784,7 @@ class Editor:
                     for i, line in enumerate(lines):
                         buf.append(f'\033[{scr_y + 1 + i};{scr_x + 1}H{line}')
         if buf:
-            sys.stdout.write(''.join(buf))
-            sys.stdout.flush()
+            os.write(sys.stdout.fileno(), ''.join(buf).encode('utf-8'))
 
     def _draw_pane(self, pane, is_active):
         lnw = self._pane_lnw(pane)
