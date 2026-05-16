@@ -245,7 +245,8 @@ except ImportError:
 
 _md_cache: dict = {}
 _md_img_cache: dict = {}   # same key as _md_cache → {row: (abs_path, alt)}
-_sixel_cache: dict = {}    # (path, mtime, max_w, max_h) → (sixel_str, w_cells, h_cells)
+_sixel_cache: dict = {}      # (path, mtime, max_w, max_h) → (sixel_str, w_cells, h_cells)
+_colortext_cache: dict = {}  # same key → (lines, w_cells, h_cells)
 _TABLE_SEP_RE = re.compile(r'^\s*\|[-:| ]+\|\s*$')
 
 
@@ -358,6 +359,51 @@ def _encode_sixel(path: str, max_w: int, max_h: int):
         out.append('\033\\')
         result = (''.join(out), w_cells, h_cells)
         _sixel_cache[key] = result
+        return result
+    except Exception:
+        return None
+
+
+def _rgb_to_256(r: int, g: int, b: int) -> int:
+    """Nearest xterm-256 index for an RGB value using the 6x6x6 color cube."""
+    return 16 + 36 * round(r * 5 / 255) + 6 * round(g * 5 / 255) + round(b * 5 / 255)
+
+
+def _encode_color_text(path: str, max_w: int, max_h: int):
+    """Encode image as ANSI-colored ▀ half-block lines (2px per cell row).
+    Returns (lines, w_cells, h_cells) or None.  Each line is a self-contained
+    ANSI string; caller positions with ESC[y;xH before printing each one."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = (path, mtime, max_w, max_h)
+    if key in _colortext_cache:
+        return _colortext_cache[key]
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        img = Image.open(path).convert('RGB')
+        img.thumbnail((max_w, max_h * 2), Image.LANCZOS)
+        w, h = img.size
+        if h % 2:
+            pad = Image.new('RGB', (w, h + 1), (0, 0, 0))
+            pad.paste(img, (0, 0))
+            img = pad; h += 1
+        pix = img.load()
+        lines = []
+        for row in range(0, h, 2):
+            parts = []
+            for col in range(w):
+                tr, tg, tb = pix[col, row]
+                br2, bg2, bb2 = pix[col, row + 1]
+                parts.append(f'\033[38;5;{_rgb_to_256(tr,tg,tb)};48;5;{_rgb_to_256(br2,bg2,bb2)}m▀')
+            parts.append('\033[0m')
+            lines.append(''.join(parts))
+        result = (lines, w, h // 2)
+        _colortext_cache[key] = result
         return result
     except Exception:
         return None
@@ -717,18 +763,24 @@ class Editor:
         self._draw_statusbar()
         self._place_cursor()
         self.stdscr.refresh()
-        self._flush_sixels()
+        self._flush_images()
 
-    def _flush_sixels(self):
-        if not HAS_SIXEL or not self._pending_sixels:
+    def _flush_images(self):
+        if not self._pending_sixels:
             return
         buf = []
         for scr_y, scr_x, path, max_w, max_h in self._pending_sixels:
-            result = _encode_sixel(path, max_w, max_h)
-            if result:
-                sixel_str, _wc, _hc = result
-                # Position cursor via raw ANSI (1-based), output sixel DCS
-                buf.append(f'\033[{scr_y + 1};{scr_x + 1}H{sixel_str}')
+            if HAS_SIXEL:
+                result = _encode_sixel(path, max_w, max_h)
+                if result:
+                    data, _wc, _hc = result
+                    buf.append(f'\033[{scr_y + 1};{scr_x + 1}H{data}')
+            else:
+                result = _encode_color_text(path, max_w, max_h)
+                if result:
+                    lines, _wc, _hc = result
+                    for i, line in enumerate(lines):
+                        buf.append(f'\033[{scr_y + 1 + i};{scr_x + 1}H{line}')
         if buf:
             sys.stdout.write(''.join(buf))
             sys.stdout.flush()
@@ -758,7 +810,7 @@ class Editor:
         is_md = _is_markdown(pane.buf.filename)
         in_insert = is_active and self.mode == Mode.INSERT
         md_table = (_md_highlight(pane.buf) if is_md else None)
-        img_map  = (_md_images(pane.buf) if is_md and HAS_SIXEL else {})
+        img_map  = (_md_images(pane.buf) if is_md else {})
         hl_table = (None if is_md else
                     _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
 
