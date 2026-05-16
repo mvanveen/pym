@@ -4,12 +4,14 @@ import ast
 import curses
 import difflib
 import os
+import pathlib
 import re
 import sys
 import copy
 import select
 import termios
 import time
+import tomllib
 import tty
 from enum import Enum, auto
 
@@ -178,19 +180,128 @@ from pygments.lexers import TextLexer
 from pygments.token import Token
 from pygments.util import ClassNotFound
 
-# pygments ttype → (color_pair_index, extra_attr)
-# Color pairs 9-15 are initialized in Editor.__init__ to match the old scheme.
+# ── Color schemes ─────────────────────────────────────────────────────────────
+# Roles map to color pairs 9-15 in order.
+_SYNTAX_ROLES = ('keyword', 'string', 'comment', 'number', 'type', 'builtin', 'decorator')
+_SYNTAX_PAIR  = {r: 9 + i for i, r in enumerate(_SYNTAX_ROLES)}
+
+# Each scheme: role → (fg_index, curses_attr).  fg values > 7 need HAS_256COLOR.
+_SCHEMES: dict = {
+    'default': {
+        'keyword':   (curses.COLOR_YELLOW,   curses.A_BOLD),
+        'string':    (curses.COLOR_GREEN,    0),
+        'comment':   (curses.COLOR_WHITE,    curses.A_DIM),
+        'number':    (curses.COLOR_MAGENTA,  0),
+        'type':      (curses.COLOR_CYAN,     0),
+        'builtin':   (curses.COLOR_BLUE,     0),
+        'decorator': (curses.COLOR_YELLOW,   curses.A_BOLD),
+    },
+    'monokai': {
+        'keyword':   (197, curses.A_BOLD),   # #F92672 pink
+        'string':    (148, 0),               # #A6E22E green
+        'comment':   (243, curses.A_DIM),    # #75715E gray
+        'number':    (141, 0),               # #AE81FF purple
+        'type':      (81,  0),               # #66D9EF cyan
+        'builtin':   (81,  0),
+        'decorator': (148, curses.A_BOLD),
+    },
+    'nord': {
+        'keyword':   (110, curses.A_BOLD),   # #81A1C1 blue
+        'string':    (143, 0),               # #A3BE8C sage
+        'comment':   (241, curses.A_DIM),    # #4C566A dark gray
+        'number':    (139, 0),               # #B48EAD purple
+        'type':      (109, 0),               # #88C0D0 light blue
+        'builtin':   (153, 0),               # #8FBCBB teal
+        'decorator': (173, curses.A_BOLD),   # #D08770 orange
+    },
+    'gruvbox': {
+        'keyword':   (167, curses.A_BOLD),   # #FB4934 red
+        'string':    (142, 0),               # #B8BB26 yellow-green
+        'comment':   (245, curses.A_DIM),    # #928374 gray
+        'number':    (175, 0),               # #D3869B pink
+        'type':      (108, 0),               # #8EC07C green
+        'builtin':   (109, 0),               # #83A598 cyan
+        'decorator': (214, curses.A_BOLD),   # #FABD2F yellow
+    },
+    'solarized': {
+        'keyword':   (64,  curses.A_BOLD),   # #859900 olive
+        'string':    (37,  0),               # #2AA198 teal
+        'comment':   (66,  curses.A_DIM),    # #657B83 gray
+        'number':    (162, 0),               # #D33682 magenta
+        'type':      (32,  0),               # #268BD2 blue
+        'builtin':   (61,  0),               # #6C71C4 violet
+        'decorator': (166, curses.A_BOLD),   # #CB4B16 orange
+    },
+    'dracula': {
+        'keyword':   (141, curses.A_BOLD),   # #BD93F9 purple
+        'string':    (84,  0),               # #50FA7B green
+        'comment':   (61,  curses.A_DIM),    # #6272A4 muted blue
+        'number':    (212, 0),               # #FF79C6 pink
+        'type':      (117, 0),               # #8BE9FD cyan
+        'builtin':   (117, 0),
+        'decorator': (215, curses.A_BOLD),   # #FFB86C orange
+    },
+}
+
+# Active attrs read by _pg_attr; updated by _apply_scheme after curses starts.
+_ACTIVE_SYNTAX_ATTRS: dict = {
+    'keyword':   (9,  curses.A_BOLD),
+    'string':    (10, 0),
+    'comment':   (11, curses.A_DIM),
+    'number':    (12, 0),
+    'type':      (13, 0),
+    'builtin':   (14, 0),
+    'decorator': (15, curses.A_BOLD),
+}
+
+def _load_pyvim_config() -> dict:
+    """Read [tool.pyvim] from the nearest pyproject.toml."""
+    for d in [pathlib.Path.cwd(), *pathlib.Path.cwd().parents]:
+        p = d / 'pyproject.toml'
+        if p.exists():
+            try:
+                return tomllib.loads(p.read_text()).get('tool', {}).get('pyvim', {})
+            except Exception:
+                pass
+    return {}
+
+def _apply_scheme(name: str, overrides: dict | None = None) -> None:
+    """Init curses pairs 9-15 for the named scheme and update _ACTIVE_SYNTAX_ATTRS.
+
+    Falls back to 'default' when the scheme needs 256 colors and the terminal
+    doesn't support them.  Call only after curses.start_color().
+    """
+    global _ACTIVE_SYNTAX_ATTRS
+    scheme = dict(_SCHEMES.get(name) or _SCHEMES['default'])
+    needs_256 = any(v[0] > 7 for v in scheme.values())
+    if needs_256 and not HAS_256COLOR:
+        scheme = dict(_SCHEMES['default'])
+    if overrides:
+        for role, fg in overrides.items():
+            if role in scheme and isinstance(fg, int):
+                scheme[role] = (fg, scheme[role][1])
+    new_attrs = {}
+    for role in _SYNTAX_ROLES:
+        fg, attr = scheme.get(role, _SCHEMES['default'][role])
+        idx = _SYNTAX_PAIR[role]
+        curses.init_pair(idx, fg, -1)
+        new_attrs[role] = (idx, attr)
+    _ACTIVE_SYNTAX_ATTRS = new_attrs
+    _pg_cache.clear()
+
+# pygments ttype → (color_pair_index, extra_attr) from active scheme
 def _pg_attr(ttype):
-    if ttype in Token.Keyword:                             return (9,  curses.A_BOLD)
-    if ttype in Token.Literal.String or ttype in Token.String: return (10, 0)
-    if ttype in Token.Comment:                             return (11, curses.A_DIM)
-    if ttype in Token.Literal.Number or ttype in Token.Number: return (12, 0)
+    a = _ACTIVE_SYNTAX_ATTRS
+    if ttype in Token.Keyword:                                   return a['keyword']
+    if ttype in Token.Literal.String or ttype in Token.String:  return a['string']
+    if ttype in Token.Comment:                                   return a['comment']
+    if ttype in Token.Literal.Number or ttype in Token.Number:  return a['number']
     if ttype in Token.Name.Class or ttype in Token.Name.Exception \
-            or ttype in Token.Name.Namespace:              return (13, 0)
-    if ttype in Token.Name.Function:                       return (13, 0)
-    if ttype in Token.Name.Builtin:                        return (14, 0)
-    if ttype in Token.Name.Decorator:                      return (15, curses.A_BOLD)
-    if ttype in Token.Operator.Word:                       return (9,  0)
+            or ttype in Token.Name.Namespace:                    return a['type']
+    if ttype in Token.Name.Function:                             return a['type']
+    if ttype in Token.Name.Builtin:                              return a['builtin']
+    if ttype in Token.Name.Decorator:                            return a['decorator']
+    if ttype in Token.Operator.Word:                             return a['keyword']
     return None
 
 # (id(buf), gen) → list[list[(start, end, curses_attr)]] indexed by row
@@ -769,14 +880,9 @@ class Editor:
         curses.init_pair(6,  curses.COLOR_WHITE,  -1)
         curses.init_pair(7,  curses.COLOR_BLUE,   -1)
         curses.init_pair(8,  curses.COLOR_BLACK,  curses.COLOR_CYAN)
-        # Syntax pairs
-        curses.init_pair(9,  curses.COLOR_YELLOW, -1)   # keyword
-        curses.init_pair(10, curses.COLOR_GREEN,  -1)   # string
-        curses.init_pair(11, curses.COLOR_WHITE,  -1)   # comment (dim)
-        curses.init_pair(12, curses.COLOR_MAGENTA,-1)   # number
-        curses.init_pair(13, curses.COLOR_CYAN,   -1)   # type
-        curses.init_pair(14, curses.COLOR_BLUE,   -1)   # builtin
-        curses.init_pair(15, curses.COLOR_YELLOW, -1)   # decorator
+        # Syntax pairs — loaded from colorscheme config
+        cfg = _load_pyvim_config()
+        _apply_scheme(cfg.get('colorscheme', 'default'), cfg.get('colors'))
         # Diff viewer: green-bg for added, red-bg for removed
         _diff_256=False
         if HAS_256COLOR:
@@ -2498,6 +2604,17 @@ class Editor:
             self._exec_sub(cmd)
         elif cmd.startswith('set ') or cmd=='set':
             self._exec_set(cmd[4:].strip() if cmd.startswith('set ') else '')
+        elif cmd.startswith('colorscheme') or cmd.startswith('colo'):
+            parts=cmd.split(None,1)
+            if len(parts)<2:
+                self.status_msg=f'colorscheme: {", ".join(_SCHEMES)}'; self.status_err=False
+            else:
+                name=parts[1].strip()
+                if name not in _SCHEMES:
+                    self.status_msg=f'Unknown colorscheme: {name}'; self.status_err=True
+                else:
+                    _apply_scheme(name)
+                    self.status_msg=f'colorscheme: {name}'; self.status_err=False
         elif cmd in ('noh','nohlsearch'): self.search_pat=''
         elif cmd in ('close','clo'): self._close_pane()
         elif cmd in ('close!','clo!'): self._close_pane(force=True)
