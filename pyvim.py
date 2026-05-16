@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """pyvim - A pure Python vim-like editor"""
+import ast
 import curses
+import difflib
 import os
 import re
 import sys
 import copy
+import select
+import termios
+import time
+import tty
 from enum import Enum, auto
 
 # ── Modes ────────────────────────────────────────────────────────────────────
@@ -17,6 +23,8 @@ class Mode(Enum):
     COMMAND = auto()
     SEARCH = auto()
     EXPLORER = auto()
+    HISTORY = auto()
+    PICKER = auto()
 
 # ── Core data ────────────────────────────────────────────────────────────────
 
@@ -31,57 +39,59 @@ class Buffer:
         self.filename = None
         self.modified = False
         self._undo = []; self._redo = []
+        self._gen = 0  # incremented on every mutation; used as highlight cache key
+        self._disk_mtime = 0.0
 
     def save_undo(self):
-        self._undo.append(copy.deepcopy(self.lines))
+        self._undo.append((copy.deepcopy(self.lines), time.time()))
         self._redo.clear()
         if len(self._undo) > 500: self._undo.pop(0)
 
     def undo(self):
         if not self._undo: return False
-        self._redo.append(copy.deepcopy(self.lines))
-        self.lines = self._undo.pop(); self.modified = True; return True
+        self._redo.append((copy.deepcopy(self.lines), time.time()))
+        self.lines, _ = self._undo.pop(); self.modified = True; self._gen += 1; return True
 
     def redo(self):
         if not self._redo: return False
-        self._undo.append(copy.deepcopy(self.lines))
-        self.lines = self._redo.pop(); self.modified = True; return True
+        self._undo.append((copy.deepcopy(self.lines), time.time()))
+        self.lines, _ = self._redo.pop(); self.modified = True; self._gen += 1; return True
 
     def line_count(self): return len(self.lines)
     def get_line(self, r): return self.lines[r] if 0 <= r < len(self.lines) else ''
 
     def set_line(self, r, t):
-        if 0 <= r < len(self.lines): self.lines[r] = t; self.modified = True
+        if 0 <= r < len(self.lines): self.lines[r] = t; self.modified = True; self._gen += 1
 
     def insert_line(self, r, t=''):
-        self.lines.insert(max(0, min(r, len(self.lines))), t); self.modified = True
+        self.lines.insert(max(0, min(r, len(self.lines))), t); self.modified = True; self._gen += 1
 
     def delete_line(self, r):
         if 0 <= r < len(self.lines):
             l = self.lines.pop(r)
             if not self.lines: self.lines = ['']
-            self.modified = True; return l
+            self.modified = True; self._gen += 1; return l
         return ''
 
     def insert_char(self, r, c, ch):
         if 0 <= r < len(self.lines):
-            s = self.lines[r]; self.lines[r] = s[:c] + ch + s[c:]; self.modified = True
+            s = self.lines[r]; self.lines[r] = s[:c] + ch + s[c:]; self.modified = True; self._gen += 1
 
     def delete_char(self, r, c):
         if 0 <= r < len(self.lines):
             s = self.lines[r]
             if 0 <= c < len(s):
-                self.lines[r] = s[:c] + s[c+1:]; self.modified = True; return s[c]
+                self.lines[r] = s[:c] + s[c+1:]; self.modified = True; self._gen += 1; return s[c]
         return ''
 
     def split_line(self, r, c):
         if 0 <= r < len(self.lines):
             s = self.lines[r]; self.lines[r] = s[:c]
-            self.lines.insert(r+1, s[c:]); self.modified = True
+            self.lines.insert(r+1, s[c:]); self.modified = True; self._gen += 1
 
     def join_lines(self, r):
         if 0 <= r < len(self.lines)-1:
-            self.lines[r] += self.lines[r+1]; self.lines.pop(r+1); self.modified = True
+            self.lines[r] += self.lines[r+1]; self.lines.pop(r+1); self.modified = True; self._gen += 1
 
     @classmethod
     def from_file(cls, filename):
@@ -89,7 +99,14 @@ class Buffer:
         try:
             with open(filename, 'r', errors='replace') as f: content = f.read()
             lines = content.splitlines(); b.lines = lines if lines else ['']
+            b._disk_mtime = os.path.getmtime(filename)
         except FileNotFoundError: b.lines = ['']
+        b.modified = False; return b
+
+    @classmethod
+    def from_string(cls, content, filename=None):
+        b = cls(); b.filename = filename
+        lines = content.splitlines(); b.lines = lines if lines else ['']
         b.modified = False; return b
 
     def save(self, filename=None):
@@ -97,6 +114,7 @@ class Buffer:
         if not fname: raise ValueError('No file name')
         with open(fname, 'w') as f: f.write('\n'.join(self.lines) + '\n')
         self.filename = fname; self.modified = False
+        self._disk_mtime = os.path.getmtime(fname)
 
 class Pane:
     def __init__(self, buf=None):
@@ -152,234 +170,528 @@ def _lc_close(node, target):
     if nb is None: return na
     n = copy.copy(node); n.a = na; n.b = nb; return n
 
-# ── Syntax highlighting ──────────────────────────────────────────────────────
+# ── Syntax highlighting (pygments) ───────────────────────────────────────────
 
-_KW='kw'; _ST='st'; _CM='cm'; _NM='nm'; _TY='ty'; _BL='bl'; _DC='dc'; _SP='sp'
+from pygments import lex
+from pygments.lexers import get_lexer_for_filename, guess_lexer, get_lexer_by_name
+from pygments.lexers import TextLexer
+from pygments.token import Token
+from pygments.util import ClassNotFound
 
-def _kw(*w): return (r'\b(?:' + '|'.join(re.escape(x) for x in w) + r')\b', _KW)
-def _bl(*w): return (r'\b(?:' + '|'.join(re.escape(x) for x in w) + r')\b', _BL)
+# pygments ttype → (color_pair_index, extra_attr)
+# Color pairs 9-15 are initialized in Editor.__init__ to match the old scheme.
+def _pg_attr(ttype):
+    if ttype in Token.Keyword:                             return (9,  curses.A_BOLD)
+    if ttype in Token.Literal.String or ttype in Token.String: return (10, 0)
+    if ttype in Token.Comment:                             return (11, curses.A_DIM)
+    if ttype in Token.Literal.Number or ttype in Token.Number: return (12, 0)
+    if ttype in Token.Name.Class or ttype in Token.Name.Exception \
+            or ttype in Token.Name.Namespace:              return (13, 0)
+    if ttype in Token.Name.Function:                       return (13, 0)
+    if ttype in Token.Name.Builtin:                        return (14, 0)
+    if ttype in Token.Name.Decorator:                      return (15, curses.A_BOLD)
+    if ttype in Token.Operator.Word:                       return (9,  0)
+    return None
 
-SYNTAX = {
-  'python': [
-    (r'#.*$', _CM),
-    (r'"""[\s\S]*?"""', _ST), (r"'''[\s\S]*?'''", _ST),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    _kw('False','None','True','and','as','assert','async','await','break',
-        'class','continue','def','del','elif','else','except','finally',
-        'for','from','global','if','import','in','is','lambda','nonlocal',
-        'not','or','pass','raise','return','try','while','with','yield'),
-    _bl('abs','all','any','bin','bool','bytes','callable','chr','dict',
-        'dir','enumerate','eval','exec','filter','float','format',
-        'frozenset','getattr','globals','hasattr','hash','hex','id',
-        'input','int','isinstance','issubclass','iter','len','list',
-        'locals','map','max','min','next','object','oct','open','ord',
-        'pow','print','property','range','repr','reversed','round','set',
-        'setattr','slice','sorted','staticmethod','str','sum','super',
-        'tuple','type','vars','zip','self','cls'),
-    (r'@\w+', _DC),
-    (r'\b0x[0-9a-fA-F]+\b', _NM), (r'\b\d+\.?\d*[jJ]?\b', _NM),
-  ],
-  'js': [
-    (r'//.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r'`(?:[^`\\]|\\.)*`', _ST),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    _kw('break','case','catch','class','const','continue','debugger',
-        'default','delete','do','else','export','extends','finally',
-        'for','function','if','import','in','instanceof','let','new',
-        'of','return','static','super','switch','this','throw','try',
-        'typeof','var','void','while','with','yield','async','await',
-        'from','as','true','false','null','undefined'),
-    _bl('console','document','window','Array','Object','String','Number',
-        'Boolean','Promise','Map','Set','Math','JSON','Date','Error',
-        'parseInt','parseFloat','isNaN','setTimeout','setInterval',
-        'clearTimeout','clearInterval','fetch','require','module',
-        'exports','process','Symbol','RegExp'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'c': [
-    (r'//.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    (r'#\s*\w+', _DC),
-    _kw('auto','break','case','char','const','continue','default','do',
-        'double','else','enum','extern','float','for','goto','if',
-        'inline','int','long','register','restrict','return','short',
-        'signed','sizeof','static','struct','switch','typedef','union',
-        'unsigned','void','volatile','while','NULL','nullptr',
-        'true','false'),
-    (r'\b0x[0-9a-fA-F]+[uUlL]*\b', _NM), (r'\b\d+\.?\d*[uUlLfF]*\b', _NM),
-  ],
-  'go': [
-    (r'//.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r'`[^`]*`', _ST), (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    _kw('break','case','chan','const','continue','default','defer','else',
-        'fallthrough','for','func','go','goto','if','import','interface',
-        'map','package','range','return','select','struct','switch','type',
-        'var','true','false','nil','iota'),
-    _bl('append','cap','close','complex','copy','delete','imag','len',
-        'make','new','panic','print','println','real','recover',
-        'bool','byte','complex64','complex128','error','float32','float64',
-        'int','int8','int16','int32','int64','rune','string',
-        'uint','uint8','uint16','uint32','uint64','uintptr'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'rust': [
-    (r'//.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'[^'\\]'", _ST),
-    (r'#!?\[[\s\S]*?\]', _DC),
-    _kw('as','break','const','continue','crate','dyn','else','enum',
-        'extern','fn','for','if','impl','in','let','loop','match',
-        'mod','move','mut','pub','ref','return','self','Self','static',
-        'struct','super','trait','true','false','type','unsafe','use',
-        'where','while','async','await'),
-    _bl('bool','char','f32','f64','i8','i16','i32','i64','i128','isize',
-        'str','u8','u16','u32','u64','u128','usize','Box','String','Vec',
-        'Option','Result','Some','None','Ok','Err','println','print',
-        'eprintln','panic','assert','assert_eq','todo','unreachable',
-        'dbg','format','vec'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'sh': [
-    (r'#.*$', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'[^']*'", _ST),
-    _kw('if','then','else','elif','fi','for','while','do','done',
-        'case','esac','in','function','return','local','export',
-        'readonly','declare','unset','shift','source','true','false',
-        'exit','break','continue'),
-    _bl('echo','printf','read','cd','ls','grep','sed','awk','find',
-        'cat','rm','mv','cp','mkdir','chmod','chown','curl','wget',
-        'git','make','test','eval','exec'),
-    (r'\$\{?[\w@#?*!-]+\}?', _DC),
-    (r'\b\d+\b', _NM),
-  ],
-  'json': [
-    (r'"(?:[^"\\]|\\.)*"\s*:', _KW),
-    (r'"(?:[^"\\]|\\.)*"', _ST),
-    (r'\b(?:true|false|null)\b', _BL),
-    (r'-?\b\d+\.?\d*(?:[eE][+-]?\d+)?\b', _NM),
-  ],
-  'html': [
-    (r'<!--[\s\S]*?-->', _CM),
-    (r'</?!?\w[\w.-]*', _KW), (r'/?>',  _KW),
-    (r'"[^"]*"', _ST), (r"'[^']*'", _ST),
-    (r'&[a-zA-Z#\d]+;', _SP),
-  ],
-  'css': [
-    (r'/\*[\s\S]*?\*/', _CM),
-    (r'"[^"]*"', _ST), (r"'[^']*'", _ST),
-    (r'@\w[\w-]*', _DC),
-    (r'#[0-9a-fA-F]{3,8}\b', _NM),
-    (r'\b\d+\.?\d*(?:px|em|rem|vh|vw|%|pt|ex|ch|vmin|vmax)?\b', _NM),
-    (r'[.#:][\w-]+', _KW),
-  ],
-  'markdown': [
-    (r'^#{1,6} .*$', _KW),
-    (r'\*\*[^*]+\*\*', _TY), (r'\*[^*\n]+\*', _ST),
-    (r'`[^`]+`', _BL),
-    (r'^>.*$', _CM),
-    (r'^\s*[-*+] ', _SP), (r'^\s*\d+\. ', _SP),
-    (r'\[[^\]]+\]\([^)]+\)', _DC),
-  ],
-  'yaml': [
-    (r'#.*$', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'[^']*'", _ST),
-    (r'^[ \t]*[\w][\w\s]*\s*:', _KW),
-    (r'\b(?:true|false|null|yes|no|on|off)\b', _BL),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'toml': [
-    (r'#.*$', _CM),
-    (r'"""[\s\S]*?"""', _ST), (r'"(?:[^"\\]|\\.)*"', _ST),
-    (r"'''[^']*'''", _ST), (r"'[^']*'", _ST),
-    (r'^\[[\w."\' ]+\]', _KW),
-    (r'\b(?:true|false)\b', _BL), (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'sql': [
-    (r'--.*$', _CM), (r'/\*[\s\S]*?\*/', _CM),
-    (r"'(?:[^'\\]|\\.)*'", _ST), (r'"(?:[^"\\]|\\.)*"', _ST),
-    _kw('SELECT','FROM','WHERE','JOIN','LEFT','RIGHT','INNER','OUTER','FULL',
-        'ON','AS','AND','OR','NOT','IN','IS','NULL','LIKE','BETWEEN',
-        'ORDER','BY','GROUP','HAVING','LIMIT','OFFSET','UNION','ALL',
-        'DISTINCT','INSERT','INTO','VALUES','UPDATE','SET','DELETE',
-        'CREATE','TABLE','ALTER','DROP','INDEX','VIEW','WITH','CASE',
-        'WHEN','THEN','ELSE','END','COUNT','SUM','AVG','MIN','MAX',
-        'OVER','PARTITION','ROWS','RANGE','CAST','COALESCE','EXISTS',
-        'select','from','where','join','left','right','inner','outer',
-        'on','as','and','or','not','in','is','null','like','between',
-        'order','by','group','having','limit','offset','union','all',
-        'distinct','insert','into','values','update','set','delete',
-        'create','table','alter','drop','index','view','with','case',
-        'when','then','else','end','count','sum','avg','min','max'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-  'lua': [
-    (r'--\[\[[\s\S]*?\]\]', _CM), (r'--.*$', _CM),
-    (r'"(?:[^"\\]|\\.)*"', _ST), (r"'(?:[^'\\]|\\.)*'", _ST),
-    (r'\[\[[\s\S]*?\]\]', _ST),
-    _kw('and','break','do','else','elseif','end','false','for',
-        'function','goto','if','in','local','nil','not','or',
-        'repeat','return','then','true','until','while'),
-    _bl('assert','error','ipairs','load','next','pairs','pcall',
-        'print','rawget','rawset','require','select','setmetatable',
-        'tonumber','tostring','type','xpcall',
-        'io','os','math','string','table','coroutine'),
-    (r'\b\d+\.?\d*\b', _NM),
-  ],
-}
-SYNTAX['ts']  = SYNTAX['js']
-SYNTAX['cpp'] = SYNTAX['c']
-SYNTAX['jsx'] = SYNTAX['js']
-SYNTAX['tsx'] = SYNTAX['ts']
-SYNTAX['bash'] = SYNTAX['zsh'] = SYNTAX['sh']
-SYNTAX['htm'] = SYNTAX['html']
+# (id(buf), gen) → list[list[(start, end, curses_attr)]] indexed by row
+_pg_cache: dict = {}
 
-EXTS = {
-  'py':'python','pyw':'python',
-  'js':'js','jsx':'jsx','mjs':'js',
-  'ts':'ts','tsx':'tsx',
-  'c':'c','h':'c','cpp':'cpp','cc':'cpp','cxx':'cpp','hpp':'cpp','hh':'cpp',
-  'go':'go','rs':'rust','rb':'ruby','java':'java',
-  'sh':'sh','bash':'sh','zsh':'sh',
-  'json':'json','html':'html','htm':'htm','css':'css',
-  'md':'markdown','markdown':'markdown',
-  'yaml':'yaml','yml':'yaml','toml':'toml','sql':'sql','lua':'lua',
-}
+def _pg_highlight(buf):
+    key = (id(buf), buf._gen)
+    if key in _pg_cache:
+        return _pg_cache[key]
+    # Evict stale entries for this buffer (different gen)
+    stale = [k for k in _pg_cache if k[0] == id(buf)]
+    for k in stale: del _pg_cache[k]
+    # Cap total cache size
+    if len(_pg_cache) > 40:
+        _pg_cache.clear()
+
+    text = '\n'.join(buf.lines)
+    try:
+        if buf.filename:
+            lexer = get_lexer_for_filename(buf.filename, stripnl=False, ensurenl=False)
+        else:
+            lexer = guess_lexer(text[:2048], stripnl=False, ensurenl=False)
+    except ClassNotFound:
+        lexer = TextLexer()
+
+    # Build per-row span lists — store (start, end, (pair_idx, extra)) to defer
+    # curses.color_pair() until draw time (requires initscr to have been called).
+    by_row: list[list] = [[] for _ in buf.lines]
+    row = 0; col = 0
+    for ttype, value in lex(text, lexer):
+        pg_attr = _pg_attr(ttype)
+        lines = value.split('\n')
+        for li, part in enumerate(lines):
+            if li > 0:
+                row += 1; col = 0
+                if row >= len(by_row): break
+            if pg_attr and part:
+                by_row[row].append((col, col + len(part), pg_attr))
+            col += len(part)
+
+    _pg_cache[key] = by_row
+    return by_row
 
 def _detect_lang(filename):
     if not filename: return None
-    ext = filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
-    return EXTS.get(ext)
+    try:
+        get_lexer_for_filename(filename)
+        return filename  # truthy — used only to decide "do we highlight?"
+    except ClassNotFound:
+        return None
 
-# Token type → color-pair index (pairs 9-15)
-_TOK_PAIR = {_KW:9, _ST:10, _CM:11, _NM:12, _TY:13, _BL:14, _DC:15, _SP:15}
+def _is_markdown(filename):
+    return bool(filename and filename.rsplit('.',1)[-1].lower() in ('md','markdown','mkd'))
 
-def _tokenize(line, lang):
-    rules = SYNTAX.get(lang)
-    if not rules: return []
-    toks = []
-    for pat, tok in rules:
-        try:
-            for m in re.finditer(pat, line, re.MULTILINE):
-                if m.end() > m.start():
-                    toks.append((m.start(), m.end(), tok))
-        except re.error:
-            pass
-    toks.sort(key=lambda t: (t[0], -(t[1]-t[0])))
-    out = []; pos = 0
-    for s, e, tok in toks:
-        if s >= pos: out.append((s, e, tok)); pos = e
-    return out
+# ── Markdown rendering via markdown-it-py ────────────────────────────────────
+# Parses with a proper GFM parser so nested inline styles (bold+code, etc.)
+# are handled correctly. Each buffer row gets (visual_line, spans) where
+# markers are removed and spans carry (color_pair_idx, extra_attr) tuples.
+# Cursor row / visual-selected rows are shown raw by the caller.
+
+try:
+    from markdown_it import MarkdownIt as _MdIt
+    _MD = _MdIt("gfm-like").disable("linkify")
+except ImportError:
+    _MD = None
+
+_md_cache: dict = {}
+_md_img_cache: dict = {}   # same key as _md_cache → {row: (abs_path, alt)}
+_sixel_cache: dict = {}      # (path, mtime, max_w, max_h) → (sixel_str, w_cells, h_cells)
+_colortext_cache: dict = {}  # same key → (lines, w_cells, h_cells)
+_TABLE_SEP_RE = re.compile(r'^\s*\|[-:| ]+\|\s*$')
+
+
+def _is_table_row(line):
+    s = line.strip()
+    return s.startswith('|') and s.endswith('|') and not _TABLE_SEP_RE.match(line)
+
+
+def _table_cells(line):
+    """Return list of (content_start, content_end) for each cell in a raw table line."""
+    if not _is_table_row(line): return []
+    pipes = [i for i, c in enumerate(line) if c == '|']
+    if len(pipes) < 2: return []
+    cells = []
+    for a, b in zip(pipes, pipes[1:]):
+        s = a + 1
+        while s < b and line[s] == ' ': s += 1
+        e = b - 1
+        while e > a and line[e] == ' ': e -= 1
+        cells.append((s, e + 1))
+    return cells
+
+
+def _table_cell_at(line, col):
+    """Return (cell_idx, content_start, content_end) for the cell containing col, or None."""
+    pipes = [i for i, c in enumerate(line) if c == '|']
+    cells = _table_cells(line)
+    for i, (a, b) in enumerate(zip(pipes, pipes[1:])):
+        if a < col <= b and i < len(cells):
+            return (i, cells[i][0], cells[i][1])
+    return None
+
+
+def _extract_img_src(children, buf_filename) -> tuple[str, str] | None:
+    """Return (abs_path, alt) for the first image token, or None.
+    Records the path even if the file doesn't exist yet — encoder will fail gracefully."""
+    for tok in (children or []):
+        if tok.type == 'image':
+            src = (tok.attrs or {}).get('src', '') if tok.attrs else ''
+            alt = tok.content or ''
+            if not src or src.startswith(('http://', 'https://', 'data:')):
+                continue
+            if buf_filename:
+                base = os.path.dirname(os.path.abspath(buf_filename))
+                path = os.path.normpath(os.path.join(base, src))
+            else:
+                path = os.path.abspath(src)
+            return (path, alt)   # let encoder handle missing-file case
+    return None
+
+
+def _encode_sixel(path: str, max_w: int, max_h: int):
+    """Encode image as DCS sixel string.  Returns (sixel_str, w_cells, h_cells) or None.
+    max_w/max_h are in terminal cells; assumes 8×16 px per cell."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = (path, mtime, max_w, max_h)
+    if key in _sixel_cache:
+        return _sixel_cache[key]
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        CW, CH = 8, 16
+        img = Image.open(path).convert('RGB')
+        img.thumbnail((max_w * CW, max_h * CH), Image.LANCZOS)
+        w, h = img.size
+        w_cells = max(1, (w + CW - 1) // CW)
+        h_cells = max(1, (h + CH - 1) // CH)
+
+        qimg = img.quantize(colors=256)
+        pal  = qimg.getpalette()
+        data = list(qimg.getdata())  # type: ignore[attr-defined]
+
+        out = ['\033Pq']
+        for ci in range(min(256, len(pal) // 3)):
+            r = pal[ci*3] * 100 // 255
+            g = pal[ci*3+1] * 100 // 255
+            b = pal[ci*3+2] * 100 // 255
+            out.append(f'#{ci};2;{r};{g};{b}')
+
+        for y0 in range(0, h, 6):
+            bh = min(6, h - y0)
+            col_bits: dict = {}
+            for x in range(w):
+                for dy in range(bh):
+                    ci = data[(y0 + dy) * w + x]
+                    if ci not in col_bits:
+                        col_bits[ci] = bytearray(w)
+                    col_bits[ci][x] |= 1 << dy
+            first = True
+            for ci, bits in col_bits.items():
+                if not first: out.append('$')
+                first = False
+                out.append(f'#{ci}')
+                prev = None; run = 0
+                for v in bits:
+                    c = chr(63 + v)
+                    if c == prev:
+                        run += 1
+                    else:
+                        if prev: out.append(f'!{run}{prev}' if run > 3 else prev * run)
+                        prev, run = c, 1
+                if prev: out.append(f'!{run}{prev}' if run > 3 else prev * run)
+            out.append('-')
+
+        out.append('\033\\')
+        result = (''.join(out), w_cells, h_cells)
+        _sixel_cache[key] = result
+        return result
+    except Exception:
+        return None
+
+
+def _rgb_to_256(r: int, g: int, b: int) -> int:
+    """Nearest xterm-256 index using the 6x6x6 color cube (indices 16-231)."""
+    return 16 + 36 * round(r * 5 / 255) + 6 * round(g * 5 / 255) + round(b * 5 / 255)
+
+
+def _rgb_to_8(r: int, g: int, b: int) -> int:
+    """Nearest ANSI 8-color index (0-7) for terminals without 256-color support."""
+    bright = (r * 299 + g * 587 + b * 114) // 1000
+    if bright < 48:  return 0  # black
+    if bright > 200: return 7  # white
+    hi = max(r, g, b)
+    rd = r > hi * 0.5
+    gr = g > hi * 0.5
+    bl = b > hi * 0.5
+    if rd and gr and bl: return 7   # white-ish
+    if rd and gr:        return 3   # yellow
+    if rd and bl:        return 5   # magenta
+    if gr and bl:        return 6   # cyan
+    if rd:               return 1
+    if gr:               return 2
+    if bl:               return 4
+    return 0
+
+
+def _encode_color_text(path: str, max_w: int, max_h: int):
+    """Encode image as ANSI-colored ▀ half-block lines (2px per cell row).
+    Returns (lines, w_cells, h_cells) or None.  Each line is a self-contained
+    ANSI string; caller positions with ESC[y;xH before printing each one."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    key = (path, mtime, max_w, max_h, HAS_256COLOR)
+    if key in _colortext_cache:
+        return _colortext_cache[key]
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        img = Image.open(path).convert('RGB')
+        img.thumbnail((max_w, max_h * 2), Image.LANCZOS)
+        w, h = img.size
+        if h % 2:
+            pad = Image.new('RGB', (w, h + 1), (0, 0, 0))
+            pad.paste(img, (0, 0))
+            img = pad; h += 1
+        pix = img.load()
+        lines = []
+        for row in range(0, h, 2):
+            parts = []
+            for col in range(w):
+                tr, tg, tb = pix[col, row]
+                br2, bg2, bb2 = pix[col, row + 1]
+                if HAS_256COLOR:
+                    tc = _rgb_to_256(tr, tg, tb)
+                    bc = _rgb_to_256(br2, bg2, bb2)
+                    parts.append(f'\033[38;5;{tc};48;5;{bc}m▀')
+                else:
+                    tc = _rgb_to_8(tr, tg, tb)
+                    bc = _rgb_to_8(br2, bg2, bb2)
+                    parts.append(f'\033[3{tc};4{bc}m▀')
+            parts.append('\033[0m')
+            lines.append(''.join(parts))
+        result = (lines, w, h // 2)
+        _colortext_cache[key] = result
+        return result
+    except Exception:
+        return None
+
+
+def _md_images(buf) -> dict:
+    """Return {row: (abs_path, alt)} for the last-parsed generation of buf."""
+    key = (id(buf), buf._gen)
+    return _md_img_cache.get(key, {})
+
+
+def _inline_render(children):
+    """Walk markdown-it inline token children → (visual_line, spans).
+    Uses a per-character style array so nested bold+code etc. work cleanly."""
+    active = set()
+    chars: list = []
+    styles: list = []
+
+    def cur():
+        if not active: return None
+        p, a = 0, 0
+        if 'bold'   in active: a |= curses.A_BOLD
+        if 'italic' in active: a |= curses.A_UNDERLINE
+        if 'strike' in active: a |= curses.A_DIM
+        if 'link'   in active: p  = 13
+        return (p, a) if (p or a) else None
+
+    for tok in (children or []):
+        t = tok.type
+        if   t == 'strong_open':  active.add('bold')
+        elif t == 'strong_close': active.discard('bold')
+        elif t == 'em_open':      active.add('italic')
+        elif t == 'em_close':     active.discard('italic')
+        elif t == 'link_open':    active.add('link')
+        elif t == 'link_close':   active.discard('link')
+        elif t == 's_open':       active.add('strike')
+        elif t == 's_close':      active.discard('strike')
+        elif t == 'text':
+            st = cur()
+            for ch in tok.content: chars.append(ch); styles.append(st)
+        elif t == 'code_inline':
+            for ch in tok.content: chars.append(ch); styles.append((10, 0))
+        elif t == 'image':
+            src = (tok.attrs or {}).get('src', '') if tok.attrs else ''
+            alt = tok.content or (tok.attrs or {}).get('alt', '') if tok.attrs else tok.content or ''
+            label = alt or (os.path.basename(src) if src else 'image')
+            st  = cur()
+            for ch in f'[{label}]': chars.append(ch); styles.append(st)
+        # softbreak / hardbreak / html_inline: skip
+
+    vis = ''.join(chars)
+    spans, i = [], 0
+    while i < len(styles):
+        st = styles[i]
+        if st is None: i += 1; continue
+        j = i + 1
+        while j < len(styles) and styles[j] == st: j += 1
+        spans.append((i, j, st))
+        i = j
+    return vis, spans
+
+
+def _inline_text(children) -> str:
+    """Extract plain text from inline token children (used for headings/cells)."""
+    return ''.join(tok.content for tok in (children or [])
+                   if tok.type in ('text', 'code_inline'))
+
+
+def _render_table_tokens(toks, lines):
+    """Render a table token slice → {row_idx: (visual_line, spans)}."""
+    DIM  = (11, curses.A_DIM)
+    HEAD = (9,  curses.A_BOLD)
+    in_head = False
+    cur_ri = cur_hdr = None
+    cur_cells: list = []
+    rows = []
+
+    for tok in toks:
+        if   tok.type == 'thead_open':  in_head = True
+        elif tok.type == 'thead_close': in_head = False
+        elif tok.type == 'tr_open':
+            cur_ri = tok.map[0] if tok.map else None
+            cur_hdr = in_head; cur_cells = []
+        elif tok.type == 'tr_close':
+            if cur_ri is not None: rows.append((cur_ri, cur_hdr, cur_cells[:]))
+        elif tok.type == 'inline' and cur_cells is not None:
+            cur_cells.append(_inline_text(tok.children))
+
+    if not rows: return {}
+    ncols  = max(len(r[2]) for r in rows)
+    widths = [1] * ncols
+    for _, _, cells in rows:
+        for ci, c in enumerate(cells[:ncols]):
+            widths[ci] = max(widths[ci], len(c))
+
+    result = {}
+    for ri, hdr, cells in rows:
+        parts = ['│']; spans = [(0, 1, DIM)]; pos = 1
+        for ci in range(ncols):
+            cell   = cells[ci] if ci < len(cells) else ''
+            padded = ' ' + cell.ljust(widths[ci]) + ' '
+            if hdr: spans.append((pos, pos + len(padded), HEAD))
+            parts.append(padded); pos += len(padded)
+            parts.append('│'); spans.append((pos, pos + 1, DIM)); pos += 1
+        result[ri] = (''.join(parts), spans)
+
+    # Separator row sits between last header row and first body row in the buffer
+    hdrs  = [r for r in rows if     r[1]]
+    bodys = [r for r in rows if not r[1]]
+    if hdrs and bodys:
+        for r in range(hdrs[-1][0] + 1, bodys[0][0]):
+            if r < len(lines) and _TABLE_SEP_RE.match(lines[r]):
+                vis = '├' + '┼'.join('─' * (w + 2) for w in widths) + '┤'
+                result[r] = (vis, [(0, len(vis), DIM)]); break
+    return result
+
+
+def _md_highlight(buf):
+    key = (id(buf), buf._gen)
+    if key in _md_cache: return _md_cache[key]
+    stale = [k for k in _md_cache if k[0] == id(buf)]
+    for k in stale:
+        del _md_cache[k]
+        _md_img_cache.pop(k, None)
+    if len(_md_cache) > 20: _md_cache.clear(); _md_img_cache.clear()
+
+    lines  = buf.lines
+    by_row = [(ln, []) for ln in lines]   # default: raw, no styling
+    images: dict = {}                      # row → (abs_path, alt)
+
+    if _MD is None:
+        _md_cache[key] = by_row; _md_img_cache[key] = images; return by_row
+
+    H1 = (9, curses.A_BOLD | curses.A_UNDERLINE)
+    H2 = (9, curses.A_BOLD)
+    H3 = (9, 0)
+    DM = (11, curses.A_DIM)
+    FC = (14, 0)
+    QU = (11, 0)
+
+    tokens = _MD.parse('\n'.join(lines))
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        if tok.type == 'heading_open' and tok.map:
+            lv  = int(tok.tag[1]) if tok.tag and len(tok.tag) > 1 and tok.tag[1].isdigit() else 2
+            inl = tokens[i + 1] if i + 1 < len(tokens) and tokens[i + 1].type == 'inline' else None
+            vis = _inline_text(inl.children if inl else [])
+            r   = tok.map[0]
+            if r < len(by_row):
+                by_row[r] = (vis, [(0, len(vis), H1 if lv == 1 else H2 if lv == 2 else H3)])
+            i += 3; continue
+
+        if tok.type == 'hr' and tok.map:
+            r = tok.map[0]
+            if r < len(by_row):
+                vis = '─' * max(len(lines[r]), 3)
+                by_row[r] = (vis, [(0, len(vis), DM)])
+            i += 1; continue
+
+        if tok.type in ('fence', 'code_block') and tok.map:
+            r0, r1 = tok.map
+            is_fence = tok.type == 'fence'
+            lang = tok.info.strip() if (is_fence and tok.info) else ''
+            LB = (13, curses.A_BOLD)   # language badge: cyan bold
+            for r in range(r0, min(r1, len(by_row))):
+                if is_fence and r == r0:
+                    label = f' {lang}' if lang else ''
+                    vis = '╭─' + label
+                    spans = [(0, 2, DM)]
+                    if lang: spans.append((2, len(vis), LB))
+                    by_row[r] = (vis, spans)
+                elif is_fence and r == r1 - 1:
+                    by_row[r] = ('╰─', [(0, 2, DM)])
+                else:
+                    vis = '│ ' + lines[r]
+                    by_row[r] = (vis, [(0, 2, DM), (2, len(vis), FC)])
+            i += 1; continue
+
+        if tok.type == 'table_open' and tok.map:
+            j, d = i + 1, 1
+            while j < len(tokens):
+                if tokens[j].type == 'table_open':  d += 1
+                if tokens[j].type == 'table_close':
+                    d -= 1
+                    if d == 0: break
+                j += 1
+            for r, v in _render_table_tokens(tokens[i:j + 1], lines).items():
+                if r < len(by_row): by_row[r] = v
+            i = j + 1; continue
+
+        if tok.type == 'inline' and tok.map:
+            r0 = tok.map[0]
+            # Split children by softbreak → one visual line per source row
+            groups: list = [[]]
+            for child in (tok.children or []):
+                if child.type in ('softbreak', 'hardbreak'): groups.append([])
+                else: groups[-1].append(child)
+
+            for gi, group in enumerate(groups):
+                r = r0 + gi
+                if r >= len(by_row): break
+                # Record image metadata before rendering the placeholder
+                img_info = _extract_img_src(group, buf.filename)
+                if img_info:
+                    images[r] = img_info
+                vis, spans = _inline_render(group)
+                raw = lines[r]
+                # Detect block context from the raw buffer line, add visual prefix
+                bm = re.match(r'^(>+\s?)', raw)
+                lm = re.match(r'^(\s*)([-*+]|\d+\.)(\s)', raw)
+                if bm:
+                    vis   = '│ ' + vis
+                    spans = [(0, 2, DM)] + [(s + 2, e + 2, st) for s, e, st in spans]
+                    # re-apply quote color to unmarked text segments
+                    spans = [(s, e, QU if st is None else st) for s, e, st in spans]
+                elif lm:
+                    indent = lm.group(1)
+                    marker = lm.group(2)
+                    pre    = indent + ('• ' if marker in '-*+' else marker + ' ')
+                    vis    = pre + vis
+                    spans  = [(s + len(pre), e + len(pre), st) for s, e, st in spans]
+                by_row[r] = (vis, spans)
+            i += 1; continue
+
+        i += 1
+
+    _md_cache[key] = by_row
+    _md_img_cache[key] = images
+    return by_row
 
 # ── Editor ───────────────────────────────────────────────────────────────────
 
 class Editor:
-    def __init__(self, stdscr, filename=None):
+    def __init__(self, stdscr, filename=None, stdin_content=None, follow=False, follow_fd=None):
         self.stdscr = stdscr
         self.mode   = Mode.NORMAL
         self.height = 0
         self.width  = 0
 
         # Pane management
-        initial_buf = Buffer.from_file(filename) if filename else Buffer()
+        if stdin_content is not None:
+            initial_buf = Buffer.from_string(stdin_content, filename='[stdin]')
+        elif filename:
+            initial_buf = Buffer.from_file(filename)
+        else:
+            initial_buf = Buffer()
         p = Pane(initial_buf)
         self._layout  = _Leaf(p)
         self._panes   = [p]
@@ -402,6 +714,15 @@ class Editor:
         self.last_f_till   = False
         self.marks   = {}
         self.running = True
+        self._pending_sixels: list = []   # [(scr_y, scr_x, path, max_w, max_h)]
+        self._confirm_cb  = None
+        self._confirm_msg = ''
+        self.hist_sel = 0
+        self.hist_top = 0
+        self.hist_preview_scroll = 0
+        self.hist_diff_mode = True
+        self._hist_git_cache: list = []
+        self._hist_preview_cache: dict = {}
 
         # Explorer state
         self.ex_dir     = os.getcwd()
@@ -410,9 +731,36 @@ class Editor:
         self.ex_top     = 0
         self._prev_buf    = None
         self._prev_cursor = None
+        self.ex_search_query  = ''
+        self.ex_searching     = False
+
+        # Jump stack + picker state
+        self._jump_stack    = []   # list of (row, col) for Ctrl-O
+        self.picker_entries = []   # list of (label, row, col)
+        self.picker_sel     = 0
+        self.picker_top     = 0
+        self.picker_title   = ''
+
+        # Follow mode (tail -f)
+        self._follow         = follow
+        self._follow_fd      = follow_fd  # duped non-blocking stdin fd, or None
+        self._follow_file    = None       # open file handle for file-follow
+        self._follow_partial = ''         # incomplete last line not yet ended with \n
+        if follow:
+            stdscr.timeout(250)           # getch returns -1 after 250 ms
+            if follow_fd is not None:
+                self.buf.filename = '[stdin]'
+            elif filename:
+                try:
+                    self._follow_file = open(filename, 'r', errors='replace')
+                    self._follow_file.seek(0, 2)   # start at current EOF
+                except OSError:
+                    pass
 
         curses.start_color()
         curses.use_default_colors()
+        global HAS_256COLOR
+        HAS_256COLOR = curses.COLORS >= 256
         curses.init_pair(1,  curses.COLOR_BLACK,  curses.COLOR_CYAN)
         curses.init_pair(2,  curses.COLOR_BLACK,  curses.COLOR_YELLOW)
         curses.init_pair(3,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
@@ -429,6 +777,19 @@ class Editor:
         curses.init_pair(13, curses.COLOR_CYAN,   -1)   # type
         curses.init_pair(14, curses.COLOR_BLUE,   -1)   # builtin
         curses.init_pair(15, curses.COLOR_YELLOW, -1)   # decorator
+        # Diff viewer: green-bg for added, red-bg for removed
+        _diff_256=False
+        if HAS_256COLOR:
+            try:
+                curses.init_pair(20, 255, 22)   # white on dark green
+                curses.init_pair(21, 255, 52)   # white on dark red
+                curses.init_pair(22, 255, 17)   # white on dark blue (hunk header)
+                _diff_256=True
+            except Exception: pass
+        if not _diff_256:
+            curses.init_pair(20, curses.COLOR_GREEN,   -1)
+            curses.init_pair(21, curses.COLOR_RED,     -1)
+            curses.init_pair(22, curses.COLOR_CYAN,    -1)
 
         self.stdscr.keypad(True)
         curses.raw(); curses.noecho(); curses.curs_set(1)
@@ -467,6 +828,11 @@ class Editor:
         self.height, self.width = self.stdscr.getmaxyx()
         if self.mode == Mode.EXPLORER:
             self._draw_explorer(); return
+        if self.mode == Mode.HISTORY:
+            self._draw_history(); return
+        if self.mode == Mode.PICKER:
+            self._draw_picker(); return
+        self._pending_sixels = []
         self.stdscr.erase()
 
         avail_h = self.height - 2
@@ -496,6 +862,26 @@ class Editor:
         self._draw_statusbar()
         self._place_cursor()
         self.stdscr.refresh()
+        self._flush_images()
+
+    def _flush_images(self):
+        if not self._pending_sixels:
+            return
+        buf = []
+        for scr_y, scr_x, path, max_w, max_h in self._pending_sixels:
+            if HAS_SIXEL:
+                result = _encode_sixel(path, max_w, max_h)
+                if result:
+                    data, _wc, _hc = result
+                    buf.append(f'\033[{scr_y + 1};{scr_x + 1}H{data}')
+            else:
+                result = _encode_color_text(path, max_w, max_h)
+                if result:
+                    lines, _wc, _hc = result
+                    for i, line in enumerate(lines):
+                        buf.append(f'\033[{scr_y + 1 + i};{scr_x + 1}H{line}')
+        if buf:
+            os.write(sys.stdout.fileno(), ''.join(buf).encode('utf-8'))
 
     def _draw_pane(self, pane, is_active):
         lnw = self._pane_lnw(pane)
@@ -519,7 +905,12 @@ class Editor:
                     elif r == er:    vis_range[r] = (0, ec)
                     else:            vis_range[r] = None
 
-        lang = _detect_lang(pane.buf.filename)
+        is_md = _is_markdown(pane.buf.filename)
+        in_insert = is_active and self.mode == Mode.INSERT
+        md_table = (_md_highlight(pane.buf) if is_md else None)
+        img_map  = (_md_images(pane.buf) if is_md else {})
+        hl_table = (None if is_md else
+                    _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
 
         try:
             spat = re.compile(self.search_pat,
@@ -544,22 +935,34 @@ class Editor:
                 self._as(scr_y, scr_x, ns, na)
 
             line = pane.buf.get_line(br)
-            self._render_line(scr_y, scr_x + lnw, line, lc, tw,
-                              vis_rows, vis_range, br, spat, lang, is_active)
+            if br in img_map and not (is_active and br == pane.cursor.row):
+                path, _alt = img_map[br]
+                self._pending_sixels.append(
+                    (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
+            if md_table:
+                is_cur = is_active and br == pane.cursor.row
+                # Table rows in normal mode: always show rendered (cell nav keeps
+                # cursor at cell-start so column accuracy isn't needed).
+                # Insert mode or non-table cursor row: show raw for accurate editing.
+                show_raw_cur = is_cur and (in_insert or not _is_table_row(line))
+                raw = show_raw_cur or br in vis_rows
+                display, hl_row = (line, []) if raw else (
+                    md_table[br] if br < len(md_table) else (line, []))
+            else:
+                display = line
+                hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
+            self._render_line(scr_y, scr_x + lnw, display, lc, tw,
+                              vis_rows, vis_range, br, spat, hl_row, is_active)
 
     def _render_line(self, sy, sx, line, lc, tw, vis_rows, vis_range, br,
-                     spat, lang, is_active):
-        """Render one line: syntax + search + visual selection, clipped to [lc, lc+tw)."""
+                     spat, hl_row, is_active):
         # Build span list: (start_in_line, end_in_line, attr)
         spans = []
 
-        # 1. Syntax tokens (lowest priority)
-        if lang:
-            for ts, te, tok in _tokenize(line, lang):
-                a = curses.color_pair(_TOK_PAIR[tok])
-                if tok == _CM: a |= curses.A_DIM
-                elif tok == _KW: a |= curses.A_BOLD
-                spans.append((ts, te, a))
+        # 1. Syntax tokens from pygments (lowest priority)
+        # hl_row entries: (start, end, (pair_idx, extra_attr)) — resolve here
+        for ts, te, pg in hl_row:
+            spans.append((ts, te, curses.color_pair(pg[0]) | pg[1]))
 
         # 2. Search matches (override syntax)
         if spat:
@@ -607,8 +1010,11 @@ class Editor:
             self._as(sy, scr_col, rest)
 
     def _draw_statusbar(self):
+        _tbl_nm = (self.mode == Mode.NORMAL and
+                   _is_table_row(self.buf.get_line(self.cursor.row)))
         ml = {
-            Mode.NORMAL:' NORMAL ', Mode.INSERT:' INSERT ',
+            Mode.NORMAL:' TABLE  ' if _tbl_nm else ' NORMAL ',
+            Mode.INSERT:' INSERT ',
             Mode.VISUAL:' VISUAL ', Mode.VISUAL_LINE:' V-LINE ',
             Mode.COMMAND:' COMMAND', Mode.SEARCH:' SEARCH ',
         }.get(self.mode, ' NORMAL ')
@@ -616,7 +1022,9 @@ class Editor:
         mod   = ' [+]' if self.buf.modified else ''
         pos   = f' {self.cursor.row+1}:{self.cursor.col+1} '
 
-        if self.mode in (Mode.COMMAND, Mode.SEARCH):
+        if self._confirm_cb is not None:
+            self._as(self.height-1, 0, (self._confirm_msg+' '*self.width)[:self.width-1], curses.color_pair(4))
+        elif self.mode in (Mode.COMMAND, Mode.SEARCH):
             self._as(self.height-1, 0, (self.cmd_line+' '*self.width)[:self.width-1])
         elif self.status_msg:
             self._as(self.height-1, 0,
@@ -638,8 +1046,23 @@ class Editor:
             return
         p = self._pane
         lnw = self._pane_lnw(p)
-        sy = p.y + p.cursor.row - p.top_row
-        sx = p.x + lnw + p.cursor.col - p.left_col
+        sy  = p.y + p.cursor.row - p.top_row
+        col = p.cursor.col
+        # TABLE mode: cursor.col is a buffer col, but the screen shows rendered
+        # box-drawing where cells are padded to equal widths.  Map to visual col.
+        if (self.mode == Mode.NORMAL and _is_markdown(p.buf.filename)):
+            raw = p.buf.get_line(p.cursor.row)
+            if _is_table_row(raw):
+                md = _md_highlight(p.buf)
+                if p.cursor.row < len(md):
+                    vis_line, _ = md[p.cursor.row]
+                    info = _table_cell_at(raw, col)
+                    if info:
+                        pipes = [i for i, c in enumerate(vis_line) if c == '│']
+                        ci = info[0]
+                        if ci + 1 < len(pipes):
+                            col = pipes[ci] + 2  # land after '│ '
+        sx = p.x + lnw + col - p.left_col
         try:
             self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)),
                              max(p.x, min(sx, p.x+p.width-1)))
@@ -685,6 +1108,68 @@ class Editor:
             mc = max(0, len(line)-(0 if self.mode==Mode.INSERT else 1))
             p.cursor.col = max(0, min(p.cursor.col+dc, mc))
             p.cursor.col_want = p.cursor.col
+
+    def _cell_next(self):
+        line = self.buf.get_line(self.cursor.row)
+        cells = _table_cells(line)
+        if not cells: return
+        info = _table_cell_at(line, self.cursor.col)
+        idx = info[0] if info else -1
+        if idx + 1 < len(cells):
+            self.cursor.col = cells[idx + 1][0]
+        else:
+            nr = self.cursor.row + 1
+            if nr < self.buf.line_count():
+                self.cursor.row = nr
+                c2 = _table_cells(self.buf.get_line(nr))
+                if c2: self.cursor.col = c2[0][0]
+
+    def _cell_prev(self):
+        line = self.buf.get_line(self.cursor.row)
+        cells = _table_cells(line)
+        if not cells: return
+        info = _table_cell_at(line, self.cursor.col)
+        idx = info[0] if info else len(cells)
+        if idx > 0:
+            self.cursor.col = cells[idx - 1][0]
+        else:
+            nr = self.cursor.row - 1
+            if nr >= 0:
+                self.cursor.row = nr
+                c2 = _table_cells(self.buf.get_line(nr))
+                if c2: self.cursor.col = c2[-1][0]
+
+    def _cell_down(self):
+        line = self.buf.get_line(self.cursor.row)
+        info = _table_cell_at(line, self.cursor.col)
+        idx = info[0] if info else 0
+        nr = self.cursor.row + 1
+        while nr < self.buf.line_count():
+            nl = self.buf.get_line(nr)
+            if _TABLE_SEP_RE.match(nl): nr += 1; continue
+            c2 = _table_cells(nl)
+            if c2:
+                self.cursor.row = nr
+                self.cursor.col = c2[min(idx, len(c2) - 1)][0]
+                return
+            break
+        self._move(1, 0)
+
+    def _cell_up(self):
+        line = self.buf.get_line(self.cursor.row)
+        info = _table_cell_at(line, self.cursor.col)
+        idx = info[0] if info else 0
+        nr = self.cursor.row - 1
+        while nr >= 0:
+            nl = self.buf.get_line(nr)
+            if _TABLE_SEP_RE.match(nl): nr -= 1; continue
+            c2 = _table_cells(nl)
+            if c2:
+                self.cursor.row = nr
+                self.cursor.col = c2[min(idx, len(c2) - 1)][0]
+                return
+            break
+        self._move(-1, 0)
 
     def _first_nonblank(self, row=None):
         r = self.cursor.row if row is None else row
@@ -968,14 +1453,10 @@ class Editor:
 
     def _goto_pane_dir(self, d):
         cur=self._pane; best=None; best_score=10**9
-        with open('/tmp/pyvim_nav.log','a') as _f:
-            _f.write(f"nav {d}: cur={self._pane_i} y={cur.y} h={cur.height} x={cur.x} w={cur.width} npanes={len(self._panes)}\n")
         for i, p in enumerate(self._panes):
             if p is cur: continue
             ov_h = p.y < cur.y+cur.height and p.y+p.height > cur.y
             ov_v = p.x < cur.x+cur.width  and p.x+p.width  > cur.x
-            with open('/tmp/pyvim_nav.log','a') as _f:
-                _f.write(f"  cand {i}: y={p.y} h={p.height} x={p.x} w={p.width} ov_h={ov_h} ov_v={ov_v}\n")
             if   d=='h' and p.x+p.width < cur.x and ov_h:
                 score = cur.x - (p.x+p.width)
             elif d=='l' and p.x > cur.x+cur.width and ov_h:
@@ -986,8 +1467,6 @@ class Editor:
                 score = p.y - (cur.y+cur.height)
             else: continue
             if score < best_score: best_score=score; best=i
-        with open('/tmp/pyvim_nav.log','a') as _f:
-            _f.write(f"  -> best={best}\n")
         if best is not None: self._pane_i=best
 
     # ── Mode transitions ──────────────────────────────────────────────────────
@@ -1009,10 +1488,70 @@ class Editor:
         while self.running:
             self._clamp(); self._scroll(); self.draw()
             key=self.stdscr.getch()
+            if key == -1:
+                if self._follow: self._follow_check()
+                continue
             self.status_msg=''; self.status_err=False
             self._dispatch(key)
 
+    def _apply_follow_text(self, new_text):
+        """Append new_text to the buffer using the partial-line state machine.
+
+        _follow_partial tracks any incomplete last line (no trailing \\n yet).
+        When non-empty it is always the last element of buf.lines.
+        """
+        if not new_text: return
+        near_bottom = self.cursor.row >= self.buf.line_count() - 2
+        # Clear the initial one-line empty-buffer placeholder on first write.
+        if not self._follow_partial and self.buf.lines == ['']:
+            self.buf.lines = []
+        full = self._follow_partial + new_text
+        parts = full.split('\n')
+        new_partial = parts[-1]   # '' when new_text ended with \n
+        complete    = parts[:-1]  # lines that ended with \n
+        if self._follow_partial and self.buf.lines:
+            self.buf.lines.pop()  # remove old partial; will be replaced below
+        self.buf.lines.extend(complete)
+        if new_partial:
+            self.buf.lines.append(new_partial)
+        if not self.buf.lines:
+            self.buf.lines = ['']
+        self._follow_partial = new_partial
+        self.buf._gen += 1
+        if near_bottom:
+            self.cursor.row = self.buf.line_count() - 1; self._clamp()
+
+    def _follow_check(self):
+        new_text = ''
+        if self._follow_file:
+            chunk = self._follow_file.read()
+            if chunk: new_text = chunk
+        elif self._follow_fd is not None:
+            r, _, _ = select.select([self._follow_fd], [], [], 0)
+            if r:
+                raw_chunks = []
+                try:
+                    while True:
+                        chunk = os.read(self._follow_fd, 65536)
+                        if not chunk:
+                            os.close(self._follow_fd); self._follow_fd = None; break
+                        raw_chunks.append(chunk)
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    pass
+                if raw_chunks:
+                    new_text = b''.join(raw_chunks).decode('utf-8', errors='replace')
+        self._apply_follow_text(new_text)
+
     def _dispatch(self, key):
+        if self._confirm_cb is not None:
+            if key in (ord('y'), ord('Y')):
+                cb=self._confirm_cb; self._confirm_cb=None; self._confirm_msg=''; cb()
+            else:
+                self._confirm_cb=None; self._confirm_msg=''
+                self.status_msg='Cancelled'; self.status_err=False
+            return
         if   self.mode==Mode.NORMAL:      self._normal(key)
         elif self.mode==Mode.INSERT:      self._insert(key)
         elif self.mode==Mode.VISUAL:      self._visual(key)
@@ -1020,6 +1559,8 @@ class Editor:
         elif self.mode==Mode.COMMAND:     self._command_key(key)
         elif self.mode==Mode.SEARCH:      self._search_key(key)
         elif self.mode==Mode.EXPLORER:    self._explorer_key(key)
+        elif self.mode==Mode.HISTORY:     self._history_key(key)
+        elif self.mode==Mode.PICKER:      self._picker_key(key)
 
     # ── Normal mode ───────────────────────────────────────────────────────────
 
@@ -1030,10 +1571,21 @@ class Editor:
         count=int(self.pending_count) if self.pending_count else 1
         self.pending_count=''
 
-        if   key in (curses.KEY_LEFT,)  or ch=='h': [self._move(0,-1) for _ in range(count)]
-        elif key in (curses.KEY_RIGHT,) or ch=='l': [self._move(0,1)  for _ in range(count)]
-        elif key in (curses.KEY_UP,)    or ch=='k': [self._move(-1,0) for _ in range(count)]
-        elif key in (curses.KEY_DOWN,)  or ch=='j': [self._move(1,0)  for _ in range(count)]
+        _on_tbl = _is_table_row(self.buf.get_line(self.cursor.row))
+        if   key in (curses.KEY_LEFT,)  or ch=='h':
+            if _on_tbl: [self._cell_prev() for _ in range(count)]
+            else: [self._move(0,-1) for _ in range(count)]
+        elif key in (curses.KEY_RIGHT,) or ch=='l':
+            if _on_tbl: [self._cell_next() for _ in range(count)]
+            else: [self._move(0,1) for _ in range(count)]
+        elif key in (curses.KEY_UP,)    or ch=='k':
+            if _on_tbl: [self._cell_up()   for _ in range(count)]
+            else: [self._move(-1,0) for _ in range(count)]
+        elif key in (curses.KEY_DOWN,)  or ch=='j':
+            if _on_tbl: [self._cell_down() for _ in range(count)]
+            else: [self._move(1,0)  for _ in range(count)]
+        elif key==9 and _on_tbl: [self._cell_next() for _ in range(count)]
+        elif key==353 and _on_tbl: [self._cell_prev() for _ in range(count)]  # Shift-Tab
         elif ch=='0': self.cursor.col=0; self.cursor.col_want=0
         elif ch=='^': self._first_nonblank()
         elif ch=='$':
@@ -1169,6 +1721,8 @@ class Editor:
                 self.cursor.row,self.cursor.col=self.marks[chr(k2)]
         elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
         elif ch=='z': self._normal_z()
+        elif key==5:  self._eval_region(self.cursor.row, self.cursor.row)  # Ctrl-E
+        elif key==15: self._jump_back()   # Ctrl-O
         elif key==23: self._ctrl_w()   # Ctrl-W
         elif key==26:                  # Ctrl-Z suspend
             import signal
@@ -1180,6 +1734,149 @@ class Editor:
         elif key==curses.KEY_END:
             self.cursor.col=max(0,len(self.buf.get_line(self.cursor.row))-1)
 
+    # ── Jump stack ────────────────────────────────────────────────────────────
+
+    def _push_jump(self):
+        self._jump_stack.append((self.cursor.row, self.cursor.col))
+
+    def _jump_back(self):
+        if self._jump_stack:
+            row, col = self._jump_stack.pop()
+            self.cursor.row = row; self.cursor.col = col; self._clamp()
+        else:
+            self.status_msg = 'Already at oldest position'
+
+    # ── AST navigation ────────────────────────────────────────────────────────
+
+    def _ast_defs(self, name, src):
+        try: tree = ast.parse(src)
+        except SyntaxError: return []
+        results = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == name:
+                    results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    n = alias.asname or alias.name.split('.')[0]
+                    if n == name:
+                        results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    n = alias.asname or alias.name
+                    if n == name:
+                        results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, ast.NamedExpr):
+                if node.target.id == name:
+                    results.append((node.target.lineno-1, node.target.col_offset))
+            elif isinstance(node, ast.comprehension):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+        results.sort()
+        return list(dict.fromkeys(results))
+
+    def _ast_refs(self, name, src):
+        try: tree = ast.parse(src)
+        except SyntaxError: return []
+        results = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == name:
+                results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == name:
+                    results.append((node.lineno-1, node.col_offset))
+        results.sort()
+        return list(dict.fromkeys(results))
+
+    def _py_file(self):
+        return bool(self.buf.filename and self.buf.filename.endswith(('.py', '.pyw')))
+
+    def _gd(self):
+        if not self._py_file():
+            self.status_msg = 'gd: Python files only'; self.status_err = True; return
+        word = self._word_under_cursor()
+        if not word: self.status_msg = 'No word under cursor'; return
+        src = '\n'.join(self.buf.lines)
+        defs = self._ast_defs(word, src)
+        if not defs:
+            self.status_msg = f'No definition: {word!r}'; self.status_err = True; return
+        self._push_jump()
+        if len(defs) == 1:
+            self.cursor.row, self.cursor.col = defs[0]; self._first_nonblank(); return
+        entries = [(f'L{r+1}: {self.buf.get_line(r).strip()[:60]}', r, 0) for r, _ in defs]
+        self._open_picker(f'Definitions of {word!r}', entries)
+
+    def _gr(self):
+        if not self._py_file():
+            self.status_msg = 'gr: Python files only'; self.status_err = True; return
+        word = self._word_under_cursor()
+        if not word: self.status_msg = 'No word under cursor'; return
+        src = '\n'.join(self.buf.lines)
+        refs = self._ast_refs(word, src)
+        if not refs:
+            self.status_msg = f'No references: {word!r}'; self.status_err = True; return
+        entries = [(f'L{r+1}: {self.buf.get_line(r).strip()[:60]}', r, c) for r, c in refs]
+        self._push_jump()
+        self._open_picker(f'References to {word!r} ({len(refs)})', entries)
+
+    # ── Picker (multi-result navigation) ─────────────────────────────────────
+
+    def _open_picker(self, title, entries):
+        self.picker_title = title
+        self.picker_entries = entries
+        self.picker_sel = 0; self.picker_top = 0
+        self.mode = Mode.PICKER
+
+    def _draw_picker(self):
+        self.stdscr.erase(); w = self.width
+        self._as(0, 0, f' {self.picker_title} '[:w-1].ljust(w-1), curses.color_pair(1)|curses.A_BOLD)
+        self._as(1, 0, '─'*(w-1), curses.A_DIM)
+        body_h = self.height - 4; n = len(self.picker_entries)
+        if self.picker_sel < self.picker_top: self.picker_top = self.picker_sel
+        elif self.picker_sel >= self.picker_top+body_h: self.picker_top = self.picker_sel-body_h+1
+        for i in range(body_h):
+            idx = self.picker_top+i
+            if idx >= n: break
+            label, row, col = self.picker_entries[idx]
+            display = ('  '+label)[:w-1].ljust(w-1)
+            attr = (curses.color_pair(8)|curses.A_BOLD if idx == self.picker_sel else 0)
+            self._as(2+i, 0, display, attr)
+        footer = ' j/k:move  Enter:jump  q/Esc:close  Ctrl-O:back '
+        self._as(self.height-2, 0, footer[:w-1].ljust(w-1), curses.color_pair(1))
+        if self.status_msg:
+            self._as(self.height-1, 0, self.status_msg[:w-1],
+                     curses.color_pair(4) if self.status_err else 0)
+        self.stdscr.refresh()
+
+    def _picker_key(self, key):
+        ch = chr(key) if 32<=key<=126 else None
+        n = len(self.picker_entries)
+        if   key==curses.KEY_UP   or ch=='k': self.picker_sel = max(0, self.picker_sel-1)
+        elif key==curses.KEY_DOWN or ch=='j': self.picker_sel = min(n-1, self.picker_sel+1)
+        elif key==6  or key==curses.KEY_NPAGE: self.picker_sel=min(n-1,self.picker_sel+max(1,self.height-6))
+        elif key==2  or key==curses.KEY_PPAGE: self.picker_sel=max(0,self.picker_sel-max(1,self.height-6))
+        elif key==curses.KEY_HOME: self.picker_sel = 0
+        elif key==curses.KEY_END:  self.picker_sel = n-1
+        elif key in (10, 13) or key==curses.KEY_RIGHT:
+            if self.picker_entries:
+                _, row, col = self.picker_entries[self.picker_sel]
+                self.mode = Mode.NORMAL; self.cursor.row = row; self.cursor.col = col; self._clamp()
+        elif ch=='q' or key==27 or key==15:   # q / Esc / Ctrl-O
+            self.mode = Mode.NORMAL; self._jump_back()
+
     def _normal_g(self, count):
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
         if ch2=='g': self.cursor.row=max(0,count-1); self._first_nonblank()
@@ -1187,6 +1884,8 @@ class Editor:
             line=self.buf.get_line(self.cursor.row); self.cursor.col=max(0,len(line.rstrip())-1)
         elif ch2=='e': self._word_end(False)
         elif ch2=='E': self._word_end(True)
+        elif ch2=='d': self._gd()
+        elif ch2=='r': self._gr()
 
     def _normal_z(self):
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
@@ -1296,7 +1995,11 @@ class Editor:
             self.cursor.row+=1; self.cursor.col=len(ind)
             self.buf.set_line(self.cursor.row,ind+self.buf.get_line(self.cursor.row))
         elif key==9:
-            for _ in range(4): self.buf.insert_char(self.cursor.row,self.cursor.col,' '); self.cursor.col+=1
+            if _is_table_row(self.buf.get_line(self.cursor.row)): self._cell_next()
+            else:
+                for _ in range(4): self.buf.insert_char(self.cursor.row,self.cursor.col,' '); self.cursor.col+=1
+        elif key==353:  # Shift-Tab
+            if _is_table_row(self.buf.get_line(self.cursor.row)): self._cell_prev()
         elif key==23:  # Ctrl-W delete word back
             line=self.buf.get_line(self.cursor.row); c=self.cursor.col
             while c>0 and line[c-1]==' ': c-=1
@@ -1408,6 +2111,10 @@ class Editor:
             return
         if ch==':':
             self.mode=Mode.COMMAND; self.cmd_line=":'<,'>"; return
+        if key==5:   # Ctrl-E — eval selection
+            sr,sc=self.visual_start; er,ec=self.cursor.row,self.cursor.col
+            if (sr,sc)>(er,ec): sr,sc,er,ec=er,ec,sr,sc
+            self._eval_region(sr, er); self._enter_normal(); return
         if ch=='n': self._search_next(self.search_dir); return
         if ch=='N': self._search_next(-self.search_dir); return
         if self._vmove(key, count): return
@@ -1471,6 +2178,9 @@ class Editor:
             self.mode=Mode.COMMAND; self.cmd_line=":'<,'>"; return
         if ch=='n': self._search_next(self.search_dir); return
         if ch=='N': self._search_next(-self.search_dir); return
+        if key==5:   # Ctrl-E — eval selection (line-wise)
+            r1,r2=self._vis_lrange()
+            self._eval_region(r1, r2); self._enter_normal(); return
 
         # All motions (line-mode cares about row movement mainly)
         moved=self._vmove(key, count)
@@ -1528,9 +2238,203 @@ class Editor:
             else: self.mode=Mode.NORMAL; self.cmd_line=''
         elif 32<=key<=126: self.cmd_line+=chr(key)
 
+    # ── Python eval integration ───────────────────────────────────────────────
+
+    def _eval_ns(self):
+        """Return the persistent eval namespace, seeded with live editor refs."""
+        if not hasattr(self, '_py_ns'):
+            self._py_ns = {}
+        self._py_ns.update({'ed': self, 'buf': self.buf, 'pane': self._pane})
+        return self._py_ns
+
+    @staticmethod
+    def _buf_is_python(buf):
+        """True if the buffer looks like Python — .py extension or valid ast.parse."""
+        import ast
+        if buf.filename and buf.filename.endswith(('.py', '.pyw')):
+            return True
+        if buf.filename:
+            return False  # named non-Python file — don't even try
+        # Unnamed buffer: try parsing first non-blank lines as a heuristic
+        sample = '\n'.join(l for l in buf.lines[:20] if l.strip())
+        try:
+            ast.parse(sample); return True
+        except SyntaxError:
+            return False
+
+    def _resolve_deps(self, r1, r2):
+        """Return statements needed before running lines r1..r2.
+
+        Parses the selection to find free variable names, then walks the
+        file's top-level AST to find the imports and definitions that supply
+        them. Returns a list of source strings to exec in order, skipping
+        anything already present in the eval namespace.
+        """
+        import ast
+        if not self._buf_is_python(self.buf):
+            return []
+        ns = self._eval_ns()
+        builtins = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
+
+        # 1. Find names the selection uses but doesn't define locally.
+        sel_src = '\n'.join(self.buf.get_line(r) for r in range(r1, r2+1))
+        try:
+            sel_tree = ast.parse(sel_src)
+        except SyntaxError:
+            return []
+
+        used = set()
+        for node in ast.walk(sel_tree):
+            if isinstance(node, ast.Name):
+                used.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                # dotted access: collect root name (random.gauss → random)
+                n = node
+                while isinstance(n, ast.Attribute): n = n.value
+                if isinstance(n, ast.Name): used.add(n.id)
+
+        local_defs = set()
+        for node in ast.walk(sel_tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                local_defs.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name): local_defs.add(t.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for a in node.names:
+                    local_defs.add(a.asname or a.name.split('.')[0])
+
+        free = used - local_defs - builtins - set(ns)
+        if not free:
+            return []
+
+        # 2. Walk the file's top-level nodes to find what supplies each free name.
+        full_src = '\n'.join(self.buf.lines)
+        try:
+            full_tree = ast.parse(full_src)
+        except SyntaxError:
+            return []
+
+        deps = []
+        seen_names = set()
+        for node in ast.iter_child_nodes(full_tree):
+            node_r1 = node.lineno - 1  # convert to 0-indexed
+            if node_r1 >= r1:          # don't look at or past the selection
+                continue
+
+            provided = set()
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    provided.add(a.asname or a.name.split('.')[0])
+            elif isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    provided.add(a.asname or (a.name if a.name != '*' else ''))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                provided.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name): provided.add(t.id)
+
+            needed = provided & free - seen_names
+            if needed:
+                end = getattr(node, 'end_lineno', node.lineno) - 1
+                src = '\n'.join(self.buf.lines[node_r1:end+1])
+                deps.append(src)
+                seen_names |= needed
+
+        return deps
+
+    def _eval_region(self, r1, r2):
+        """Eval lines r1..r2 (inclusive), insert captured output after r2."""
+        import io, contextlib, traceback
+        ns = self._eval_ns()
+        for dep in self._resolve_deps(r1, r2):
+            try:
+                exec(compile(dep, '<dep>', 'exec'), ns)
+            except Exception:
+                pass
+        code = '\n'.join(self.buf.get_line(r) for r in range(r1, r2+1))
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                exec(compile(code, '<pyvim>', 'exec'), self._eval_ns())
+            result = out.getvalue()
+            self.status_msg = 'eval ok'
+        except Exception:
+            result = traceback.format_exc()
+            self.status_err = True
+            self.status_msg = result.splitlines()[-1]
+        if result.strip():
+            self.buf.save_undo()
+            lines = result.rstrip('\n').splitlines()
+            for i, line in enumerate(lines):
+                self.buf.insert_line(r2 + 1 + i, '# >> ' + line)
+            self.cursor.row = r2 + 1
+
+    def _exec_file_toplevel(self):
+        """Run every top-level statement in the current buffer into _py_ns.
+        Used to pre-populate the REPL so all imports and defs are available.
+        """
+        import ast
+        if not self._buf_is_python(self.buf):
+            return
+        ns = self._eval_ns()
+        full_src = '\n'.join(self.buf.lines)
+        try:
+            full_tree = ast.parse(full_src)
+        except SyntaxError:
+            return
+        for node in ast.iter_child_nodes(full_tree):
+            r1 = node.lineno - 1
+            end = getattr(node, 'end_lineno', node.lineno) - 1
+            src = '\n'.join(self.buf.lines[r1:end+1])
+            try:
+                exec(compile(src, '<toplevel>', 'exec'), ns)
+            except Exception:
+                pass
+
+    def _py_repl(self):
+        """Drop into an interactive Python REPL, then return to pyvim."""
+        import code as _code
+        self._exec_file_toplevel()
+        curses.endwin()
+        print(f'\n  pyvim REPL  —  locals: ed, buf, pane  —  Ctrl-D to return\n')
+        _code.interact(local=self._eval_ns(), banner='')
+        self.stdscr.refresh()
+        self.status_msg = 'returned from REPL'
+
+    def _py_exec(self, expr):
+        """Eval a single expression from command line, show result in status."""
+        import io, contextlib, traceback
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                result = eval(compile(expr, '<cmd>', 'eval'), self._eval_ns())
+            self.status_msg = repr(result) if result is not None else (out.getvalue().rstrip() or 'ok')
+        except SyntaxError:
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                    exec(compile(expr, '<cmd>', 'exec'), self._eval_ns())
+                self.status_msg = out.getvalue().rstrip() or 'ok'
+            except Exception:
+                self.status_msg = traceback.format_exc().splitlines()[-1]; self.status_err = True
+        except Exception:
+            self.status_msg = traceback.format_exc().splitlines()[-1]; self.status_err = True
+
+    def _disk_changed(self, fname=None):
+        """Return True if the file on disk has been modified since we last read/wrote it."""
+        target=fname or self.buf.filename
+        if not target: return False
+        try: return os.path.getmtime(target) != self.buf._disk_mtime
+        except OSError: return False
+
     def _exec_cmd(self, cmd):
         cmd=cmd.strip()
         if not cmd: return
+        if cmd in ('py','python'):
+            self._py_repl(); return
+        elif cmd.startswith('py ') or cmd.startswith('python '):
+            self._py_exec(cmd.split(None,1)[1]); return
         if cmd in ('qa','qall'):
             dirty=[p for p in self._panes if p.buf.modified]
             if dirty:
@@ -1549,14 +2453,32 @@ class Editor:
             self._close_pane(force=True)
         elif re.match(r'^wq?!?$',cmd) or cmd in ('x','wq','x!'):
             parts=cmd.split(None,1); fname=parts[1] if len(parts)>1 else None
-            try: self.buf.save(fname); self._close_pane(force=True)
-            except Exception as e: self.status_msg=str(e); self.status_err=True
+            force='!' in cmd or cmd=='x'
+            if not force and self._disk_changed(fname):
+                def _do_wq(f=fname):
+                    try: self.buf.save(f); self._close_pane(force=True)
+                    except Exception as e: self.status_msg=str(e); self.status_err=True
+                self._confirm_cb=_do_wq
+                self._confirm_msg=f'"{fname or self.buf.filename}" changed on disk. Overwrite? [y/N] '
+            else:
+                try: self.buf.save(fname); self._close_pane(force=True)
+                except Exception as e: self.status_msg=str(e); self.status_err=True
         elif cmd.startswith('w') and (len(cmd)==1 or cmd[1] in ' !'):
             parts=cmd.split(None,1); fname=parts[1] if len(parts)>1 else None
-            try:
-                self.buf.save(fname)
-                self.status_msg=f'"{self.buf.filename}" {self.buf.line_count()}L written'
-            except Exception as e: self.status_msg=str(e); self.status_err=True
+            force='!' in cmd
+            if not force and self._disk_changed(fname):
+                def _do_w(f=fname):
+                    try:
+                        self.buf.save(f)
+                        self.status_msg=f'"{self.buf.filename}" {self.buf.line_count()}L written'
+                    except Exception as e: self.status_msg=str(e); self.status_err=True
+                self._confirm_cb=_do_w
+                self._confirm_msg=f'"{fname or self.buf.filename}" changed on disk. Overwrite? [y/N] '
+            else:
+                try:
+                    self.buf.save(fname)
+                    self.status_msg=f'"{self.buf.filename}" {self.buf.line_count()}L written'
+                except Exception as e: self.status_msg=str(e); self.status_err=True
         elif cmd.startswith('e ') or cmd.startswith('edit '):
             parts=cmd.split(None,1)
             if len(parts)>1: self._load_file(parts[1].strip())
@@ -1584,6 +2506,14 @@ class Editor:
         elif re.match(r'^[Ee]x(plore)?(\s|$)',cmd) or re.match(r'^[Ll]ex(plore)?(\s|$)',cmd):
             parts=cmd.split(None,1); path=parts[1].strip() if len(parts)>1 else None
             self._open_explorer(path)
+        elif cmd in ('history','historyw','undolist'):
+            self.hist_sel=0; self.hist_top=0; self.hist_preview_scroll=0
+            self._hist_git_cache=self._git_hist(); self._hist_preview_cache={}
+            self.mode=Mode.HISTORY
+        elif re.match(r'^earlier\b',cmd):
+            self._cmd_earlier_later(cmd, forward=False)
+        elif re.match(r'^later\b',cmd):
+            self._cmd_earlier_later(cmd, forward=True)
         elif re.match(r'^[vV]?sp(lit)?(\s|$)',cmd,re.IGNORECASE):
             m=re.match(r'^([vV]?)sp(?:lit)?\s*(.*)',cmd,re.IGNORECASE)
             if m:
@@ -1639,6 +2569,243 @@ class Editor:
             else: self.mode=Mode.NORMAL; self.cmd_line=''; self.search_pat=''
         elif 32<=key<=126: self.cmd_line+=chr(key)
 
+    # ── History ───────────────────────────────────────────────────────────────
+
+    def _cmd_earlier_later(self, cmd, forward):
+        parts=cmd.split(None,1); arg=parts[1].strip() if len(parts)>1 else '1'
+        m=re.match(r'^(\d+)([smh]?)$',arg)
+        if not m: self.status_msg=f'Invalid argument: {arg}'; self.status_err=True; return
+        n=int(m.group(1)); unit=m.group(2)
+        if unit:
+            secs={'s':1,'m':60,'h':3600}[unit]*n; target=time.time()-secs; steps=0
+            if forward:
+                while self.buf._redo and self.buf._redo[-1][1]>target: self.buf.redo(); steps+=1
+            else:
+                while self.buf._undo and self.buf._undo[-1][1]>=target: self.buf.undo(); steps+=1
+            self.status_msg=f'{"later" if forward else "earlier"} {n}{unit}: {steps} change{"s" if steps!=1 else ""}'
+        else:
+            steps=0
+            for _ in range(n):
+                ok=self.buf.redo() if forward else self.buf.undo()
+                if not ok: break
+                steps+=1
+            self.status_msg=f'{"Later" if forward else "Earlier"} {steps} change{"s" if steps!=1 else ""}'
+        self._clamp()
+
+    @staticmethod
+    def _rel_time(ts):
+        d=int(time.time()-ts)
+        if d<60:    return f'{d}s ago'
+        if d<3600:  return f'{d//60}m ago'
+        if d<86400: return f'{d//3600}h ago'
+        return f'{d//86400}d ago'
+
+    def _git_root_relpath(self):
+        """Return (git_root, relpath) for the current buffer, or (None, None)."""
+        fname=self.buf.filename
+        if not fname: return None,None
+        import subprocess
+        try:
+            r=subprocess.run(['git','rev-parse','--show-toplevel'],
+                capture_output=True,text=True,timeout=3,
+                cwd=os.path.dirname(os.path.abspath(fname)) or '.')
+            if r.returncode!=0: return None,None
+            root=r.stdout.strip()
+            return root,os.path.relpath(os.path.abspath(fname),root)
+        except Exception: return None,None
+
+    def _git_file_at(self, commit_hash):
+        """Return list[str] of the current file's lines at commit_hash, or []."""
+        if commit_hash in self._hist_preview_cache:
+            return self._hist_preview_cache[commit_hash]
+        root,relpath=self._git_root_relpath()
+        if root is None: return []
+        import subprocess
+        try:
+            r=subprocess.run(['git','show',f'{commit_hash}:{relpath}'],
+                capture_output=True,text=True,timeout=5,cwd=root)
+            lines=r.stdout.splitlines() if r.returncode==0 else []
+        except Exception: lines=[]
+        self._hist_preview_cache[commit_hash]=lines
+        return lines
+
+    def _git_hist(self):
+        fname=self.buf.filename
+        if not fname: return []
+        import subprocess
+        try:
+            r=subprocess.run(
+                ['git','log','--pretty=format:%h\t%at\t%s','--follow','--',fname],
+                capture_output=True,text=True,timeout=3,
+                cwd=os.path.dirname(os.path.abspath(fname)) or '.')
+            if r.returncode!=0 or not r.stdout.strip(): return []
+            out=[]
+            for line in r.stdout.strip().splitlines():
+                parts=line.split('\t',2)
+                if len(parts)==3:
+                    out.append({'hash':parts[0],'ts':float(parts[1]),'subject':parts[2]})
+            return out
+        except Exception: return []
+
+    def _git_load(self, commit_hash):
+        lines=self._git_file_at(commit_hash)
+        if not lines and not self.buf.filename: return
+        import subprocess
+        root,relpath=self._git_root_relpath()
+        if root is None:
+            self.status_msg='Not in a git repo'; self.status_err=True; return
+        self.buf.save_undo()
+        self.buf.lines=lines or ['']
+        self.buf._gen+=1; self.buf.modified=True
+        self.status_msg=f'Loaded {commit_hash}'
+
+    def _hist_entries(self):
+        entries=[]
+        entries.append({'kind':'undo','step':0,'nlines':len(self.buf.lines),'ts':time.time()})
+        for i,(snap,ts) in enumerate(reversed(self.buf._undo),1):
+            entries.append({'kind':'undo','step':i,'nlines':len(snap),'ts':ts})
+        if self._hist_git_cache:
+            entries.append({'kind':'divider','label':'── git history '})
+            for g in self._hist_git_cache:
+                entries.append({'kind':'git','hash':g['hash'],'ts':g['ts'],'subject':g['subject']})
+        return entries
+
+    def _hist_preview_lines(self, entry):
+        """Return (lines, is_diff) for the preview pane."""
+        try:
+            if entry['kind']=='undo':
+                step=entry['step']
+                if step==0:
+                    if self.hist_diff_mode and self.buf._undo:
+                        # Show what changed to get to current state
+                        prev_lines=list(self.buf._undo[-1][0])
+                        diff=list(difflib.unified_diff(prev_lines,self.buf.lines,
+                            fromfile='prev',tofile='now',lineterm='',n=3))
+                        return diff or ['(no changes)'],True
+                    return list(self.buf.lines),False
+                idx=len(self.buf._undo)-step
+                target=list(self.buf._undo[idx][0]) if 0<=idx<len(self.buf._undo) else list(self.buf.lines)
+            elif entry['kind']=='git':
+                target=self._git_file_at(entry['hash'])
+            else:
+                return [],False
+            if self.hist_diff_mode:
+                diff=list(difflib.unified_diff(target,self.buf.lines,
+                    fromfile=entry.get('hash',f'step {entry.get("step","")}'),tofile='now',
+                    lineterm='',n=3))
+                return diff or ['(no changes)'],True
+            return target,False
+        except Exception as exc:
+            return [f'Error: {exc}'],False
+
+    def _draw_history(self):
+        self.stdscr.erase(); w=self.width; h=self.height
+        entries=self._hist_entries(); n=len(entries); body_h=h-4
+
+        # Layout: left list | divider | right preview (only when wide enough)
+        has_preview=(w>=55)
+        left_w=min(36,w//2) if has_preview else w
+        rx=left_w+1; right_w=w-rx
+
+        # Header
+        fname=self.buf.filename or '[No Name]'
+        mode_lbl='diff' if self.hist_diff_mode else 'content'
+        self._as(0,0,f' History — {fname}  [{mode_lbl}]'[:w-1].ljust(w-1),curses.color_pair(1)|curses.A_BOLD)
+        self._as(1,0,'─'*(w-1),curses.A_DIM)
+
+        # Scroll list
+        if self.hist_sel<self.hist_top: self.hist_top=self.hist_sel
+        elif self.hist_sel>=self.hist_top+body_h: self.hist_top=self.hist_sel-body_h+1
+
+        # Left: history list
+        for i in range(body_h):
+            idx=self.hist_top+i; sy=2+i
+            if idx>=n: break
+            e=entries[idx]; sel=(idx==self.hist_sel); lw=left_w-1
+            if e['kind']=='divider':
+                self._as(sy,0,(e['label']+'─'*w)[:lw].ljust(lw),curses.A_DIM)
+            elif e['kind']=='undo':
+                ts_str=time.strftime('%H:%M:%S',time.localtime(e['ts']))
+                if e['step']==0:
+                    row=f'  {"now":<6}  {ts_str}  {e["nlines"]}L'
+                else:
+                    prev=entries[e['step']-1]['nlines']
+                    d=e['nlines']-prev
+                    row=f'  {e["step"]:<6}  {ts_str}  {e["nlines"]}L'+(f'  {"+"+str(d) if d>0 else str(d)}' if d else '')
+                self._as(sy,0,row[:lw].ljust(lw),curses.color_pair(8)|curses.A_BOLD if sel else 0)
+            elif e['kind']=='git':
+                rel=self._rel_time(e['ts'])
+                row=f'  {e["hash"]}  {rel:<9}  {e["subject"]}'
+                self._as(sy,0,row[:lw].ljust(lw),curses.color_pair(8)|curses.A_BOLD if sel else curses.color_pair(7))
+
+        # Right: preview pane
+        if has_preview:
+            for sy in range(2,h-2): self._as(sy,left_w,'│',curses.A_DIM)
+            cur_e=entries[self.hist_sel] if 0<=self.hist_sel<n else None
+            preview,is_diff=(self._hist_preview_lines(cur_e) if cur_e and cur_e['kind']!='divider' else ([],False))
+            max_scroll=max(0,len(preview)-body_h)
+            self.hist_preview_scroll=min(self.hist_preview_scroll,max_scroll)
+            def _diff_style(line):
+                """Return (line_attr, prefix_attr) for a unified diff line."""
+                if not line: return curses.A_DIM, 0
+                if line.startswith('---') or line.startswith('+++'):
+                    return curses.A_DIM, curses.A_DIM
+                c=line[0]
+                if c=='+': return curses.color_pair(20), curses.color_pair(20)|curses.A_BOLD
+                if c=='-': return curses.color_pair(21), curses.color_pair(21)|curses.A_BOLD
+                if c=='@': return curses.color_pair(22)|curses.A_BOLD, curses.color_pair(22)|curses.A_BOLD
+                return curses.A_DIM, curses.A_DIM  # context
+            for i in range(body_h):
+                sy=2+i; pidx=self.hist_preview_scroll+i
+                if pidx<len(preview):
+                    line=preview[pidx]
+                    if is_diff:
+                        la,pa=_diff_style(line)
+                        pad=right_w-1
+                        if line and len(line)>1 and pa!=la:
+                            self._as(sy,rx,line[0],pa)
+                            self._as(sy,rx+1,(line[1:pad]).ljust(pad-1),la)
+                        else:
+                            self._as(sy,rx,line[:pad].ljust(pad),la)
+                    else:
+                        self._as(sy,rx,line[:right_w-1].ljust(right_w-1),0)
+                else:
+                    self._as(sy,rx,' '*(right_w-1))
+
+        footer=' j/k:history  J/K:scroll preview  d:diff/content  Enter:restore  q:close'
+        self._as(h-2,0,footer[:w-1].ljust(w-1),curses.color_pair(1))
+        try: self.stdscr.move(h-1,0)
+        except curses.error: pass
+        self.stdscr.refresh()
+
+    def _history_key(self, key):
+        ch=chr(key) if 32<=key<=126 else None
+        entries=self._hist_entries(); n=len(entries)
+        def _skip(idx,step):
+            while 0<=idx<n and entries[idx]['kind']=='divider': idx+=step
+            return max(0,min(n-1,idx))
+        def _nav(new_sel):
+            self.hist_sel=new_sel; self.hist_preview_scroll=0
+        if   key==curses.KEY_UP   or ch=='k': _nav(_skip(self.hist_sel-1,-1))
+        elif key==curses.KEY_DOWN or ch=='j': _nav(_skip(self.hist_sel+1,1))
+        elif key==6  or key==curses.KEY_NPAGE: _nav(_skip(self.hist_sel+max(1,self.height-6),1))
+        elif key==2  or key==curses.KEY_PPAGE: _nav(_skip(self.hist_sel-max(1,self.height-6),-1))
+        elif key==curses.KEY_HOME: _nav(0)
+        elif key==curses.KEY_END:  _nav(_skip(n-1,-1))
+        elif ch=='J': self.hist_preview_scroll+=3
+        elif ch=='K': self.hist_preview_scroll=max(0,self.hist_preview_scroll-3)
+        elif ch=='d': self.hist_diff_mode=not self.hist_diff_mode; self.hist_preview_scroll=0
+        elif key in (10,13):
+            e=entries[self.hist_sel]
+            if e['kind']=='undo':
+                steps=e['step']
+                for _ in range(steps): self.buf.undo()
+                self._clamp(); self.mode=Mode.NORMAL
+                self.status_msg=f'Restored {steps} step{"s" if steps!=1 else ""} back' if steps else ''
+            elif e['kind']=='git':
+                self._git_load(e['hash']); self._clamp(); self.mode=Mode.NORMAL
+        elif ch=='q' or key==27: self.mode=Mode.NORMAL
+
     # ── Explorer ──────────────────────────────────────────────────────────────
 
     def _open_explorer(self, path=None):
@@ -1660,7 +2827,7 @@ class Editor:
         dirs =sorted([e for e in entries if     os.path.isdir(os.path.join(self.ex_dir,e))],key=str.lower)
         files=sorted([e for e in entries if not os.path.isdir(os.path.join(self.ex_dir,e))],key=str.lower)
         self.ex_entries=[('..',True)]+[(d,True) for d in dirs]+[(f,False) for f in files]
-        self.ex_sel=0; self.ex_top=0
+        self.ex_sel=0; self.ex_top=0; self.ex_searching=False
 
     def _draw_explorer(self):
         self.stdscr.erase(); w=self.width
@@ -1683,16 +2850,47 @@ class Editor:
                 display=('  '+f'{sz:>9}  '+name)[:w-1].ljust(w-1)
                 attr=(curses.color_pair(8)|curses.A_BOLD if idx==self.ex_sel else 0)
             self._as(sy,0,display,attr)
-        footer=' j/k:move  Enter:open  -:up  q:back  R:refresh'
+        footer=' j/k:move  Enter:open  -:up  q:back  /:search  n/N:next/prev  R:refresh'
         self._as(self.height-2,0,footer[:w-1].ljust(w-1),curses.color_pair(1))
-        if self.status_msg:
+        if self.ex_searching:
+            prompt=('/'+self.ex_search_query+' '*w)[:w-1]
+            self._as(self.height-1,0,prompt)
+            try: self.stdscr.move(self.height-1,min(1+len(self.ex_search_query),w-1))
+            except curses.error: pass
+        elif self.status_msg:
             self._as(self.height-1,0,self.status_msg[:w-1],curses.color_pair(4) if self.status_err else 0)
-        try: self.stdscr.move(self.height-1,0)
-        except curses.error: pass
+            try: self.stdscr.move(self.height-1,0)
+            except curses.error: pass
+        else:
+            try: self.stdscr.move(self.height-1,0)
+            except curses.error: pass
         self.stdscr.refresh()
+
+    def _ex_search_jump(self, pat, start, forward=True):
+        """Jump ex_sel to the next entry whose name matches pat, wrapping around."""
+        if not pat: return
+        n=len(self.ex_entries)
+        step=1 if forward else -1
+        for i in range(1,n+1):
+            idx=(start+i*step)%n
+            name,_=self.ex_entries[idx]
+            if pat.lower() in name.lower(): self.ex_sel=idx; return
+        self.status_msg='(no match)'; self.status_err=True
 
     def _explorer_key(self, key):
         ch=chr(key) if 32<=key<=126 else None; n=len(self.ex_entries)
+        if self.ex_searching:
+            if key==27:                                          # Esc — cancel
+                self.ex_searching=False; self.ex_search_query=''
+            elif key in (10,13):                                 # Enter — confirm
+                self.ex_searching=False
+            elif key in (curses.KEY_BACKSPACE,127,8):
+                self.ex_search_query=self.ex_search_query[:-1]
+                self._ex_search_jump(self.ex_search_query,len(self.ex_entries)-1,True)
+            elif 32<=key<=126:
+                self.ex_search_query+=ch
+                self._ex_search_jump(self.ex_search_query,len(self.ex_entries)-1,True)
+            return
         if   key==curses.KEY_UP   or ch=='k': self.ex_sel=max(0,self.ex_sel-1)
         elif key==curses.KEY_DOWN or ch=='j': self.ex_sel=min(n-1,self.ex_sel+1)
         elif key==6 or key==curses.KEY_NPAGE: self.ex_sel=min(n-1,self.ex_sel+max(1,self.height-6))
@@ -1704,7 +2902,9 @@ class Editor:
         elif ch=='q' or key==27: self._ex_close()
         elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
         elif ch=='R': self._ex_reload(); self.status_msg='Refreshed'
-        elif ch=='/': self.mode=Mode.SEARCH; self.search_dir=1; self.cmd_line='/'
+        elif ch=='/': self.ex_searching=True; self.ex_search_query=''
+        elif ch=='n' and self.ex_search_query: self._ex_search_jump(self.ex_search_query,self.ex_sel,True)
+        elif ch=='N' and self.ex_search_query: self._ex_search_jump(self.ex_search_query,self.ex_sel,False)
 
     def _ex_open(self):
         if not self.ex_entries: return
@@ -1733,9 +2933,74 @@ class Editor:
         self.mode=Mode.NORMAL; self.status_msg=f'"{path}"'
 
 
+def _probe_sixel() -> bool:
+    """Send DA1 (ESC[c) and return True if the terminal reports sixel support
+    (capability code 4 in the response: ESC[?<n>;4;...c).
+    Must be called before curses.wrapper() takes over the terminal."""
+    if not sys.stdout.isatty():
+        return False
+    try:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            sys.stdout.write('\033[c')
+            sys.stdout.flush()
+            resp = ''
+            while True:
+                r, _, _ = select.select([fd], [], [], 0.3)
+                if not r:
+                    break
+                ch = os.read(fd, 1).decode('latin-1')
+                resp += ch
+                if ch == 'c':
+                    break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        m = re.search(r'\[\?([0-9;]+)c', resp)
+        if m:
+            return '4' in m.group(1).split(';')
+    except Exception:
+        pass
+    return False
+
+HAS_SIXEL:    bool = False   # populated by _probe_sixel() in main()
+HAS_256COLOR: bool = False   # populated by Editor.__init__ after curses.start_color()
+
 def main():
-    filename=sys.argv[1] if len(sys.argv)>1 else None
-    curses.wrapper(lambda s: Editor(s, filename).run())
+    global HAS_SIXEL
+    import argparse, fcntl
+    parser = argparse.ArgumentParser(prog='pym', description='pyvim editor')
+    parser.add_argument('filename', nargs='?', default=None)
+    parser.add_argument('-f', '--follow', action='store_true',
+                        help='follow mode: tail new content as it arrives')
+    args = parser.parse_args()
+
+    stdin_content = None
+    follow_fd = None
+
+    if not sys.stdin.isatty():
+        if args.follow:
+            # Dup the pipe fd before redirecting stdin to /dev/tty
+            follow_fd = os.dup(sys.stdin.fileno())
+            flags = fcntl.fcntl(follow_fd, fcntl.F_GETFL)
+            fcntl.fcntl(follow_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        else:
+            stdin_content = sys.stdin.buffer.read().decode('utf-8', errors='replace')
+        # Hand /dev/tty to curses for keyboard input
+        try:
+            tty_fd = os.open('/dev/tty', os.O_RDONLY)
+            os.dup2(tty_fd, sys.stdin.fileno())
+            os.close(tty_fd)
+            sys.stdin = open('/dev/tty', 'r')
+        except OSError as e:
+            sys.exit(f'pym: cannot open /dev/tty: {e}')
+
+    HAS_SIXEL = _probe_sixel()
+    curses.wrapper(lambda s: Editor(s, args.filename,
+                                    stdin_content=stdin_content,
+                                    follow=args.follow,
+                                    follow_fd=follow_fd).run())
 
 if __name__=='__main__':
     main()

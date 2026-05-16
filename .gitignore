@@ -1,0 +1,4 @@
+pyvim_nav.log
+__pycache__/
+.venv/
+*.pyc

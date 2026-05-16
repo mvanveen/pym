@@ -1,0 +1,18 @@
+[project]
+name = "pyvim"
+version = "0.1.0"
+description = "Pure Python vim clone"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "markdown-it-py>=4.2.0",
+    "pillow>=12.2.0",
+    "pygments>=2.20.0",
+]
+
+[project.scripts]
+pym = "pyvim:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
