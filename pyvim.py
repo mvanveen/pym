@@ -704,6 +704,8 @@ class Editor:
         self.ex_top     = 0
         self._prev_buf    = None
         self._prev_cursor = None
+        self.ex_search_query  = ''
+        self.ex_searching     = False
 
         curses.start_color()
         curses.use_default_colors()
@@ -2278,7 +2280,7 @@ class Editor:
         dirs =sorted([e for e in entries if     os.path.isdir(os.path.join(self.ex_dir,e))],key=str.lower)
         files=sorted([e for e in entries if not os.path.isdir(os.path.join(self.ex_dir,e))],key=str.lower)
         self.ex_entries=[('..',True)]+[(d,True) for d in dirs]+[(f,False) for f in files]
-        self.ex_sel=0; self.ex_top=0
+        self.ex_sel=0; self.ex_top=0; self.ex_searching=False
 
     def _draw_explorer(self):
         self.stdscr.erase(); w=self.width
@@ -2301,16 +2303,47 @@ class Editor:
                 display=('  '+f'{sz:>9}  '+name)[:w-1].ljust(w-1)
                 attr=(curses.color_pair(8)|curses.A_BOLD if idx==self.ex_sel else 0)
             self._as(sy,0,display,attr)
-        footer=' j/k:move  Enter:open  -:up  q:back  R:refresh'
+        footer=' j/k:move  Enter:open  -:up  q:back  /:search  n/N:next/prev  R:refresh'
         self._as(self.height-2,0,footer[:w-1].ljust(w-1),curses.color_pair(1))
-        if self.status_msg:
+        if self.ex_searching:
+            prompt=('/'+self.ex_search_query+' '*w)[:w-1]
+            self._as(self.height-1,0,prompt)
+            try: self.stdscr.move(self.height-1,min(1+len(self.ex_search_query),w-1))
+            except curses.error: pass
+        elif self.status_msg:
             self._as(self.height-1,0,self.status_msg[:w-1],curses.color_pair(4) if self.status_err else 0)
-        try: self.stdscr.move(self.height-1,0)
-        except curses.error: pass
+            try: self.stdscr.move(self.height-1,0)
+            except curses.error: pass
+        else:
+            try: self.stdscr.move(self.height-1,0)
+            except curses.error: pass
         self.stdscr.refresh()
+
+    def _ex_search_jump(self, pat, start, forward=True):
+        """Jump ex_sel to the next entry whose name matches pat, wrapping around."""
+        if not pat: return
+        n=len(self.ex_entries)
+        step=1 if forward else -1
+        for i in range(1,n+1):
+            idx=(start+i*step)%n
+            name,_=self.ex_entries[idx]
+            if pat.lower() in name.lower(): self.ex_sel=idx; return
+        self.status_msg='(no match)'; self.status_err=True
 
     def _explorer_key(self, key):
         ch=chr(key) if 32<=key<=126 else None; n=len(self.ex_entries)
+        if self.ex_searching:
+            if key==27:                                          # Esc — cancel
+                self.ex_searching=False; self.ex_search_query=''
+            elif key in (10,13):                                 # Enter — confirm
+                self.ex_searching=False
+            elif key in (curses.KEY_BACKSPACE,127,8):
+                self.ex_search_query=self.ex_search_query[:-1]
+                self._ex_search_jump(self.ex_search_query,len(self.ex_entries)-1,True)
+            elif 32<=key<=126:
+                self.ex_search_query+=ch
+                self._ex_search_jump(self.ex_search_query,len(self.ex_entries)-1,True)
+            return
         if   key==curses.KEY_UP   or ch=='k': self.ex_sel=max(0,self.ex_sel-1)
         elif key==curses.KEY_DOWN or ch=='j': self.ex_sel=min(n-1,self.ex_sel+1)
         elif key==6 or key==curses.KEY_NPAGE: self.ex_sel=min(n-1,self.ex_sel+max(1,self.height-6))
@@ -2322,7 +2355,9 @@ class Editor:
         elif ch=='q' or key==27: self._ex_close()
         elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
         elif ch=='R': self._ex_reload(); self.status_msg='Refreshed'
-        elif ch=='/': self.mode=Mode.SEARCH; self.search_dir=1; self.cmd_line='/'
+        elif ch=='/': self.ex_searching=True; self.ex_search_query=''
+        elif ch=='n' and self.ex_search_query: self._ex_search_jump(self.ex_search_query,self.ex_sel,True)
+        elif ch=='N' and self.ex_search_query: self._ex_search_jump(self.ex_search_query,self.ex_sel,False)
 
     def _ex_open(self):
         if not self.ex_entries: return

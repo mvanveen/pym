@@ -153,3 +153,4 @@ Requires Python 3.9+ (uses `ast.unparse`). The only dependency is `pygments`, wh
 - No `%` bracket matching
 - Ctrl-W navigation has been through several iterations of geometry bugs and may still have edge cases
 - No `%` bracket matching yet
+

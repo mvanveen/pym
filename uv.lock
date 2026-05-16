@@ -104,7 +104,7 @@ wheels = [
 [[package]]
 name = "pyvim"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "markdown-it-py" },
     { name = "pillow" },
