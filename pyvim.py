@@ -90,6 +90,7 @@ class Mode(Enum):
     COMMAND = auto()
     SEARCH = auto()
     EXPLORER = auto()
+    PICKER = auto()
 
 # ── Core data ────────────────────────────────────────────────────────────────
 
@@ -804,6 +805,13 @@ class Editor:
         self.ex_search_query  = ''
         self.ex_searching     = False
 
+        # Jump stack + picker state
+        self._jump_stack    = []
+        self.picker_entries = []
+        self.picker_sel     = 0
+        self.picker_top     = 0
+        self.picker_title   = ''
+
         curses.start_color()
         curses.use_default_colors()
         global HAS_256COLOR
@@ -862,6 +870,8 @@ class Editor:
         self.height, self.width = self.stdscr.getmaxyx()
         if self.mode == Mode.EXPLORER:
             self._draw_explorer(); return
+        if self.mode == Mode.PICKER:
+            self._draw_picker(); return
         self._pending_sixels = []
         self.stdscr.erase()
 
@@ -1720,6 +1730,7 @@ class Editor:
         elif self.mode==Mode.COMMAND:     self._command_key(key)
         elif self.mode==Mode.SEARCH:      self._search_key(key)
         elif self.mode==Mode.EXPLORER:    self._explorer_key(key)
+        elif self.mode==Mode.PICKER:      self._picker_key(key)
 
     # ── Filter bar ────────────────────────────────────────────────────────────
 
@@ -1965,6 +1976,7 @@ class Editor:
         elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
         elif ch=='z': self._normal_z()
         elif key==5:  self._eval_region(self.cursor.row, self.cursor.row)  # Ctrl-E
+        elif key==15: self._jump_back()   # Ctrl-O
         elif key==23: self._ctrl_w()   # Ctrl-W
         elif key==26:                  # Ctrl-Z suspend
             import signal
@@ -1983,6 +1995,151 @@ class Editor:
             line=self.buf.get_line(self.cursor.row); self.cursor.col=max(0,len(line.rstrip())-1)
         elif ch2=='e': self._word_end(False)
         elif ch2=='E': self._word_end(True)
+        elif ch2=='d': self._gd()
+        elif ch2=='r': self._gr()
+
+    # ── Jump stack ────────────────────────────────────────────────────────────
+
+    def _push_jump(self):
+        self._jump_stack.append((self.cursor.row, self.cursor.col))
+
+    def _jump_back(self):
+        if self._jump_stack:
+            row, col = self._jump_stack.pop()
+            self.cursor.row = row; self.cursor.col = col; self._clamp()
+        else:
+            self.status_msg = 'Already at oldest position'
+
+    # ── AST navigation ────────────────────────────────────────────────────────
+
+    def _ast_defs(self, name, src):
+        try: tree = ast.parse(src)
+        except SyntaxError: return []
+        results = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == name:
+                    results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    n = alias.asname or alias.name.split('.')[0]
+                    if n == name:
+                        results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    n = alias.asname or alias.name
+                    if n == name:
+                        results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+            elif isinstance(node, ast.NamedExpr):
+                if node.target.id == name:
+                    results.append((node.target.lineno-1, node.target.col_offset))
+            elif isinstance(node, ast.comprehension):
+                t = node.target
+                if isinstance(t, ast.Name) and t.id == name:
+                    results.append((t.lineno-1, t.col_offset))
+        results.sort()
+        return list(dict.fromkeys(results))
+
+    def _ast_refs(self, name, src):
+        try: tree = ast.parse(src)
+        except SyntaxError: return []
+        results = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == name:
+                results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name == name:
+                    results.append((node.lineno-1, node.col_offset))
+        results.sort()
+        return list(dict.fromkeys(results))
+
+    def _py_file(self):
+        return bool(self.buf.filename and self.buf.filename.endswith(('.py', '.pyw')))
+
+    def _gd(self):
+        if not self._py_file():
+            self.status_msg = 'gd: Python files only'; self.status_err = True; return
+        word = self._word_under_cursor()
+        if not word: self.status_msg = 'No word under cursor'; return
+        src = '\n'.join(self.buf.lines)
+        defs = self._ast_defs(word, src)
+        if not defs:
+            self.status_msg = f'No definition: {word!r}'; self.status_err = True; return
+        self._push_jump()
+        if len(defs) == 1:
+            self.cursor.row, self.cursor.col = defs[0]; self._first_nonblank(); return
+        entries = [(f'L{r+1}: {self.buf.get_line(r).strip()[:60]}', r, 0) for r, _ in defs]
+        self._open_picker(f'Definitions of {word!r}', entries)
+
+    def _gr(self):
+        if not self._py_file():
+            self.status_msg = 'gr: Python files only'; self.status_err = True; return
+        word = self._word_under_cursor()
+        if not word: self.status_msg = 'No word under cursor'; return
+        src = '\n'.join(self.buf.lines)
+        refs = self._ast_refs(word, src)
+        if not refs:
+            self.status_msg = f'No references: {word!r}'; self.status_err = True; return
+        entries = [(f'L{r+1}: {self.buf.get_line(r).strip()[:60]}', r, c) for r, c in refs]
+        self._push_jump()
+        self._open_picker(f'References to {word!r} ({len(refs)})', entries)
+
+    # ── Picker (multi-result navigation) ─────────────────────────────────────
+
+    def _open_picker(self, title, entries):
+        self.picker_title = title
+        self.picker_entries = entries
+        self.picker_sel = 0; self.picker_top = 0
+        self.mode = Mode.PICKER
+
+    def _draw_picker(self):
+        self.stdscr.erase(); w = self.width
+        self._as(0, 0, f' {self.picker_title} '[:w-1].ljust(w-1), curses.color_pair(1)|curses.A_BOLD)
+        self._as(1, 0, '─'*(w-1), curses.A_DIM)
+        body_h = self.height - 4; n = len(self.picker_entries)
+        if self.picker_sel < self.picker_top: self.picker_top = self.picker_sel
+        elif self.picker_sel >= self.picker_top+body_h: self.picker_top = self.picker_sel-body_h+1
+        for i in range(body_h):
+            idx = self.picker_top+i
+            if idx >= n: break
+            label, row, col = self.picker_entries[idx]
+            display = ('  '+label)[:w-1].ljust(w-1)
+            attr = (curses.color_pair(8)|curses.A_BOLD if idx == self.picker_sel else 0)
+            self._as(2+i, 0, display, attr)
+        footer = ' j/k:move  Enter:jump  q/Esc:close  Ctrl-O:back '
+        self._as(self.height-2, 0, footer[:w-1].ljust(w-1), curses.color_pair(1))
+        if self.status_msg:
+            self._as(self.height-1, 0, self.status_msg[:w-1],
+                     curses.color_pair(4) if self.status_err else 0)
+        self.stdscr.refresh()
+
+    def _picker_key(self, key):
+        ch = chr(key) if 32<=key<=126 else None
+        n = len(self.picker_entries)
+        if   key==curses.KEY_UP   or ch=='k': self.picker_sel = max(0, self.picker_sel-1)
+        elif key==curses.KEY_DOWN or ch=='j': self.picker_sel = min(n-1, self.picker_sel+1)
+        elif key==6  or key==curses.KEY_NPAGE: self.picker_sel=min(n-1,self.picker_sel+max(1,self.height-6))
+        elif key==2  or key==curses.KEY_PPAGE: self.picker_sel=max(0,self.picker_sel-max(1,self.height-6))
+        elif key==curses.KEY_HOME: self.picker_sel = 0
+        elif key==curses.KEY_END:  self.picker_sel = n-1
+        elif key in (10, 13) or key==curses.KEY_RIGHT:
+            if self.picker_entries:
+                _, row, col = self.picker_entries[self.picker_sel]
+                self.mode = Mode.NORMAL; self.cursor.row = row; self.cursor.col = col; self._clamp()
+        elif ch=='q' or key==27 or key==15:
+            self.mode = Mode.NORMAL; self._jump_back()
 
     def _normal_z(self):
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
