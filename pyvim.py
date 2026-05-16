@@ -373,6 +373,13 @@ _md_img_cache: dict = {}   # same key as _md_cache → {row: (abs_path, alt)}
 _sixel_cache: dict = {}      # (path, mtime, max_w, max_h) → (sixel_str, w_cells, h_cells)
 _colortext_cache: dict = {}  # same key → (lines, w_cells, h_cells)
 _TABLE_SEP_RE = re.compile(r'^\s*\|[-:| ]+\|\s*$')
+_TASK_RE      = re.compile(r'^(\s*)([-*+]|\d+\.)\s+\[([ xX])\] ?')
+
+def _task_state(line):
+    """Return 'checked', 'unchecked', or None."""
+    m = _TASK_RE.match(line)
+    if not m: return None
+    return 'checked' if m.group(3).lower() == 'x' else 'unchecked'
 
 
 def _is_table_row(line):
@@ -775,9 +782,29 @@ def _md_highlight(buf):
                 elif lm:
                     indent = lm.group(1)
                     marker = lm.group(2)
-                    pre    = indent + ('• ' if marker in '-*+' else marker + ' ')
-                    vis    = pre + vis
-                    spans  = [(s + len(pre), e + len(pre), st) for s, e, st in spans]
+                    task_m = re.match(r'^\[( |x|X)\] ?', vis) if marker in '-*+' else None
+                    if task_m:
+                        done   = task_m.group(1).lower() == 'x'
+                        box    = '☑ ' if done else '☐ '
+                        rest   = vis[len(task_m.group(0)):]
+                        delta  = len(box) - len(task_m.group(0))
+                        # Shift existing spans, clamp negatives
+                        new_sp = []
+                        for s, e, st in spans:
+                            ns, ne = max(0, s + delta), max(0, e + delta)
+                            if ne > ns: new_sp.append((ns, ne, st))
+                        # Checkbox glyph span
+                        box_st = (10, 0) if done else (9, curses.A_BOLD)
+                        new_sp = [(0, len(box), box_st)] + new_sp
+                        # Dim the text of completed items
+                        if done and rest:
+                            new_sp.append((len(box), len(box) + len(rest), (0, curses.A_DIM)))
+                        vis = box + rest; spans = new_sp
+                        pre = indent  # no bullet — checkbox is the marker
+                    else:
+                        pre = indent + ('• ' if marker in '-*+' else marker + ' ')
+                    vis   = pre + vis
+                    spans = [(s + len(pre), e + len(pre), st) for s, e, st in spans]
                 by_row[r] = (vis, spans)
             i += 1; continue
 
@@ -1839,6 +1866,22 @@ class Editor:
         elif key==curses.KEY_HOME: self.cursor.col=0
         elif key==curses.KEY_END:
             self.cursor.col=max(0,len(self.buf.get_line(self.cursor.row))-1)
+        elif key in (10,13):  # Enter — toggle task item if on one, else next non-blank
+            line=self.buf.get_line(self.cursor.row)
+            if _is_markdown(self.buf.filename) and _task_state(line):
+                self._toggle_task()
+            else:
+                self._move(1,0); self._first_nonblank()
+
+    def _toggle_task(self):
+        """Flip [ ] ↔ [x] on the current line."""
+        row=self.cursor.row; line=self.buf.get_line(row)
+        m=_TASK_RE.match(line)
+        if not m: return
+        i=m.start(3)
+        new_char=' ' if line[i].lower()=='x' else 'x'
+        self.buf.save_undo()
+        self.buf.set_line(row, line[:i]+new_char+line[i+1:])
 
     # ── Jump stack ────────────────────────────────────────────────────────────
 
