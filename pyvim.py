@@ -2059,6 +2059,8 @@ class Editor:
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id == name:
                 results.append((node.lineno-1, node.col_offset))
+            elif isinstance(node, ast.Attribute) and node.attr == name:
+                results.append((node.lineno-1, node.col_offset))
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if node.name == name:
                     results.append((node.lineno-1, node.col_offset))
@@ -2068,10 +2070,23 @@ class Editor:
     def _py_file(self):
         return bool(self.buf.filename and self.buf.filename.endswith(('.py', '.pyw')))
 
+    def _nav_word(self):
+        """Word under cursor; if it's 'def'/'class', skip to the next identifier."""
+        word = self._word_under_cursor()
+        if word in ('def', 'class', 'async'):
+            line = self.buf.get_line(self.cursor.row)
+            col = self.cursor.col + len(word)
+            while col < len(line) and not self._is_word(line[col]): col += 1
+            if col < len(line):
+                s = col
+                while col < len(line) and self._is_word(line[col]): col += 1
+                word = line[s:col]
+        return word
+
     def _gd(self):
         if not self._py_file():
             self.status_msg = 'gd: Python files only'; self.status_err = True; return
-        word = self._word_under_cursor()
+        word = self._nav_word()
         if not word: self.status_msg = 'No word under cursor'; return
         src = '\n'.join(self.buf.lines)
         defs = self._ast_defs(word, src)
@@ -2086,7 +2101,7 @@ class Editor:
     def _gr(self):
         if not self._py_file():
             self.status_msg = 'gr: Python files only'; self.status_err = True; return
-        word = self._word_under_cursor()
+        word = self._nav_word()
         if not word: self.status_msg = 'No word under cursor'; return
         src = '\n'.join(self.buf.lines)
         refs = self._ast_refs(word, src)
