@@ -785,7 +785,7 @@ def _md_highlight(buf):
                     task_m = re.match(r'^\[( |x|X)\] ?', vis) if marker in '-*+' else None
                     if task_m:
                         done   = task_m.group(1).lower() == 'x'
-                        box    = '☑ ' if done else '☐ '
+                        box    = '■ ' if done else '□ '
                         rest   = vis[len(task_m.group(0)):]
                         delta  = len(box) - len(task_m.group(0))
                         # Shift existing spans, clamp negatives
@@ -878,6 +878,7 @@ class Editor:
         self.picker_sel     = 0
         self.picker_top     = 0
         self.picker_title   = ''
+        self.picker_cb      = None  # if set, called with label on Enter instead of jumping
 
         # Follow mode (tail -f)
         self._follow         = follow
@@ -1983,10 +1984,11 @@ class Editor:
 
     # ── Picker (multi-result navigation) ─────────────────────────────────────
 
-    def _open_picker(self, title, entries):
+    def _open_picker(self, title, entries, cb=None):
         self.picker_title = title
         self.picker_entries = entries
         self.picker_sel = 0; self.picker_top = 0
+        self.picker_cb = cb
         self.mode = Mode.PICKER
 
     def _draw_picker(self):
@@ -2021,10 +2023,14 @@ class Editor:
         elif key==curses.KEY_END:  self.picker_sel = n-1
         elif key in (10, 13) or key==curses.KEY_RIGHT:
             if self.picker_entries:
-                _, row, col = self.picker_entries[self.picker_sel]
-                self.mode = Mode.NORMAL; self.cursor.row = row; self.cursor.col = col; self._clamp()
+                label, row, col = self.picker_entries[self.picker_sel]
+                self.mode = Mode.NORMAL
+                if self.picker_cb:
+                    cb = self.picker_cb; self.picker_cb = None; cb(label)
+                else:
+                    self.cursor.row = row; self.cursor.col = col; self._clamp()
         elif ch=='q' or key==27 or key==15:   # q / Esc / Ctrl-O
-            self.mode = Mode.NORMAL; self._jump_back()
+            self.picker_cb = None; self.mode = Mode.NORMAL; self._jump_back()
 
     def _normal_g(self, count):
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
@@ -2643,6 +2649,9 @@ class Editor:
             self.cursor.row=max(0,min(int(cmd)-1,self.buf.line_count()-1)); self._first_nonblank()
         elif cmd=='$':
             self.cursor.row=self.buf.line_count()-1; self._first_nonblank()
+        elif re.match(r'^fin?d?\b', cmd):
+            parts = cmd.split(None, 1)
+            self._cmd_find(parts[1].strip() if len(parts) > 1 else '')
         elif re.match(r'^(%|\.|\d+(,(\d+|\.|\$))?)?s',cmd):
             self._exec_sub(cmd)
         elif cmd.startswith('set ') or cmd=='set':
@@ -2688,6 +2697,46 @@ class Editor:
             except Exception as e: self.status_msg=str(e); self.status_err=True
         else:
             self.status_msg=f'E492: Not a command: {cmd}'; self.status_err=True
+
+    def _cmd_find(self, pattern):
+        """Fuzzy file finder — collects files via git ls-files (or os.walk) and opens picker."""
+        import subprocess as _sp
+        # Prefer git ls-files so .gitignore is respected
+        try:
+            res = _sp.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard'],
+                          capture_output=True, text=True, cwd=os.getcwd(), timeout=5)
+            root = _sp.run(['git', 'rev-parse', '--show-toplevel'],
+                           capture_output=True, text=True, cwd=os.getcwd()).stdout.strip()
+            files = res.stdout.splitlines() if res.returncode == 0 else None
+        except Exception:
+            files = None; root = os.getcwd()
+        if not files:
+            root = os.getcwd(); files = []
+            for dp, dns, fns in os.walk(root):
+                dns[:] = [d for d in dns if not d.startswith('.')]
+                for f in fns:
+                    files.append(os.path.relpath(os.path.join(dp, f), root))
+        # Filter by pattern (fuzzy: all chars appear in order, case-insensitive)
+        if pattern:
+            pl = pattern.lower()
+            def _match(p):
+                s = p.lower(); i = 0
+                for c in pl:
+                    i = s.find(c, i)
+                    if i < 0: return False
+                    i += 1
+                return True
+            files = [f for f in files if _match(f)]
+        files = sorted(files)[:1000]
+        if not files:
+            self.status_msg = f'No files matching {pattern!r}'; self.status_err = True; return
+        entries = [(f, 0, 0) for f in files]
+        _root = root
+        def _open(label):
+            path = os.path.join(_root, label)
+            self.pane.buf = Buffer.from_file(path)
+            self.pane.cursor.row = 0; self.pane.cursor.col = 0; self._clamp()
+        self._open_picker(f'find: {pattern or "*"}', entries, cb=_open)
 
     def _exec_sub(self, cmd):
         try:
