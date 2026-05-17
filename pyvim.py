@@ -2701,9 +2701,9 @@ class Editor:
     def _cmd_find(self, pattern):
         """Fuzzy file finder — collects files via git ls-files (or os.walk) and opens picker."""
         import subprocess as _sp
-        # Prefer git ls-files so .gitignore is respected
+        # Prefer git ls-files (tracked files only — no untracked noise)
         try:
-            res = _sp.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard'],
+            res = _sp.run(['git', 'ls-files', '--cached'],
                           capture_output=True, text=True, cwd=os.getcwd(), timeout=5)
             root = _sp.run(['git', 'rev-parse', '--show-toplevel'],
                            capture_output=True, text=True, cwd=os.getcwd()).stdout.strip()
@@ -2716,6 +2716,8 @@ class Editor:
                 dns[:] = [d for d in dns if not d.startswith('.')]
                 for f in fns:
                     files.append(os.path.relpath(os.path.join(dp, f), root))
+        # Drop any path whose components include hidden dirs/files
+        files = [f for f in files if not any(p.startswith('.') for p in f.replace('\\', '/').split('/'))]
         # Filter by pattern (fuzzy: all chars appear in order, case-insensitive)
         if pattern:
             pl = pattern.lower()
@@ -2733,9 +2735,7 @@ class Editor:
         entries = [(f, 0, 0) for f in files]
         _root = root
         def _open(label):
-            path = os.path.join(_root, label)
-            self.pane.buf = Buffer.from_file(path)
-            self.pane.cursor.row = 0; self.pane.cursor.col = 0; self._clamp()
+            self._load_file(os.path.join(_root, label))
         self._open_picker(f'find: {pattern or "*"}', entries, cb=_open)
 
     def _exec_sub(self, cmd):
