@@ -3,6 +3,7 @@
 import ast
 import curses
 import difflib
+import fcntl
 import os
 import pathlib
 import re
@@ -10,6 +11,7 @@ import sys
 import copy
 import select
 import termios
+import threading
 import time
 import tomllib
 import tty
@@ -27,6 +29,7 @@ class Mode(Enum):
     EXPLORER = auto()
     HISTORY = auto()
     PICKER = auto()
+    CHAT = auto()     # chat-pane input mode
 
 # ── Core data ────────────────────────────────────────────────────────────────
 
@@ -125,6 +128,13 @@ class Pane:
         self.top_row = 0; self.left_col = 0
         # Screen geometry (set by layout engine)
         self.y = 0; self.x = 0; self.height = 24; self.width = 80
+        # Chat pane state
+        self.is_chat           = False
+        self.chat_input        = ''
+        self.chat_history: list = []   # [{'role': ..., 'content': ...}]
+        self.chat_follow_fd    = None  # read-end of streaming pipe
+        self.chat_follow_partial = ''  # incomplete last line (matches _apply_follow_text logic)
+        self.chat_streaming    = False
 
 # ── Layout tree ──────────────────────────────────────────────────────────────
 
@@ -1053,7 +1063,8 @@ class Editor:
         except re.error:
             spat = None
 
-        for sy in range(pane.height):
+        view_h = self._pane_view_height(pane)
+        for sy in range(view_h):
             br = pane.top_row + sy
             scr_y = pane.y + sy
             scr_x = pane.x
@@ -1087,6 +1098,19 @@ class Editor:
                 hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
             self._render_line(scr_y, scr_x + lnw, display, lc, tw,
                               vis_rows, vis_range, br, spat, hl_row, is_active)
+
+        # Chat pane: render input line at the bottom of this pane
+        if pane.is_chat:
+            inp_y = pane.y + pane.height - 1
+            if pane.chat_streaming:
+                inp_str = ' ● '
+            elif is_active and self.mode == Mode.CHAT:
+                inp_str = f'> {pane.chat_input}'
+            else:
+                inp_str = f'> {pane.chat_input}' if pane.chat_input else '> '
+            inp_str = inp_str[:pane.width].ljust(pane.width)
+            attr = curses.color_pair(1) | curses.A_BOLD if is_active else curses.color_pair(1)
+            self._as(inp_y, pane.x, inp_str, attr)
 
     def _render_line(self, sy, sx, line, lc, tw, vis_rows, vis_range, br,
                      spat, hl_row, is_active):
@@ -1151,6 +1175,7 @@ class Editor:
             Mode.INSERT:' INSERT ',
             Mode.VISUAL:' VISUAL ', Mode.VISUAL_LINE:' V-LINE ',
             Mode.COMMAND:' COMMAND', Mode.SEARCH:' SEARCH ',
+            Mode.CHAT:  '  CHAT  ',
         }.get(self.mode, ' NORMAL ')
         fname = self.buf.filename or '[No Name]'
         mod   = ' [+]' if self.buf.modified else ''
@@ -1176,6 +1201,13 @@ class Editor:
     def _place_cursor(self):
         if self.mode in (Mode.COMMAND, Mode.SEARCH):
             try: self.stdscr.move(self.height-1, min(len(self.cmd_line), self.width-1))
+            except curses.error: pass
+            return
+        if self.mode == Mode.CHAT and self._pane.is_chat:
+            p = self._pane
+            cx = p.x + min(2 + len(p.chat_input), p.width - 1)
+            cy = p.y + p.height - 1
+            try: self.stdscr.move(cy, cx)
             except curses.error: pass
             return
         p = self._pane
@@ -1222,7 +1254,7 @@ class Editor:
 
     def _scroll(self):
         p = self._pane
-        th = p.height
+        th = self._pane_view_height(p)
         lnw = self._pane_lnw(p)
         tw  = p.width - lnw
         if p.cursor.row < p.top_row: p.top_row = p.cursor.row
@@ -1606,6 +1638,8 @@ class Editor:
     # ── Mode transitions ──────────────────────────────────────────────────────
 
     def _enter_insert(self, col_delta=0):
+        if self._pane.is_chat:
+            self.mode = Mode.CHAT; self.status_msg = ''; return
         self.buf.save_undo(); self.cursor.col+=col_delta
         self.mode=Mode.INSERT; self.status_msg=''
 
@@ -1624,6 +1658,7 @@ class Editor:
             key=self.stdscr.getch()
             if key == -1:
                 if self._follow: self._follow_check()
+                self._chat_panes_check()
                 continue
             self.status_msg=''; self.status_err=False
             self._dispatch(key)
@@ -1678,6 +1713,174 @@ class Editor:
                     new_text = b''.join(raw_chunks).decode('utf-8', errors='replace')
         self._apply_follow_text(new_text)
 
+    # ── Chat pane ─────────────────────────────────────────────────────────────
+
+    def _pane_view_height(self, pane):
+        """Usable display rows for a pane (chat panes reserve one row for input)."""
+        return pane.height - 1 if pane.is_chat else pane.height
+
+    def _chat_pane_apply_text(self, pane, new_text):
+        """Stream new_text into a chat pane's buffer (mirrors _apply_follow_text)."""
+        if not new_text: return
+        vh = self._pane_view_height(pane)
+        near_bottom = pane.cursor.row >= pane.buf.line_count() - 2
+        if not pane.chat_follow_partial and pane.buf.lines == ['']:
+            pane.buf.lines = []
+        full = pane.chat_follow_partial + new_text
+        parts = full.split('\n')
+        new_partial = parts[-1]
+        complete    = parts[:-1]
+        if pane.chat_follow_partial and pane.buf.lines:
+            pane.buf.lines.pop()
+        pane.buf.lines.extend(complete)
+        if new_partial:
+            pane.buf.lines.append(new_partial)
+        if not pane.buf.lines:
+            pane.buf.lines = ['']
+        pane.chat_follow_partial = new_partial
+        pane.buf._gen += 1
+        if near_bottom:
+            pane.cursor.row = pane.buf.line_count() - 1
+            pane.top_row = max(0, pane.cursor.row - vh + 1)
+
+    def _chat_panes_check(self):
+        """Poll all streaming chat panes and flush available chunks."""
+        for pane in self._panes:
+            if not (pane.is_chat and pane.chat_follow_fd is not None):
+                continue
+            r, _, _ = select.select([pane.chat_follow_fd], [], [], 0)
+            if not r:
+                continue
+            raw_chunks = []
+            try:
+                while True:
+                    chunk = os.read(pane.chat_follow_fd, 65536)
+                    if not chunk:
+                        os.close(pane.chat_follow_fd)
+                        pane.chat_follow_fd = None
+                        pane.chat_streaming = False
+                        break
+                    raw_chunks.append(chunk)
+            except BlockingIOError:
+                pass
+            except OSError:
+                try: os.close(pane.chat_follow_fd)
+                except OSError: pass
+                pane.chat_follow_fd = None
+                pane.chat_streaming = False
+            if raw_chunks:
+                self._chat_pane_apply_text(
+                    pane, b''.join(raw_chunks).decode('utf-8', errors='replace'))
+
+    def _open_chat(self):
+        """Open (or focus) the Claude chat pane in a vertical split."""
+        for i, p in enumerate(self._panes):
+            if p.is_chat:
+                self._pane_i = i
+                self.mode = Mode.CHAT
+                return
+        buf = Buffer(['# Claude Chat', '',
+                      'Press i to start typing, Enter to send, Esc to browse.', ''])
+        buf.filename = '[claude-chat]'
+        chat_pane = Pane(buf)
+        chat_pane.is_chat = True
+        chat_pane.cursor.row = buf.line_count() - 1
+        self._layout = _lc_split(self._layout, self._pane, chat_pane, vertical=True)
+        self._panes.append(chat_pane)
+        self._pane_i = len(self._panes) - 1
+        self.mode = Mode.CHAT
+        self.stdscr.timeout(250)  # enable non-blocking getch for streaming updates
+
+    def _chat_send(self, chat_pane, message):
+        """Append user message, call Claude API streaming into the pane's buffer."""
+        if chat_pane.chat_streaming:
+            self.status_msg = 'Claude is still responding…'; self.status_err = True; return
+        chat_pane.chat_history.append({'role': 'user', 'content': message})
+        # Append formatted user turn + Claude prefix to buffer
+        if chat_pane.buf.lines[-1] != '':
+            chat_pane.buf.lines.append('')
+        chat_pane.buf.lines.extend([f'You: {message}', '', 'Claude: '])
+        chat_pane.buf._gen += 1
+        # Position cursor at the new Claude: line
+        chat_pane.cursor.row = chat_pane.buf.line_count() - 1
+        vh = self._pane_view_height(chat_pane)
+        chat_pane.top_row = max(0, chat_pane.cursor.row - vh + 1)
+
+        # Build context from the first non-chat editing pane
+        edit_pane = next((p for p in self._panes if not p.is_chat), None)
+        ctx_file  = edit_pane.buf.filename if edit_pane else None
+        ctx_text  = '\n'.join(edit_pane.buf.lines) if edit_pane else None
+
+        # Pipe for streaming
+        r_fd, w_fd = os.pipe()
+        flags = fcntl.fcntl(r_fd, fcntl.F_GETFL)
+        fcntl.fcntl(r_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        chat_pane.chat_follow_fd      = r_fd
+        chat_pane.chat_follow_partial = 'Claude: '  # matches the last line we just appended
+        chat_pane.chat_streaming      = True
+        self.stdscr.timeout(250)
+
+        history = list(chat_pane.chat_history)
+
+        def _stream():
+            try:
+                import anthropic
+                client = anthropic.Anthropic()
+                sys_prompt = (
+                    'You are an expert pair programmer embedded in pym, '
+                    'a terminal-based vi-like editor written in Python. '
+                    'Be concise and actionable. Use markdown sparingly.'
+                )
+                if ctx_file and ctx_text is not None:
+                    lang = ctx_file.rsplit('.', 1)[-1] if '.' in (ctx_file or '') else ''
+                    sys_prompt += (
+                        f'\n\nThe user is editing: {ctx_file}\n\n'
+                        f'```{lang}\n{ctx_text}\n```'
+                    )
+                response_text = ''
+                with anthropic.Anthropic().messages.stream(
+                    model='claude-opus-4-5',
+                    max_tokens=4096,
+                    system=sys_prompt,
+                    messages=history,
+                ) as stream:
+                    w_file = os.fdopen(w_fd, 'w', buffering=1)
+                    for text in stream.text_stream:
+                        w_file.write(text)
+                        w_file.flush()
+                        response_text += text
+                chat_pane.chat_history.append(
+                    {'role': 'assistant', 'content': response_text})
+                w_file.write('\n\n')
+                w_file.flush()
+                w_file.close()
+            except Exception as e:
+                try:
+                    wf = os.fdopen(w_fd, 'w')
+                    wf.write(f'\n[Error: {e}]\n\n')
+                    wf.flush(); wf.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_stream, daemon=True).start()
+
+    def _chat_key(self, key):
+        """Handle keystrokes in CHAT input mode."""
+        pane = self._pane
+        if not pane.is_chat:
+            self.mode = Mode.NORMAL; return
+        if key == 27:                          # Esc — browse mode
+            self.mode = Mode.NORMAL
+        elif key in (10, 13):                  # Enter — send
+            msg = pane.chat_input.strip()
+            pane.chat_input = ''
+            if msg:
+                self._chat_send(pane, msg)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            pane.chat_input = pane.chat_input[:-1]
+        elif 32 <= key <= 126:
+            pane.chat_input += chr(key)
+
     def _dispatch(self, key):
         if self._confirm_cb is not None:
             if key in (ord('y'), ord('Y')):
@@ -1695,6 +1898,7 @@ class Editor:
         elif self.mode==Mode.EXPLORER:    self._explorer_key(key)
         elif self.mode==Mode.HISTORY:     self._history_key(key)
         elif self.mode==Mode.PICKER:      self._picker_key(key)
+        elif self.mode==Mode.CHAT:        self._chat_key(key)
 
     # ── Normal mode ───────────────────────────────────────────────────────────
 
@@ -2688,6 +2892,8 @@ class Editor:
             if m:
                 vertical=bool(m.group(1)); fname=m.group(2).strip() or None
                 self._split(vertical=vertical,filename=fname)
+        elif cmd in ('chat', 'claude'):
+            self._open_chat()
         elif cmd.startswith('!'):
             import subprocess
             try:
@@ -3178,7 +3384,7 @@ HAS_256COLOR: bool = False   # populated by Editor.__init__ after curses.start_c
 
 def main():
     global HAS_SIXEL
-    import argparse, fcntl
+    import argparse
     parser = argparse.ArgumentParser(prog='pym', description='pyvim editor')
     parser.add_argument('filename', nargs='?', default=None)
     parser.add_argument('-f', '--follow', action='store_true',
