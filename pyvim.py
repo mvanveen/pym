@@ -43,6 +43,7 @@ class Buffer:
         self._undo = []; self._redo = []
         self._gen = 0  # incremented on every mutation; used as highlight cache key
         self._disk_mtime = 0.0
+        self._nb_meta = None  # notebook JSON metadata, set for .ipynb files
 
     def save_undo(self):
         self._undo.append((copy.deepcopy(self.lines), time.time()))
@@ -99,10 +100,27 @@ class Buffer:
     def from_file(cls, filename):
         b = cls(); b.filename = filename
         try:
-            with open(filename, 'r', errors='replace') as f: content = f.read()
-            lines = content.splitlines(); b.lines = lines if lines else ['']
+            if filename and filename.endswith('.ipynb'):
+                import json
+                with open(filename, 'r', errors='replace') as f:
+                    nb = json.load(f)
+                b._nb_meta = nb
+                lines = []
+                for cell in nb.get('cells', []):
+                    ct = cell.get('cell_type', 'code')
+                    lines.append(f'# %% {ct}')
+                    src = cell.get('source', [])
+                    if isinstance(src, list): src = ''.join(src)
+                    lines.extend(src.splitlines())
+                    for output in cell.get('outputs', []):
+                        for ol in _nb_output_lines(output):
+                            lines.append('# >> ' + ol)
+                b.lines = lines if lines else ['# %% code', '']
+            else:
+                with open(filename, 'r', errors='replace') as f: content = f.read()
+                lines = content.splitlines(); b.lines = lines if lines else ['']
             b._disk_mtime = os.path.getmtime(filename)
-        except FileNotFoundError: b.lines = ['']
+        except FileNotFoundError: b.lines = ['# %% code', ''] if (filename and filename.endswith('.ipynb')) else ['']
         b.modified = False; return b
 
     @classmethod
@@ -114,7 +132,10 @@ class Buffer:
     def save(self, filename=None):
         fname = filename or self.filename
         if not fname: raise ValueError('No file name')
-        with open(fname, 'w') as f: f.write('\n'.join(self.lines) + '\n')
+        if fname.endswith('.ipynb'):
+            _nb_save(self, fname)
+        else:
+            with open(fname, 'w') as f: f.write('\n'.join(self.lines) + '\n')
         self.filename = fname; self.modified = False
         self._disk_mtime = os.path.getmtime(fname)
 
@@ -355,6 +376,152 @@ def _detect_lang(filename):
 
 def _is_markdown(filename):
     return bool(filename and filename.rsplit('.',1)[-1].lower() in ('md','markdown','mkd'))
+
+def _is_notebook(filename):
+    return bool(filename and filename.endswith('.ipynb'))
+
+# ── Notebook (.ipynb) helpers ─────────────────────────────────────────────────
+
+_ANSI_ESC = re.compile(r'\x1b(?:\[[0-9;]*[A-Za-z]|\([A-Z]|[^[])')
+
+def _nb_output_lines(output):
+    """Extract plain-text lines from a notebook output cell dict.
+
+    Handles stream, execute_result, display_data (skips binary image data),
+    and error (strips ANSI escape codes from tracebacks).
+    """
+    ot = output.get('output_type', '')
+    if ot == 'stream':
+        text = output.get('text', [])
+        if isinstance(text, list): text = ''.join(text)
+        return text.rstrip('\n').splitlines()
+    if ot in ('execute_result', 'display_data'):
+        data = output.get('data', {})
+        text = data.get('text/plain', '')
+        if isinstance(text, list): text = ''.join(text)
+        if text.strip():
+            return text.rstrip('\n').splitlines()
+        # Binary-only outputs (image/png, image/svg+xml, etc.) — show placeholder
+        if any(k.startswith('image/') or k == 'application/pdf' for k in data):
+            mime = next((k for k in data if k.startswith('image/') or k == 'application/pdf'), '?')
+            return [f'[{mime} output]']
+        return []
+    if ot == 'error':
+        tb = output.get('traceback', [])
+        if tb:
+            lines = []
+            for tl in tb:
+                cleaned = _ANSI_ESC.sub('', tl)
+                lines.extend(cleaned.splitlines())
+            return lines
+        return [(output.get('ename', '') + ': ' + output.get('evalue', '')).strip()]
+    return []
+
+def _nb_cells(buf):
+    """Return list of (sep_row, src_start, src_end, cell_type) for each cell.
+    src_end < src_start means the cell has no source lines."""
+    sep_rows = [r for r, l in enumerate(buf.lines) if l.startswith('# %% ')]
+    n = len(buf.lines)
+    result = []
+    for i, sep in enumerate(sep_rows):
+        ct = buf.lines[sep][5:].strip() or 'code'
+        src_start = sep + 1
+        next_sep = sep_rows[i+1] if i+1 < len(sep_rows) else n
+        src_end = sep  # sentinel: empty cell
+        for r in range(src_start, next_sep):
+            if not buf.lines[r].startswith('# >> '):
+                src_end = r
+        result.append((sep, src_start, src_end, ct))
+    return result
+
+def _nb_cell_idx_at(cells_list, row):
+    """Return index into cells_list for the cell that contains row, or None."""
+    for i, (sep, _, _, _) in enumerate(cells_list):
+        next_sep = cells_list[i+1][0] if i+1 < len(cells_list) else float('inf')
+        if sep <= row < next_sep:
+            return i
+    return None
+
+def _nb_save(buf, filename):
+    """Reconstruct .ipynb JSON from the flat buffer and write to disk."""
+    import json
+    cells_info = _nb_cells(buf)
+    n = len(buf.lines)
+    cells = []
+    for i, (sep, src_start, src_end, ct) in enumerate(cells_info):
+        next_sep = cells_info[i+1][0] if i+1 < len(cells_info) else n
+        src_lines = [buf.lines[r] for r in range(src_start, next_sep)
+                     if not buf.lines[r].startswith('# >> ')]
+        if src_lines:
+            src_nb = [l + '\n' for l in src_lines[:-1]] + [src_lines[-1]]
+        else:
+            src_nb = []
+        cell_dict: dict = {'cell_type': ct, 'source': src_nb, 'metadata': {}}
+        if ct == 'code':
+            cell_dict['outputs'] = []
+            cell_dict['execution_count'] = None
+        cells.append(cell_dict)
+    meta = dict(getattr(buf, '_nb_meta', {}) or {})
+    meta['cells'] = cells
+    meta.setdefault('nbformat', 4)
+    meta.setdefault('nbformat_minor', 5)
+    meta.setdefault('metadata', {})
+    with open(filename, 'w') as f:
+        json.dump(meta, f, indent=1)
+        f.write('\n')
+
+class _FakeBuf:
+    """Minimal buffer-like used to run per-cell highlighting on a slice of lines."""
+    __slots__ = ('lines', 'filename', '_gen')
+    def __init__(self, lines, filename, gen):
+        self.lines = lines; self.filename = filename; self._gen = gen
+    def line_count(self): return len(self.lines)
+    def get_line(self, r): return self.lines[r] if 0 <= r < len(self.lines) else ''
+
+_nb_hl_cache: dict = {}
+
+def _nb_highlight(buf):
+    """Compute per-row highlight info for a notebook buffer.
+
+    Returns list[(display_override | None, spans)] indexed by buf row.
+    display_override is None for code cell lines (raw text + python spans);
+    for markdown cell lines it's the rendered text (may differ from raw).
+    Separator and output lines keep (None, []) — caller handles them separately.
+    """
+    key = (id(buf), buf._gen)
+    if key in _nb_hl_cache: return _nb_hl_cache[key]
+    stale = [k for k in _nb_hl_cache if k[0] == id(buf)]
+    for k in stale: del _nb_hl_cache[k]
+    if len(_nb_hl_cache) > 20: _nb_hl_cache.clear()
+
+    cells_list = _nb_cells(buf)
+    n = len(buf.lines)
+    result: list = [(None, []) for _ in range(n)]
+
+    for ci, (sep, src_start, src_end, ct) in enumerate(cells_list):
+        if src_start > src_end: continue  # empty cell
+        src_lines = buf.lines[src_start:src_end + 1]
+        if ct == 'code':
+            fake = _FakeBuf(src_lines, 'cell.py', (id(buf), ci, buf._gen))
+            try:
+                hl = _pg_highlight(fake)
+                for r, spans in enumerate(hl):
+                    if r < len(src_lines):
+                        result[src_start + r] = (None, spans)
+            except Exception:
+                pass
+        elif ct == 'markdown':
+            fake = _FakeBuf(src_lines, 'cell.md', (id(buf), ci, buf._gen))
+            try:
+                md_tbl = _md_highlight(fake)
+                for r in range(len(src_lines)):
+                    display, spans = md_tbl[r] if r < len(md_tbl) else (src_lines[r], [])
+                    result[src_start + r] = (display, spans)
+            except Exception:
+                pass
+
+    _nb_hl_cache[key] = result
+    return result
 
 # ── Markdown rendering via markdown-it-py ────────────────────────────────────
 # Parses with a proper GFM parser so nested inline styles (bold+code, etc.)
@@ -838,6 +1005,7 @@ class Editor:
         # Editor-global state
         self.register_text    = ''
         self.register_linewise= False
+        self.register_cell    = None   # list[str] of yanked/cut cell lines
         self.search_pat  = ''
         self.search_dir  = 1
         self.cmd_line    = ''
@@ -1040,11 +1208,15 @@ class Editor:
                     else:            vis_range[r] = None
 
         is_md = _is_markdown(pane.buf.filename)
+        is_nb = _is_notebook(pane.buf.filename)
         in_insert = is_active and self.mode == Mode.INSERT
         md_table = (_md_highlight(pane.buf) if is_md else None)
         img_map  = (_md_images(pane.buf) if is_md else {})
-        hl_table = (None if is_md else
+        hl_table = (None if is_md or is_nb else
                     _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
+        _nb_clist = _nb_cells(pane.buf) if is_nb else []
+        _nb_cursor_ci = _nb_cell_idx_at(_nb_clist, pane.cursor.row) if is_nb else None
+        nb_hl = _nb_highlight(pane.buf) if is_nb else None
 
         try:
             spat = re.compile(self.search_pat,
@@ -1061,6 +1233,30 @@ class Editor:
             if br >= pane.buf.line_count():
                 self._as(scr_y, scr_x, '~', curses.A_DIM); continue
 
+            line = pane.buf.get_line(br)
+
+            # Notebook: cell separator — ╭── [type] ──────────────────────╮
+            if is_nb and line.startswith('# %% '):
+                ct = line[5:].strip() or 'code'
+                label = f' {ct} '
+                inner = max(0, pane.width - 2 - len(label) - 2)
+                bar = ('╭─ ' + label + '─' * inner + '─╮')[:pane.width]
+                my_ci = _nb_cell_idx_at(_nb_clist, br)
+                if is_active and my_ci == _nb_cursor_ci:
+                    attr = curses.color_pair(1) | curses.A_BOLD
+                else:
+                    attr = curses.color_pair(7) | curses.A_DIM
+                self._as(scr_y, scr_x, bar, attr)
+                continue
+
+            # Notebook: output lines — comment color, │ prefix gutter
+            if is_nb and line.startswith('# >> '):
+                out_attr = curses.color_pair(_SYNTAX_PAIR['comment']) | curses.A_DIM
+                if lnw > 0:
+                    self._as(scr_y, scr_x, ' ' * (lnw - 1) + '│', out_attr)
+                self._as(scr_y, scr_x + lnw, (' ' + line[5:])[lc:lc+tw], out_attr)
+                continue
+
             if self.show_numbers:
                 ns = str(br+1).rjust(lnw-1) + ' '
                 na = (curses.color_pair(6)|curses.A_BOLD
@@ -1068,12 +1264,30 @@ class Editor:
                       else curses.color_pair(5))
                 self._as(scr_y, scr_x, ns, na)
 
-            line = pane.buf.get_line(br)
+            # Notebook: │ left-border overlay (replaces trailing space of line-number gutter)
+            if is_nb and lnw > 0:
+                my_ci = _nb_cell_idx_at(_nb_clist, br)
+                if is_active and my_ci == _nb_cursor_ci:
+                    ba = curses.color_pair(1) | curses.A_BOLD
+                else:
+                    ba = curses.color_pair(7) | curses.A_DIM
+                self._as(scr_y, scr_x + lnw - 1, '│', ba)
+
             if br in img_map and not (is_active and br == pane.cursor.row):
                 path, _alt = img_map[br]
                 self._pending_sixels.append(
                     (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
-            if md_table:
+            if is_nb and nb_hl is not None:
+                nb_rendered, hl_row = nb_hl[br] if br < len(nb_hl) else (None, [])
+                if nb_rendered is not None:
+                    # Markdown cell line: apply raw/rendered logic same as full md mode
+                    is_cur = is_active and br == pane.cursor.row
+                    show_raw = (is_cur and (in_insert or not _is_table_row(line))) or br in vis_rows
+                    display = line if show_raw else nb_rendered
+                    if show_raw: hl_row = []
+                else:
+                    display = line  # code cell: raw text, python spans in hl_row
+            elif md_table:
                 is_cur = is_active and br == pane.cursor.row
                 # Table rows in normal mode: always show rendered (cell nav keeps
                 # cursor at cell-start so column accuracy isn't needed).
@@ -1146,12 +1360,19 @@ class Editor:
     def _draw_statusbar(self):
         _tbl_nm = (self.mode == Mode.NORMAL and
                    _is_table_row(self.buf.get_line(self.cursor.row)))
-        ml = {
-            Mode.NORMAL:' TABLE  ' if _tbl_nm else ' NORMAL ',
-            Mode.INSERT:' INSERT ',
-            Mode.VISUAL:' VISUAL ', Mode.VISUAL_LINE:' V-LINE ',
-            Mode.COMMAND:' COMMAND', Mode.SEARCH:' SEARCH ',
-        }.get(self.mode, ' NORMAL ')
+        _nb_nav = (self.mode == Mode.NORMAL and _is_notebook(self.buf.filename) and
+                   self.buf.get_line(self.cursor.row).startswith('# %% '))
+        if _nb_nav:
+            _nb_cells_list = _nb_cells(self.buf)
+            _nb_ci = (_nb_cell_idx_at(_nb_cells_list, self.cursor.row) or 0) + 1
+            ml = f' CELL {_nb_ci}/{len(_nb_cells_list)} '
+        else:
+            ml = {
+                Mode.NORMAL:' TABLE  ' if _tbl_nm else ' NORMAL ',
+                Mode.INSERT:' INSERT ',
+                Mode.VISUAL:' VISUAL ', Mode.VISUAL_LINE:' V-LINE ',
+                Mode.COMMAND:' COMMAND', Mode.SEARCH:' SEARCH ',
+            }.get(self.mode, ' NORMAL ')
         fname = self.buf.filename or '[No Name]'
         mod   = ' [+]' if self.buf.modified else ''
         pos   = f' {self.cursor.row+1}:{self.cursor.col+1} '
@@ -1196,6 +1417,11 @@ class Editor:
                         ci = info[0]
                         if ci + 1 < len(pipes):
                             col = pipes[ci] + 2  # land after '│ '
+        # Notebook separator: cursor sits at left edge of the bar
+        if _is_notebook(p.buf.filename) and p.buf.get_line(p.cursor.row).startswith('# %% '):
+            try: self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)), p.x)
+            except curses.error: pass
+            return
         sx = p.x + lnw + col - p.left_col
         try:
             self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)),
@@ -1706,6 +1932,7 @@ class Editor:
         self.pending_count=''
 
         _on_tbl = _is_table_row(self.buf.get_line(self.cursor.row))
+        _on_nb  = _is_notebook(self.buf.filename)
         if   key in (curses.KEY_LEFT,)  or ch=='h':
             if _on_tbl: [self._cell_prev() for _ in range(count)]
             else: [self._move(0,-1) for _ in range(count)]
@@ -1713,10 +1940,12 @@ class Editor:
             if _on_tbl: [self._cell_next() for _ in range(count)]
             else: [self._move(0,1) for _ in range(count)]
         elif key in (curses.KEY_UP,)    or ch=='k':
-            if _on_tbl: [self._cell_up()   for _ in range(count)]
+            if _on_tbl: [self._cell_up() for _ in range(count)]
+            elif _on_nb: self._nb_move_up(count)
             else: [self._move(-1,0) for _ in range(count)]
         elif key in (curses.KEY_DOWN,)  or ch=='j':
             if _on_tbl: [self._cell_down() for _ in range(count)]
+            elif _on_nb: self._nb_move_down(count)
             else: [self._move(1,0)  for _ in range(count)]
         elif key==9 and _on_tbl: [self._cell_next() for _ in range(count)]
         elif key==353 and _on_tbl: [self._cell_prev() for _ in range(count)]  # Shift-Tab
@@ -1755,27 +1984,38 @@ class Editor:
         elif key==2  or key==curses.KEY_PPAGE: self._scroll_page(-count)
         elif key==4:  self._scroll_half(count)
         elif key==21 and self.mode==Mode.NORMAL: self._scroll_half(-count)
-        elif ch=='i': self._enter_insert()
-        elif ch=='I': self._first_nonblank(); self._enter_insert()
+        elif ch=='i': self._nb_enter_cell(); self._enter_insert()
+        elif ch=='I': self._nb_enter_cell(); self._first_nonblank(); self._enter_insert()
         elif ch=='a':
+            self._nb_enter_cell()
             line=self.buf.get_line(self.cursor.row)
             self._enter_insert(1 if line else 0)
         elif ch=='A':
+            self._nb_enter_cell()
             line=self.buf.get_line(self.cursor.row)
             self.cursor.col=len(line); self._enter_insert()
         elif ch=='o':
-            self.buf.save_undo(); ind=self._indent(self.cursor.row)
-            self.buf.insert_line(self.cursor.row+1,ind)
-            self.cursor.row+=1; self.cursor.col=len(ind); self.mode=Mode.INSERT
+            if _on_nb and self._nb_on_sep():
+                self._nb_insert_cell(below=True)
+            else:
+                self.buf.save_undo(); ind=self._indent(self.cursor.row)
+                self.buf.insert_line(self.cursor.row+1,ind)
+                self.cursor.row+=1; self.cursor.col=len(ind); self.mode=Mode.INSERT
         elif ch=='O':
-            self.buf.save_undo(); ind=self._indent(self.cursor.row)
-            self.buf.insert_line(self.cursor.row,ind)
-            self.cursor.col=len(ind); self.mode=Mode.INSERT
+            if _on_nb and self._nb_on_sep():
+                self._nb_insert_cell(below=False)
+            else:
+                self.buf.save_undo(); ind=self._indent(self.cursor.row)
+                self.buf.insert_line(self.cursor.row,ind)
+                self.cursor.col=len(ind); self.mode=Mode.INSERT
         elif ch=='x':
-            self.buf.save_undo()
-            for _ in range(count):
-                c=self.buf.delete_char(self.cursor.row,self.cursor.col)
-                if c: self.register_text=c; self.register_linewise=False
+            if _on_nb and self._nb_on_sep():
+                self._nb_cut_cell()
+            else:
+                self.buf.save_undo()
+                for _ in range(count):
+                    c=self.buf.delete_char(self.cursor.row,self.cursor.col)
+                    if c: self.register_text=c; self.register_linewise=False
         elif ch=='X':
             self.buf.save_undo()
             for _ in range(count):
@@ -1822,8 +2062,12 @@ class Editor:
         elif ch=='y': self._await_motion('y',count)
         elif ch=='>': self._indent_lines(self.cursor.row,self.cursor.row,1)
         elif ch=='<': self._indent_lines(self.cursor.row,self.cursor.row,-1)
-        elif ch=='p': self._paste(True)
-        elif ch=='P': self._paste(False)
+        elif ch=='p':
+            if _on_nb and self._nb_on_sep() and self.register_cell: self._nb_paste_cell(below=True)
+            else: self._paste(True)
+        elif ch=='P':
+            if _on_nb and self._nb_on_sep() and self.register_cell: self._nb_paste_cell(below=False)
+            else: self._paste(False)
         elif ch=='u':
             if not self.buf.undo(): self.status_msg='Already at oldest change'
             else: self.status_msg='Undo'; self._clamp()
@@ -1853,9 +2097,17 @@ class Editor:
             k2=self.stdscr.getch()
             if 32<=k2<=126 and chr(k2) in self.marks:
                 self.cursor.row,self.cursor.col=self.marks[chr(k2)]
+        elif ch==']':
+            k2 = self.stdscr.getch()
+            if k2 == ord('c') and _is_notebook(self.buf.filename): self._nb_cell_next()
+        elif ch=='[':
+            k2 = self.stdscr.getch()
+            if k2 == ord('c') and _is_notebook(self.buf.filename): self._nb_cell_prev()
         elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
         elif ch=='z': self._normal_z()
-        elif key==5:  self._eval_region(self.cursor.row, self.cursor.row)  # Ctrl-E
+        elif key==5:  # Ctrl-E: run cell (notebook) or eval current line (other files)
+            if _is_notebook(self.buf.filename): self._nb_eval_cell()
+            else: self._eval_region(self.cursor.row, self.cursor.row)
         elif key==15: self._jump_back()   # Ctrl-O
         elif key==23: self._ctrl_w()   # Ctrl-W
         elif key==26:                  # Ctrl-Z suspend
@@ -1863,13 +2115,23 @@ class Editor:
             curses.endwin()
             os.kill(os.getpid(), signal.SIGTSTP)
             self.stdscr.refresh()
-        elif key==27: self.search_pat=''; self.status_msg=''
+        elif key==27:
+            self.search_pat=''; self.status_msg=''
+            # Notebook: Esc from in-cell → pop back to cell separator
+            if _on_nb and not self._nb_on_sep():
+                cells = _nb_cells(self.buf)
+                idx = _nb_cell_idx_at(cells, self.cursor.row)
+                if idx is not None:
+                    self.cursor.row = cells[idx][0]
+                    self.cursor.col = 0; self.cursor.col_want = 0
         elif key==curses.KEY_HOME: self.cursor.col=0
         elif key==curses.KEY_END:
             self.cursor.col=max(0,len(self.buf.get_line(self.cursor.row))-1)
-        elif key in (10,13):  # Enter — toggle task item if on one, else next non-blank
+        elif key in (10,13):  # Enter
             line=self.buf.get_line(self.cursor.row)
-            if _is_markdown(self.buf.filename) and _task_state(line):
+            if _on_nb and line.startswith('# %% '):
+                self._nb_enter_cell()  # land on first source line of this cell
+            elif _is_markdown(self.buf.filename) and _task_state(line):
                 self._toggle_task()
             else:
                 self._move(1,0); self._first_nonblank()
@@ -2078,6 +2340,10 @@ class Editor:
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
         if ch2 is None: return
         if ch2==op:
+            if _is_notebook(self.buf.filename) and self._nb_on_sep():
+                if op=='d': self._nb_cut_cell()
+                elif op=='y': self._nb_yank_cell()
+                return
             r1=self.cursor.row; r2=min(r1+count-1,self.buf.line_count()-1)
             self._op_lines(op,r1,r2); return
         if ch2 in ('i','a'):
@@ -2269,7 +2535,9 @@ class Editor:
         if key==5:   # Ctrl-E — eval selection
             sr,sc=self.visual_start; er,ec=self.cursor.row,self.cursor.col
             if (sr,sc)>(er,ec): sr,sc,er,ec=er,ec,sr,sc
-            self._eval_region(sr, er); self._enter_normal(); return
+            if _is_notebook(self.buf.filename): self._nb_eval_range(sr, er)
+            else: self._eval_region(sr, er)
+            self._enter_normal(); return
         if ch=='n': self._search_next(self.search_dir); return
         if ch=='N': self._search_next(-self.search_dir); return
         if self._vmove(key, count): return
@@ -2335,7 +2603,9 @@ class Editor:
         if ch=='N': self._search_next(-self.search_dir); return
         if key==5:   # Ctrl-E — eval selection (line-wise)
             r1,r2=self._vis_lrange()
-            self._eval_region(r1, r2); self._enter_normal(); return
+            if _is_notebook(self.buf.filename): self._nb_eval_range(r1, r2)
+            else: self._eval_region(r1, r2)
+            self._enter_normal(); return
 
         # All motions (line-mode cares about row movement mainly)
         moved=self._vmove(key, count)
@@ -2525,6 +2795,256 @@ class Editor:
             for i, line in enumerate(lines):
                 self.buf.insert_line(r2 + 1 + i, '# >> ' + line)
             self.cursor.row = r2 + 1
+
+    # ── Notebook cell operations ──────────────────────────────────────────────
+
+    def _nb_on_sep(self):
+        """True when cursor is on a notebook cell separator (cell-nav mode)."""
+        return self.buf.get_line(self.cursor.row).startswith('# %% ')
+
+    def _nb_move_down(self, count=1):
+        """j in notebook.
+        On separator (cell-nav): jump to next cell's separator.
+        On source line (in-cell): move down within cell, clamped at last source line.
+        """
+        for _ in range(count):
+            cells = _nb_cells(self.buf)
+            idx = _nb_cell_idx_at(cells, self.cursor.row)
+            if idx is None: self._move(1, 0); continue
+            if self._nb_on_sep():
+                if idx + 1 < len(cells):
+                    self.cursor.row = cells[idx+1][0]
+                    self.cursor.col = 0; self.cursor.col_want = 0
+            else:
+                _, src_start, src_end, _ = cells[idx]
+                if self.cursor.row < src_end:
+                    self.cursor.row += 1
+                    line = self.buf.get_line(self.cursor.row)
+                    self.cursor.col = min(self.cursor.col_want, max(0, len(line)-1))
+
+    def _nb_move_up(self, count=1):
+        """k in notebook.
+        On separator (cell-nav): jump to previous cell's separator.
+        On source line (in-cell): move up within cell, clamped at first source line.
+        """
+        for _ in range(count):
+            cells = _nb_cells(self.buf)
+            idx = _nb_cell_idx_at(cells, self.cursor.row)
+            if idx is None: self._move(-1, 0); continue
+            if self._nb_on_sep():
+                if idx > 0:
+                    self.cursor.row = cells[idx-1][0]
+                    self.cursor.col = 0; self.cursor.col_want = 0
+            else:
+                _, src_start, src_end, _ = cells[idx]
+                if self.cursor.row > src_start:
+                    self.cursor.row -= 1
+                    line = self.buf.get_line(self.cursor.row)
+                    self.cursor.col = min(self.cursor.col_want, max(0, len(line)-1))
+
+    def _nb_enter_cell(self):
+        """If cursor is on a separator line, jump to the first source line of that cell."""
+        if not _is_notebook(self.buf.filename): return
+        line = self.buf.get_line(self.cursor.row)
+        if not line.startswith('# %% '): return
+        cells = _nb_cells(self.buf)
+        idx = _nb_cell_idx_at(cells, self.cursor.row)
+        if idx is None: return
+        _, src_start, _, _ = cells[idx]
+        if src_start < self.buf.line_count():
+            self.cursor.row = src_start
+            self.cursor.col = 0; self.cursor.col_want = 0
+
+    def _nb_eval_range(self, r1, r2):
+        """Ctrl-E over a visual selection: run every code cell that overlaps [r1, r2].
+        Markdown cells in the selection are silently skipped."""
+        cells = _nb_cells(self.buf)
+        for i, (sep, src_start, src_end, ct) in enumerate(cells):
+            next_sep = cells[i+1][0] if i+1 < len(cells) else len(self.buf.lines)
+            cell_end = next_sep - 1
+            # Cell overlaps selection and is a code cell with source
+            if ct == 'code' and src_start <= src_end and sep <= r2 and cell_end >= r1:
+                # Temporarily move cursor into this cell so _nb_eval_cell works
+                saved = self.cursor.row
+                self.cursor.row = src_start
+                self._nb_eval_cell()
+                # _nb_eval_cell may have inserted output lines; recompute cells
+                cells = _nb_cells(self.buf)
+                self.cursor.row = saved
+
+    def _nb_eval_cell(self):
+        """Run the current notebook code cell; replace its output lines.
+
+        Execution runs in a daemon thread so Ctrl-C (^C) can interrupt it
+        without killing the editor.
+        """
+        import io, contextlib, traceback, threading, ctypes
+        cells = _nb_cells(self.buf)
+        idx = _nb_cell_idx_at(cells, self.cursor.row)
+        if idx is None:
+            self.status_msg = 'Not in a notebook cell'; return
+        sep, src_start, src_end, ct = cells[idx]
+        if ct != 'code':
+            self.status_msg = 'Not a code cell'; return
+        if src_start > src_end:
+            self.status_msg = 'Empty cell'; return
+        self.buf.save_undo()
+        # Remove old output lines between src_end and next separator
+        next_sep = cells[idx+1][0] if idx+1 < len(cells) else len(self.buf.lines)
+        r = src_end + 1
+        while r < next_sep:
+            if self.buf.lines[r].startswith('# >> '):
+                self.buf.delete_line(r); next_sep -= 1
+            else:
+                r += 1
+        ns = self._eval_ns()
+        src_lines = [self.buf.get_line(r) for r in range(src_start, src_end+1)]
+        code = '\n'.join(src_lines)
+
+        # ── run in a thread so Ctrl-C can interrupt ───────────────────────────
+        result_box = [None, None]   # [output_str, err_msg_or_None]
+
+        def _run():
+            out = io.StringIO()
+            last_val = None
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                    last_line = src_lines[-1] if src_lines else ''
+                    try:
+                        last_expr = compile(last_line, '<expr>', 'eval')
+                        rest = '\n'.join(src_lines[:-1])
+                        if rest.strip():
+                            exec(compile(rest, '<nb>', 'exec'), ns)
+                        last_val = eval(last_expr, ns)
+                    except SyntaxError:
+                        exec(compile(code, '<nb>', 'exec'), ns)
+                result = out.getvalue()
+                if last_val is not None:
+                    result += repr(last_val) + '\n'
+                result_box[0] = result
+            except KeyboardInterrupt:
+                result_box[0] = out.getvalue()
+                result_box[1] = 'KeyboardInterrupt'
+            except Exception:
+                result_box[0] = out.getvalue() + traceback.format_exc()
+                result_box[1] = traceback.format_exc().splitlines()[-1]
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        self.status_msg = '▶ running…  (^C to interrupt)'
+        self.status_err = False
+        self.stdscr.timeout(100)          # fast poll while waiting
+        try:
+            while t.is_alive():
+                self._clamp(); self._scroll(); self.draw()
+                k = self.stdscr.getch()
+                if k == 3:               # Ctrl-C → raise KI in the worker thread
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                        ctypes.c_ulong(t.ident),
+                        ctypes.py_object(KeyboardInterrupt))
+                    t.join(timeout=2.0)
+                    break
+        finally:
+            self.stdscr.timeout(250)     # restore normal 250 ms timeout
+        t.join(timeout=0)
+
+        result  = result_box[0] or ''
+        err_msg = result_box[1]
+        if err_msg:
+            self.status_err = True
+            self.status_msg = err_msg
+        else:
+            self.status_msg = 'cell ok'; self.status_err = False
+        if result.strip():
+            lines = result.rstrip('\n').splitlines()
+            for i, line in enumerate(lines):
+                self.buf.insert_line(src_end + 1 + i, '# >> ' + line)
+
+    def _nb_cell_next(self):
+        """Jump to the first source line of the next notebook cell."""
+        cells = _nb_cells(self.buf)
+        idx = _nb_cell_idx_at(cells, self.cursor.row)
+        if idx is None or idx + 1 >= len(cells):
+            self.status_msg = 'No next cell'; return
+        _, src_start, _, _ = cells[idx+1]
+        self.cursor.row = min(src_start, len(self.buf.lines)-1)
+        self.cursor.col = 0; self.cursor.col_want = 0
+
+    def _nb_cell_prev(self):
+        """Jump to the first source line of the previous notebook cell."""
+        cells = _nb_cells(self.buf)
+        idx = _nb_cell_idx_at(cells, self.cursor.row)
+        if idx is None or idx == 0:
+            self.status_msg = 'No previous cell'; return
+        _, src_start, _, _ = cells[idx-1]
+        self.cursor.row = min(src_start, len(self.buf.lines)-1)
+        self.cursor.col = 0; self.cursor.col_want = 0
+
+    def _nb_insert_cell(self, below=True):
+        """Insert a new empty code cell above or below the current cell."""
+        self.buf.save_undo()
+        cells = _nb_cells(self.buf)
+        idx = _nb_cell_idx_at(cells, self.cursor.row)
+        if idx is None: return
+        sep, src_start, src_end, ct = cells[idx]
+        if below:
+            # Insert after all output lines (before the next separator or EOF)
+            insert_at = cells[idx+1][0] if idx+1 < len(cells) else len(self.buf.lines)
+        else:
+            insert_at = sep
+        self.buf.insert_line(insert_at, '')            # empty source line
+        self.buf.insert_line(insert_at, '# %% code')  # separator
+        self.cursor.row = insert_at + 1
+        self.cursor.col = 0; self.cursor.col_want = 0
+        self.mode = Mode.INSERT
+
+    def _nb_yank_cell(self):
+        """Yank the current cell (separator + source + output) into register_cell."""
+        cells = _nb_cells(self.buf)
+        idx = _nb_cell_idx_at(cells, self.cursor.row)
+        if idx is None: return
+        sep = cells[idx][0]
+        end = (cells[idx+1][0] if idx+1 < len(cells) else len(self.buf.lines)) - 1
+        self.register_cell = list(self.buf.lines[sep:end+1])
+        self.status_msg = f'yanked {len(self.register_cell)} lines'
+
+    def _nb_cut_cell(self):
+        """Cut the current cell into register_cell and remove it from the buffer."""
+        cells = _nb_cells(self.buf)
+        idx = _nb_cell_idx_at(cells, self.cursor.row)
+        if idx is None: return
+        sep = cells[idx][0]
+        end = (cells[idx+1][0] if idx+1 < len(cells) else len(self.buf.lines)) - 1
+        self.register_cell = list(self.buf.lines[sep:end+1])
+        self.buf.save_undo()
+        for r in range(end, sep-1, -1):
+            self.buf.delete_line(r)
+        if self.buf.line_count() == 0:
+            self.buf.insert_line(0, '# %% code')
+            self.buf.insert_line(1, '')
+        new_row = min(sep, self.buf.line_count()-1)
+        while new_row > 0 and not self.buf.lines[new_row].startswith('# %% '):
+            new_row -= 1
+        self.cursor.row = new_row
+        self.cursor.col = 0; self.cursor.col_want = 0
+        self.status_msg = f'cut {len(self.register_cell)} lines'
+
+    def _nb_paste_cell(self, below=True):
+        """Paste register_cell above or below the current cell."""
+        if not self.register_cell: return
+        cells = _nb_cells(self.buf)
+        idx = _nb_cell_idx_at(cells, self.cursor.row)
+        if idx is None: return
+        sep = cells[idx][0]
+        if below:
+            insert_at = cells[idx+1][0] if idx+1 < len(cells) else len(self.buf.lines)
+        else:
+            insert_at = sep
+        self.buf.save_undo()
+        for i, line in enumerate(self.register_cell):
+            self.buf.insert_line(insert_at + i, line)
+        self.cursor.row = insert_at
+        self.cursor.col = 0; self.cursor.col_want = 0
 
     def _exec_file_toplevel(self):
         """Run every top-level statement in the current buffer into _py_ns.
