@@ -1808,6 +1808,20 @@ class Editor:
         self._panes=[x for x in self._panes if x is not p]
         self._pane_i=min(self._pane_i, len(self._panes)-1)
 
+    def _rotate_panes(self, delta=1):
+        ordered = _lc_panes(self._layout)
+        n = len(ordered)
+        if n < 2: self.status_msg = 'Need 2+ panes to rotate (use ^W v or ^W s to split)'; return
+        attrs = [(p.buf, p.cursor, p.top_row, p.left_col) for p in ordered]
+        d = delta % n
+        rotated = attrs[-d:] + attrs[:-d]
+        cur_i = ordered.index(self._pane)
+        for p, (buf, cur, tr, lc) in zip(ordered, rotated):
+            p.buf = buf; p.cursor = cur; p.top_row = tr; p.left_col = lc
+        new_active = ordered[(cur_i + delta) % n]
+        self._pane_i = self._panes.index(new_active)
+        self.status_msg = f'Rotated {n} panes'
+
     def _next_pane(self, delta=1):
         self._pane_i=(self._pane_i+delta)%len(self._panes)
 
@@ -2320,6 +2334,8 @@ class Editor:
         elif ch2=='j' or k2==curses.KEY_DOWN:  self._goto_pane_dir('j')
         elif ch2=='k' or k2==curses.KEY_UP:    self._goto_pane_dir('k')
         elif ch2 in ('q','c'): self._close_pane()
+        elif ch2=='r': self._rotate_panes(1)
+        elif ch2=='R': self._rotate_panes(-1)
         elif ch2=='v': self._split(vertical=True)
         elif ch2=='s': self._split(vertical=False)
         elif ch2=='=': pass  # equalize (TODO)
