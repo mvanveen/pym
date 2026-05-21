@@ -4426,6 +4426,26 @@ class Editor:
         else:
             self.status_msg = f"Unknown option: {opt}"
 
+    # ── Command mode ─────────────────────────────────────────────────────────
+
+    def _command_key(self, key):
+        if key == 27:
+            self.mode = Mode.NORMAL
+            self.cmd_line = ""
+        elif key in (10, 13):
+            cmd = self.cmd_line[1:]
+            self.mode = Mode.NORMAL
+            self.cmd_line = ""
+            self._exec_cmd(cmd)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if len(self.cmd_line) > 1:
+                self.cmd_line = self.cmd_line[:-1]
+            else:
+                self.mode = Mode.NORMAL
+                self.cmd_line = ""
+        elif 32 <= key <= 126:
+            self.cmd_line += chr(key)
+
     # ── Search mode ───────────────────────────────────────────────────────────
 
     def _search_key(self, key):
