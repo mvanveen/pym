@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """pyvim - A pure Python vim-like editor"""
+
 import ast
 import curses
 import difflib
@@ -19,6 +20,7 @@ from enum import Enum, auto
 
 # ── Modes ────────────────────────────────────────────────────────────────────
 
+
 class Mode(Enum):
     NORMAL = auto()
     INSERT = auto()
@@ -29,140 +31,264 @@ class Mode(Enum):
     EXPLORER = auto()
     HISTORY = auto()
     PICKER = auto()
-    CHAT = auto()     # chat-pane input mode
+    CHAT = auto()  # chat-pane input mode
+
 
 # ── Core data ────────────────────────────────────────────────────────────────
 
+
 class Cursor:
-    __slots__ = ('row', 'col', 'col_want')
+    __slots__ = ("row", "col", "col_want")
+
     def __init__(self):
-        self.row = 0; self.col = 0; self.col_want = 0
+        self.row = 0
+        self.col = 0
+        self.col_want = 0
+
 
 class Buffer:
     def __init__(self, lines=None):
-        self.lines = lines or ['']
-        self.filename = None
+        self.lines = lines or [""]
+        self._undo = []
+        self._redo = []
         self.modified = False
-        self._undo = []; self._redo = []
         self._gen = 0  # incremented on every mutation; used as highlight cache key
         self._disk_mtime = 0.0
+        self.line_ending = "\n"  # '\n' (LF) or '\r\n' (CRLF)
+        self._observers = []  # list of (callback, event_type) tuples
+        # Attach debug observer if enabled
+        if _DEBUG_OBSERVER_ENABLED:
+            self.observe(debug_observer, "all")
+
+    def observe(self, callback, event_type="all"):
+        """Register observer: callback(event_type, **details)"""
+        self._observers.append((callback, event_type))
+
+    def _notify(self, event_type, **details):
+        """Fire change events to observers"""
+        for cb, et in self._observers:
+            if et == "all" or et == event_type:
+                cb(event_type, **details)
 
     def save_undo(self):
         self._undo.append((copy.deepcopy(self.lines), time.time()))
         self._redo.clear()
-        if len(self._undo) > 500: self._undo.pop(0)
+        if len(self._undo) > 500:
+            self._undo.pop(0)
 
     def undo(self):
-        if not self._undo: return False
+        if not self._undo:
+            return False
         self._redo.append((copy.deepcopy(self.lines), time.time()))
-        self.lines, _ = self._undo.pop(); self.modified = True; self._gen += 1; return True
+        self.lines, _ = self._undo.pop()
+        self.modified = True
+        self._gen += 1
+        return True
 
     def redo(self):
-        if not self._redo: return False
+        if not self._redo:
+            return False
         self._undo.append((copy.deepcopy(self.lines), time.time()))
-        self.lines, _ = self._redo.pop(); self.modified = True; self._gen += 1; return True
+        self.lines, _ = self._redo.pop()
+        self.modified = True
+        self._gen += 1
+        return True
 
-    def line_count(self): return len(self.lines)
-    def get_line(self, r): return self.lines[r] if 0 <= r < len(self.lines) else ''
+    def line_count(self):
+        return len(self.lines)
+
+    def get_line(self, r):
+        return self.lines[r] if 0 <= r < len(self.lines) else ""
 
     def set_line(self, r, t):
-        if 0 <= r < len(self.lines): self.lines[r] = t; self.modified = True; self._gen += 1
+        if 0 <= r < len(self.lines):
+            old = self.lines[r]
+            self.lines[r] = t
+            self.modified = True
+            self._gen += 1
+            self._notify("set_line", row=r, old=old, new=t)
 
-    def insert_line(self, r, t=''):
-        self.lines.insert(max(0, min(r, len(self.lines))), t); self.modified = True; self._gen += 1
+    def insert_line(self, r, t=""):
+        self.lines.insert(max(0, min(r, len(self.lines))), t)
+        self.modified = True
+        self._gen += 1
+        self._notify("insert_line", row=r, text=t)
 
     def delete_line(self, r):
         if 0 <= r < len(self.lines):
             l = self.lines.pop(r)
-            if not self.lines: self.lines = ['']
-            self.modified = True; self._gen += 1; return l
-        return ''
+            if not self.lines:
+                self.lines = [""]
+            self.modified = True
+            self._gen += 1
+            self._notify("delete_line", row=r, text=l)
+            return l
+        return ""
 
     def insert_char(self, r, c, ch):
         if 0 <= r < len(self.lines):
-            s = self.lines[r]; self.lines[r] = s[:c] + ch + s[c:]; self.modified = True; self._gen += 1
+            s = self.lines[r]
+            self.lines[r] = s[:c] + ch + s[c:]
+            self.modified = True
+            self._gen += 1
+            self._notify("insert_char", row=r, col=c, char=ch)
 
     def delete_char(self, r, c):
         if 0 <= r < len(self.lines):
             s = self.lines[r]
             if 0 <= c < len(s):
-                self.lines[r] = s[:c] + s[c+1:]; self.modified = True; self._gen += 1; return s[c]
-        return ''
+                deleted = s[c]
+                self.lines[r] = s[:c] + s[c + 1 :]
+                self.modified = True
+                self._gen += 1
+                self._notify("delete_char", row=r, col=c, char=deleted)
+                return deleted
+        return ""
 
     def split_line(self, r, c):
         if 0 <= r < len(self.lines):
-            s = self.lines[r]; self.lines[r] = s[:c]
-            self.lines.insert(r+1, s[c:]); self.modified = True; self._gen += 1
+            s = self.lines[r]
+            self.lines[r] = s[:c]
+            self.lines.insert(r + 1, s[c:])
+            self.modified = True
+            self._gen += 1
+            self._notify("split_line", row=r, col=c)
 
     def join_lines(self, r):
-        if 0 <= r < len(self.lines)-1:
-            self.lines[r] += self.lines[r+1]; self.lines.pop(r+1); self.modified = True; self._gen += 1
+        if 0 <= r < len(self.lines) - 1:
+            self.lines[r] += self.lines[r + 1]
+            self.lines.pop(r + 1)
+            self.modified = True
+            self._gen += 1
+            self._notify("join_lines", row=r)
 
     @classmethod
     def from_file(cls, filename):
-        b = cls(); b.filename = filename
+        b = cls()
+        b.filename = filename
         try:
-            with open(filename, 'r', errors='replace') as f: content = f.read()
-            lines = content.splitlines(); b.lines = lines if lines else ['']
+            with open(filename, "rb") as f:
+                raw = f.read()
+            # Detect line ending
+            if b"\r\n" in raw:
+                b.line_ending = "\r\n"
+                content = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+            else:
+                b.line_ending = "\n"
+                content = raw.decode("utf-8", errors="replace")
+            lines = content.splitlines()
+            b.lines = lines if lines else [""]
             b._disk_mtime = os.path.getmtime(filename)
-        except FileNotFoundError: b.lines = ['']
-        b.modified = False; return b
+        except FileNotFoundError:
+            b.lines = [""]
+        b.modified = False
+        # Attach debug observer if enabled
+        if _DEBUG_OBSERVER_ENABLED:
+            b.observe(debug_observer, "all")
+        return b
 
     @classmethod
     def from_string(cls, content, filename=None):
-        b = cls(); b.filename = filename
-        lines = content.splitlines(); b.lines = lines if lines else ['']
-        b.modified = False; return b
+        b = cls()
+        b.filename = filename
+        # Detect line ending from content
+        if "\r\n" in content:
+            b.line_ending = "\r\n"
+            content = content.replace("\r\n", "\n")
+        else:
+            b.line_ending = "\n"
+        lines = content.splitlines()
+        b.lines = lines if lines else [""]
+        b.modified = False
+        # Attach debug observer if enabled
+        if _DEBUG_OBSERVER_ENABLED:
+            b.observe(debug_observer, "all")
+        return b
 
     def save(self, filename=None):
         fname = filename or self.filename
-        if not fname: raise ValueError('No file name')
-        with open(fname, 'w') as f: f.write('\n'.join(self.lines) + '\n')
-        self.filename = fname; self.modified = False
+        if not fname:
+            raise ValueError("No file name")
+        content = self.line_ending.join(self.lines) + self.line_ending
+        with open(fname, "w", newline="") as f:
+            f.write(content)
+        self.filename = fname
+        self.modified = False
         self._disk_mtime = os.path.getmtime(fname)
+
+    def save(self, filename=None):
+        fname = filename or self.filename
+        if not fname:
+            raise ValueError("No file name")
+        content = self.line_ending.join(self.lines) + self.line_ending
+        with open(fname, "w", newline="") as f:
+            f.write(content)
+        self.filename = fname
+        self.modified = False
+        self._disk_mtime = os.path.getmtime(fname)
+
 
 class Pane:
     def __init__(self, buf=None):
-        self.buf    = buf or Buffer()
+        self.buf = buf or Buffer()
         self.cursor = Cursor()
-        self.top_row = 0; self.left_col = 0
+        self.top_row = 0
+        self.left_col = 0
         # Screen geometry (set by layout engine)
-        self.y = 0; self.x = 0; self.height = 24; self.width = 80
+        self.y = 0
+        self.x = 0
+        self.height = 24
+        self.width = 80
         # Chat pane state
-        self.is_chat           = False
-        self.chat_input        = ''
-        self.chat_history: list = []   # [{'role': ..., 'content': ...}]
-        self.chat_follow_fd    = None  # read-end of streaming pipe
-        self.chat_follow_partial = ''  # incomplete last line (matches _apply_follow_text logic)
-        self.chat_streaming    = False
+        self.is_chat = False
+        self.chat_input = ""
+        self.chat_history: list = []  # [{'role': ..., 'content': ...}]
+        self.chat_follow_fd = None  # read-end of streaming pipe
+        self.chat_follow_partial = (
+            ""  # incomplete last line (matches _apply_follow_text logic)
+        )
+        self.chat_streaming = False
+
 
 # ── Layout tree ──────────────────────────────────────────────────────────────
 
+
 class _Leaf:
-    def __init__(self, pane): self.pane = pane
+    def __init__(self, pane):
+        self.pane = pane
+
 
 class _Split:
     def __init__(self, a, b, vertical=False):
-        self.a = a; self.b = b; self.vertical = vertical
+        self.a = a
+        self.b = b
+        self.vertical = vertical
+
 
 def _lc_compute(node, y, x, h, w, divs):
     if isinstance(node, _Leaf):
-        p = node.pane; p.y, p.x, p.height, p.width = y, x, max(1,h), max(1,w)
+        p = node.pane
+        p.y, p.x, p.height, p.width = y, x, max(1, h), max(1, w)
     else:
         if node.vertical:
-            w1 = max(1, (w-1)//2); w2 = max(1, w-w1-1)
-            divs.append(('v', y, x+w1, h))
-            _lc_compute(node.a, y, x,      h, w1, divs)
-            _lc_compute(node.b, y, x+w1+1, h, w2, divs)
+            w1 = max(1, (w - 1) // 2)
+            w2 = max(1, w - w1 - 1)
+            divs.append(("v", y, x + w1, h))
+            _lc_compute(node.a, y, x, h, w1, divs)
+            _lc_compute(node.b, y, x + w1 + 1, h, w2, divs)
         else:
-            h1 = max(1, (h-1)//2); h2 = max(1, h-h1-1)
-            divs.append(('h', y+h1, x, w))
-            _lc_compute(node.a, y,    x, h1, w, divs)
-            _lc_compute(node.b, y+h1+1, x, h2, w, divs)
+            h1 = max(1, (h - 1) // 2)
+            h2 = max(1, h - h1 - 1)
+            divs.append(("h", y + h1, x, w))
+            _lc_compute(node.a, y, x, h1, w, divs)
+            _lc_compute(node.b, y + h1 + 1, x, h2, w, divs)
+
 
 def _lc_panes(node):
-    if isinstance(node, _Leaf): return [node.pane]
+    if isinstance(node, _Leaf):
+        return [node.pane]
     return _lc_panes(node.a) + _lc_panes(node.b)
+
 
 def _lc_split(node, target, new_pane, vertical):
     if isinstance(node, _Leaf):
@@ -174,13 +300,181 @@ def _lc_split(node, target, new_pane, vertical):
     n.b = _lc_split(node.b, target, new_pane, vertical)
     return n
 
+
+def _anthropic_client():
+    """Return an Anthropic client, preferring ANTHROPIC_API_KEY then Claude Code creds."""
+    import anthropic, json as _json
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        return anthropic.Anthropic(api_key=api_key)
+    creds_path = os.path.expanduser("~/.claude/.credentials.json")
+    try:
+        with open(creds_path) as f:
+            data = _json.load(f)
+        token = data.get("claudeAiOauth", {}).get("accessToken", "")
+        if token:
+            return anthropic.Anthropic(auth_token=token)
+    except (OSError, _json.JSONDecodeError):
+        pass
+    raise RuntimeError(
+        "No credentials found. Set ANTHROPIC_API_KEY or log in with: claude login"
+    )
+
+
+# ── pym agent tools ───────────────────────────────────────────────────────────
+
+_PYMI_TOOLS = [
+    {
+        "name": "view_file",
+        "description": "View lines from the active buffer with line numbers.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-indexed start line",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "1-indexed end line (inclusive)",
+                },
+            },
+            "required": ["start_line", "end_line"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": (
+            "Replace lines start_line..end_line (1-indexed, inclusive) in the active buffer "
+            "with new_content. Use this to make code changes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-indexed first line to replace",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "1-indexed last line to replace (inclusive)",
+                },
+                "new_content": {
+                    "type": "string",
+                    "description": "Replacement text (may span multiple lines)",
+                },
+            },
+            "required": ["start_line", "end_line", "new_content"],
+        },
+    },
+    {
+        "name": "run_command",
+        "description": "Run a shell command and return stdout+stderr (max 3000 chars).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to execute",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default 15)",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read a file from disk (optionally a line range).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path"},
+                "start_line": {
+                    "type": "integer",
+                    "description": "Optional 1-indexed start line",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Optional 1-indexed end line",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Save the active buffer to disk.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+
+def _exec_tool(name: str, inp: dict, pane) -> str:
+    """Execute a pym agent tool and return the result string."""
+    import subprocess as _sp
+
+    try:
+        if name == "view_file":
+            s = max(0, inp["start_line"] - 1)
+            e = min(len(pane.buf.lines), inp["end_line"])
+            return "\n".join(
+                f"{s + i + 1:4}: {l}" for i, l in enumerate(pane.buf.lines[s:e])
+            )
+
+        elif name == "edit_file":
+            s = max(0, inp["start_line"] - 1)
+            e = min(len(pane.buf.lines), inp["end_line"])
+            new_lines = inp["new_content"].splitlines()
+            pane.buf.lines[s:e] = new_lines
+            pane.buf.modified = True
+            pane.buf._gen += 1
+            return f"replaced lines {s + 1}–{e} with {len(new_lines)} line(s)"
+
+        elif name == "run_command":
+            cmd = inp["command"]
+            timeout = inp.get("timeout", 15)
+            r = _sp.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout
+            )
+            out = (r.stdout + r.stderr).strip()
+            return (out[:3000] + "…") if len(out) > 3000 else (out or "(no output)")
+
+        elif name == "read_file":
+            p = inp["path"]
+            with open(p, errors="replace") as f:
+                lines = f.readlines()
+            s = inp.get("start_line", 1) - 1
+            e = inp.get("end_line", len(lines))
+            chunk = "".join(lines[s:e])
+            return (chunk[:3000] + "…") if len(chunk) > 3000 else chunk
+
+        elif name == "write_file":
+            pane.buf.save()
+            return f"saved {pane.buf.filename!r}"
+
+        return f"unknown tool: {name}"
+    except Exception as ex:
+        return f"error: {ex}"
+
+
 def _lc_close(node, target):
     if isinstance(node, _Leaf):
         return None if node.pane is target else node
-    na = _lc_close(node.a, target); nb = _lc_close(node.b, target)
-    if na is None: return nb
-    if nb is None: return na
-    n = copy.copy(node); n.a = na; n.b = nb; return n
+    na = _lc_close(node.a, target)
+    nb = _lc_close(node.b, target)
+    if na is None:
+        return nb
+    if nb is None:
+        return na
+    n = copy.copy(node)
+    n.a = na
+    n.b = nb
+    return n
+
 
 # ── Syntax highlighting (pygments) ───────────────────────────────────────────
 
@@ -192,88 +486,98 @@ from pygments.util import ClassNotFound
 
 # ── Color schemes ─────────────────────────────────────────────────────────────
 # Roles map to color pairs 9-15 in order.
-_SYNTAX_ROLES = ('keyword', 'string', 'comment', 'number', 'type', 'builtin', 'decorator')
-_SYNTAX_PAIR  = {r: 9 + i for i, r in enumerate(_SYNTAX_ROLES)}
+_SYNTAX_ROLES = (
+    "keyword",
+    "string",
+    "comment",
+    "number",
+    "type",
+    "builtin",
+    "decorator",
+)
+_SYNTAX_PAIR = {r: 9 + i for i, r in enumerate(_SYNTAX_ROLES)}
 
 # Each scheme: role → (fg_index, curses_attr).  fg values > 7 need HAS_256COLOR.
 _SCHEMES: dict = {
-    'default': {
-        'keyword':   (curses.COLOR_YELLOW,   curses.A_BOLD),
-        'string':    (curses.COLOR_GREEN,    0),
-        'comment':   (curses.COLOR_WHITE,    curses.A_DIM),
-        'number':    (curses.COLOR_MAGENTA,  0),
-        'type':      (curses.COLOR_CYAN,     0),
-        'builtin':   (curses.COLOR_BLUE,     0),
-        'decorator': (curses.COLOR_YELLOW,   curses.A_BOLD),
+    "default": {
+        "keyword": (curses.COLOR_YELLOW, curses.A_BOLD),
+        "string": (curses.COLOR_GREEN, 0),
+        "comment": (curses.COLOR_WHITE, curses.A_DIM),
+        "number": (curses.COLOR_MAGENTA, 0),
+        "type": (curses.COLOR_CYAN, 0),
+        "builtin": (curses.COLOR_BLUE, 0),
+        "decorator": (curses.COLOR_YELLOW, curses.A_BOLD),
     },
-    'monokai': {
-        'keyword':   (197, curses.A_BOLD),   # #F92672 pink
-        'string':    (148, 0),               # #A6E22E green
-        'comment':   (243, curses.A_DIM),    # #75715E gray
-        'number':    (141, 0),               # #AE81FF purple
-        'type':      (81,  0),               # #66D9EF cyan
-        'builtin':   (81,  0),
-        'decorator': (148, curses.A_BOLD),
+    "monokai": {
+        "keyword": (197, curses.A_BOLD),  # #F92672 pink
+        "string": (148, 0),  # #A6E22E green
+        "comment": (243, curses.A_DIM),  # #75715E gray
+        "number": (141, 0),  # #AE81FF purple
+        "type": (81, 0),  # #66D9EF cyan
+        "builtin": (81, 0),
+        "decorator": (148, curses.A_BOLD),
     },
-    'nord': {
-        'keyword':   (110, curses.A_BOLD),   # #81A1C1 blue
-        'string':    (143, 0),               # #A3BE8C sage
-        'comment':   (241, curses.A_DIM),    # #4C566A dark gray
-        'number':    (139, 0),               # #B48EAD purple
-        'type':      (109, 0),               # #88C0D0 light blue
-        'builtin':   (153, 0),               # #8FBCBB teal
-        'decorator': (173, curses.A_BOLD),   # #D08770 orange
+    "nord": {
+        "keyword": (110, curses.A_BOLD),  # #81A1C1 blue
+        "string": (143, 0),  # #A3BE8C sage
+        "comment": (241, curses.A_DIM),  # #4C566A dark gray
+        "number": (139, 0),  # #B48EAD purple
+        "type": (109, 0),  # #88C0D0 light blue
+        "builtin": (153, 0),  # #8FBCBB teal
+        "decorator": (173, curses.A_BOLD),  # #D08770 orange
     },
-    'gruvbox': {
-        'keyword':   (167, curses.A_BOLD),   # #FB4934 red
-        'string':    (142, 0),               # #B8BB26 yellow-green
-        'comment':   (245, curses.A_DIM),    # #928374 gray
-        'number':    (175, 0),               # #D3869B pink
-        'type':      (108, 0),               # #8EC07C green
-        'builtin':   (109, 0),               # #83A598 cyan
-        'decorator': (214, curses.A_BOLD),   # #FABD2F yellow
+    "gruvbox": {
+        "keyword": (167, curses.A_BOLD),  # #FB4934 red
+        "string": (142, 0),  # #B8BB26 yellow-green
+        "comment": (245, curses.A_DIM),  # #928374 gray
+        "number": (175, 0),  # #D3869B pink
+        "type": (108, 0),  # #8EC07C green
+        "builtin": (109, 0),  # #83A598 cyan
+        "decorator": (214, curses.A_BOLD),  # #FABD2F yellow
     },
-    'solarized': {
-        'keyword':   (64,  curses.A_BOLD),   # #859900 olive
-        'string':    (37,  0),               # #2AA198 teal
-        'comment':   (66,  curses.A_DIM),    # #657B83 gray
-        'number':    (162, 0),               # #D33682 magenta
-        'type':      (32,  0),               # #268BD2 blue
-        'builtin':   (61,  0),               # #6C71C4 violet
-        'decorator': (166, curses.A_BOLD),   # #CB4B16 orange
+    "solarized": {
+        "keyword": (64, curses.A_BOLD),  # #859900 olive
+        "string": (37, 0),  # #2AA198 teal
+        "comment": (66, curses.A_DIM),  # #657B83 gray
+        "number": (162, 0),  # #D33682 magenta
+        "type": (32, 0),  # #268BD2 blue
+        "builtin": (61, 0),  # #6C71C4 violet
+        "decorator": (166, curses.A_BOLD),  # #CB4B16 orange
     },
-    'dracula': {
-        'keyword':   (141, curses.A_BOLD),   # #BD93F9 purple
-        'string':    (84,  0),               # #50FA7B green
-        'comment':   (61,  curses.A_DIM),    # #6272A4 muted blue
-        'number':    (212, 0),               # #FF79C6 pink
-        'type':      (117, 0),               # #8BE9FD cyan
-        'builtin':   (117, 0),
-        'decorator': (215, curses.A_BOLD),   # #FFB86C orange
+    "dracula": {
+        "keyword": (141, curses.A_BOLD),  # #BD93F9 purple
+        "string": (84, 0),  # #50FA7B green
+        "comment": (61, curses.A_DIM),  # #6272A4 muted blue
+        "number": (212, 0),  # #FF79C6 pink
+        "type": (117, 0),  # #8BE9FD cyan
+        "builtin": (117, 0),
+        "decorator": (215, curses.A_BOLD),  # #FFB86C orange
     },
 }
 
 # Active attrs read by _pg_attr; updated by _apply_scheme after curses starts.
 _ACTIVE_SYNTAX_ATTRS: dict = {
-    'keyword':   (9,  curses.A_BOLD),
-    'string':    (10, 0),
-    'comment':   (11, curses.A_DIM),
-    'number':    (12, 0),
-    'type':      (13, 0),
-    'builtin':   (14, 0),
-    'decorator': (15, curses.A_BOLD),
+    "keyword": (9, curses.A_BOLD),
+    "string": (10, 0),
+    "comment": (11, curses.A_DIM),
+    "number": (12, 0),
+    "type": (13, 0),
+    "builtin": (14, 0),
+    "decorator": (15, curses.A_BOLD),
 }
+
 
 def _load_pyvim_config() -> dict:
     """Read [tool.pyvim] from the nearest pyproject.toml."""
     for d in [pathlib.Path.cwd(), *pathlib.Path.cwd().parents]:
-        p = d / 'pyproject.toml'
+        p = d / "pyproject.toml"
         if p.exists():
             try:
-                return tomllib.loads(p.read_text()).get('tool', {}).get('pyvim', {})
+                return tomllib.loads(p.read_text()).get("tool", {}).get("pyvim", {})
             except Exception:
                 pass
     return {}
+
 
 def _apply_scheme(name: str, overrides: dict | None = None) -> None:
     """Init curses pairs 9-15 for the named scheme and update _ACTIVE_SYNTAX_ATTRS.
@@ -282,40 +586,55 @@ def _apply_scheme(name: str, overrides: dict | None = None) -> None:
     doesn't support them.  Call only after curses.start_color().
     """
     global _ACTIVE_SYNTAX_ATTRS
-    scheme = dict(_SCHEMES.get(name) or _SCHEMES['default'])
+    scheme = dict(_SCHEMES.get(name) or _SCHEMES["default"])
     needs_256 = any(v[0] > 7 for v in scheme.values())
     if needs_256 and not HAS_256COLOR:
-        scheme = dict(_SCHEMES['default'])
+        scheme = dict(_SCHEMES["default"])
     if overrides:
         for role, fg in overrides.items():
             if role in scheme and isinstance(fg, int):
                 scheme[role] = (fg, scheme[role][1])
     new_attrs = {}
     for role in _SYNTAX_ROLES:
-        fg, attr = scheme.get(role, _SCHEMES['default'][role])
+        fg, attr = scheme.get(role, _SCHEMES["default"][role])
         idx = _SYNTAX_PAIR[role]
         curses.init_pair(idx, fg, -1)
         new_attrs[role] = (idx, attr)
     _ACTIVE_SYNTAX_ATTRS = new_attrs
     _pg_cache.clear()
 
+
 # pygments ttype → (color_pair_index, extra_attr) from active scheme
 def _pg_attr(ttype):
     a = _ACTIVE_SYNTAX_ATTRS
-    if ttype in Token.Keyword:                                   return a['keyword']
-    if ttype in Token.Literal.String or ttype in Token.String:  return a['string']
-    if ttype in Token.Comment:                                   return a['comment']
-    if ttype in Token.Literal.Number or ttype in Token.Number:  return a['number']
-    if ttype in Token.Name.Class or ttype in Token.Name.Exception \
-            or ttype in Token.Name.Namespace:                    return a['type']
-    if ttype in Token.Name.Function:                             return a['type']
-    if ttype in Token.Name.Builtin:                              return a['builtin']
-    if ttype in Token.Name.Decorator:                            return a['decorator']
-    if ttype in Token.Operator.Word:                             return a['keyword']
+    if ttype in Token.Keyword:
+        return a["keyword"]
+    if ttype in Token.Literal.String or ttype in Token.String:
+        return a["string"]
+    if ttype in Token.Comment:
+        return a["comment"]
+    if ttype in Token.Literal.Number or ttype in Token.Number:
+        return a["number"]
+    if (
+        ttype in Token.Name.Class
+        or ttype in Token.Name.Exception
+        or ttype in Token.Name.Namespace
+    ):
+        return a["type"]
+    if ttype in Token.Name.Function:
+        return a["type"]
+    if ttype in Token.Name.Builtin:
+        return a["builtin"]
+    if ttype in Token.Name.Decorator:
+        return a["decorator"]
+    if ttype in Token.Operator.Word:
+        return a["keyword"]
     return None
+
 
 # (id(buf), gen) → list[list[(start, end, curses_attr)]] indexed by row
 _pg_cache: dict = {}
+
 
 def _pg_highlight(buf):
     key = (id(buf), buf._gen)
@@ -323,12 +642,13 @@ def _pg_highlight(buf):
         return _pg_cache[key]
     # Evict stale entries for this buffer (different gen)
     stale = [k for k in _pg_cache if k[0] == id(buf)]
-    for k in stale: del _pg_cache[k]
+    for k in stale:
+        del _pg_cache[k]
     # Cap total cache size
     if len(_pg_cache) > 40:
         _pg_cache.clear()
 
-    text = '\n'.join(buf.lines)
+    text = "\n".join(buf.lines)
     try:
         if buf.filename:
             lexer = get_lexer_for_filename(buf.filename, stripnl=False, ensurenl=False)
@@ -340,14 +660,17 @@ def _pg_highlight(buf):
     # Build per-row span lists — store (start, end, (pair_idx, extra)) to defer
     # curses.color_pair() until draw time (requires initscr to have been called).
     by_row: list[list] = [[] for _ in buf.lines]
-    row = 0; col = 0
+    row = 0
+    col = 0
     for ttype, value in lex(text, lexer):
         pg_attr = _pg_attr(ttype)
-        lines = value.split('\n')
+        lines = value.split("\n")
         for li, part in enumerate(lines):
             if li > 0:
-                row += 1; col = 0
-                if row >= len(by_row): break
+                row += 1
+                col = 0
+                if row >= len(by_row):
+                    break
             if pg_attr and part:
                 by_row[row].append((col, col + len(part), pg_attr))
             col += len(part)
@@ -355,16 +678,22 @@ def _pg_highlight(buf):
     _pg_cache[key] = by_row
     return by_row
 
+
 def _detect_lang(filename):
-    if not filename: return None
+    if not filename:
+        return None
     try:
         get_lexer_for_filename(filename)
         return filename  # truthy — used only to decide "do we highlight?"
     except ClassNotFound:
         return None
 
+
 def _is_markdown(filename):
-    return bool(filename and filename.rsplit('.',1)[-1].lower() in ('md','markdown','mkd'))
+    return bool(
+        filename and filename.rsplit(".", 1)[-1].lower() in ("md", "markdown", "mkd")
+    )
+
 
 # ── Markdown rendering via markdown-it-py ────────────────────────────────────
 # Parses with a proper GFM parser so nested inline styles (bold+code, etc.)
@@ -374,47 +703,54 @@ def _is_markdown(filename):
 
 try:
     from markdown_it import MarkdownIt as _MdIt
+
     _MD = _MdIt("gfm-like").disable("linkify")
 except ImportError:
     _MD = None
 
 _md_cache: dict = {}
-_md_img_cache: dict = {}   # same key as _md_cache → {row: (abs_path, alt)}
-_sixel_cache: dict = {}      # (path, mtime, max_w, max_h) → (sixel_str, w_cells, h_cells)
+_md_img_cache: dict = {}  # same key as _md_cache → {row: (abs_path, alt)}
+_sixel_cache: dict = {}  # (path, mtime, max_w, max_h) → (sixel_str, w_cells, h_cells)
 _colortext_cache: dict = {}  # same key → (lines, w_cells, h_cells)
-_TABLE_SEP_RE = re.compile(r'^\s*\|[-:| ]+\|\s*$')
-_TASK_RE      = re.compile(r'^(\s*)([-*+]|\d+\.)\s+\[([ xX])\] ?')
+_TABLE_SEP_RE = re.compile(r"^\s*\|[-:| ]+\|\s*$")
+_TASK_RE = re.compile(r"^(\s*)([-*+]|\d+\.)\s+\[([ xX])\] ?")
+
 
 def _task_state(line):
     """Return 'checked', 'unchecked', or None."""
     m = _TASK_RE.match(line)
-    if not m: return None
-    return 'checked' if m.group(3).lower() == 'x' else 'unchecked'
+    if not m:
+        return None
+    return "checked" if m.group(3).lower() == "x" else "unchecked"
 
 
 def _is_table_row(line):
     s = line.strip()
-    return s.startswith('|') and s.endswith('|') and not _TABLE_SEP_RE.match(line)
+    return s.startswith("|") and s.endswith("|") and not _TABLE_SEP_RE.match(line)
 
 
 def _table_cells(line):
     """Return list of (content_start, content_end) for each cell in a raw table line."""
-    if not _is_table_row(line): return []
-    pipes = [i for i, c in enumerate(line) if c == '|']
-    if len(pipes) < 2: return []
+    if not _is_table_row(line):
+        return []
+    pipes = [i for i, c in enumerate(line) if c == "|"]
+    if len(pipes) < 2:
+        return []
     cells = []
     for a, b in zip(pipes, pipes[1:]):
         s = a + 1
-        while s < b and line[s] == ' ': s += 1
+        while s < b and line[s] == " ":
+            s += 1
         e = b - 1
-        while e > a and line[e] == ' ': e -= 1
+        while e > a and line[e] == " ":
+            e -= 1
         cells.append((s, e + 1))
     return cells
 
 
 def _table_cell_at(line, col):
     """Return (cell_idx, content_start, content_end) for the cell containing col, or None."""
-    pipes = [i for i, c in enumerate(line) if c == '|']
+    pipes = [i for i, c in enumerate(line) if c == "|"]
     cells = _table_cells(line)
     for i, (a, b) in enumerate(zip(pipes, pipes[1:])):
         if a < col <= b and i < len(cells):
@@ -425,18 +761,18 @@ def _table_cell_at(line, col):
 def _extract_img_src(children, buf_filename) -> tuple[str, str] | None:
     """Return (abs_path, alt) for the first image token, or None.
     Records the path even if the file doesn't exist yet — encoder will fail gracefully."""
-    for tok in (children or []):
-        if tok.type == 'image':
-            src = (tok.attrs or {}).get('src', '') if tok.attrs else ''
-            alt = tok.content or ''
-            if not src or src.startswith(('http://', 'https://', 'data:')):
+    for tok in children or []:
+        if tok.type == "image":
+            src = (tok.attrs or {}).get("src", "") if tok.attrs else ""
+            alt = tok.content or ""
+            if not src or src.startswith(("http://", "https://", "data:")):
                 continue
             if buf_filename:
                 base = os.path.dirname(os.path.abspath(buf_filename))
                 path = os.path.normpath(os.path.join(base, src))
             else:
                 path = os.path.abspath(src)
-            return (path, alt)   # let encoder handle missing-file case
+            return (path, alt)  # let encoder handle missing-file case
     return None
 
 
@@ -456,22 +792,22 @@ def _encode_sixel(path: str, max_w: int, max_h: int):
         return None
     try:
         CW, CH = 8, 16
-        img = Image.open(path).convert('RGB')
+        img = Image.open(path).convert("RGB")
         img.thumbnail((max_w * CW, max_h * CH), Image.LANCZOS)
         w, h = img.size
         w_cells = max(1, (w + CW - 1) // CW)
         h_cells = max(1, (h + CH - 1) // CH)
 
         qimg = img.quantize(colors=256)
-        pal  = qimg.getpalette()
+        pal = qimg.getpalette()
         data = list(qimg.getdata())  # type: ignore[attr-defined]
 
-        out = ['\033Pq']
+        out = ["\033Pq"]
         for ci in range(min(256, len(pal) // 3)):
-            r = pal[ci*3] * 100 // 255
-            g = pal[ci*3+1] * 100 // 255
-            b = pal[ci*3+2] * 100 // 255
-            out.append(f'#{ci};2;{r};{g};{b}')
+            r = pal[ci * 3] * 100 // 255
+            g = pal[ci * 3 + 1] * 100 // 255
+            b = pal[ci * 3 + 2] * 100 // 255
+            out.append(f"#{ci};2;{r};{g};{b}")
 
         for y0 in range(0, h, 6):
             bh = min(6, h - y0)
@@ -484,22 +820,26 @@ def _encode_sixel(path: str, max_w: int, max_h: int):
                     col_bits[ci][x] |= 1 << dy
             first = True
             for ci, bits in col_bits.items():
-                if not first: out.append('$')
+                if not first:
+                    out.append("$")
                 first = False
-                out.append(f'#{ci}')
-                prev = None; run = 0
+                out.append(f"#{ci}")
+                prev = None
+                run = 0
                 for v in bits:
                     c = chr(63 + v)
                     if c == prev:
                         run += 1
                     else:
-                        if prev: out.append(f'!{run}{prev}' if run > 3 else prev * run)
+                        if prev:
+                            out.append(f"!{run}{prev}" if run > 3 else prev * run)
                         prev, run = c, 1
-                if prev: out.append(f'!{run}{prev}' if run > 3 else prev * run)
-            out.append('-')
+                if prev:
+                    out.append(f"!{run}{prev}" if run > 3 else prev * run)
+            out.append("-")
 
-        out.append('\033\\')
-        result = (''.join(out), w_cells, h_cells)
+        out.append("\033\\")
+        result = ("".join(out), w_cells, h_cells)
         _sixel_cache[key] = result
         return result
     except Exception:
@@ -514,19 +854,28 @@ def _rgb_to_256(r: int, g: int, b: int) -> int:
 def _rgb_to_8(r: int, g: int, b: int) -> int:
     """Nearest ANSI 8-color index (0-7) for terminals without 256-color support."""
     bright = (r * 299 + g * 587 + b * 114) // 1000
-    if bright < 48:  return 0  # black
-    if bright > 200: return 7  # white
+    if bright < 48:
+        return 0  # black
+    if bright > 200:
+        return 7  # white
     hi = max(r, g, b)
     rd = r > hi * 0.5
     gr = g > hi * 0.5
     bl = b > hi * 0.5
-    if rd and gr and bl: return 7   # white-ish
-    if rd and gr:        return 3   # yellow
-    if rd and bl:        return 5   # magenta
-    if gr and bl:        return 6   # cyan
-    if rd:               return 1
-    if gr:               return 2
-    if bl:               return 4
+    if rd and gr and bl:
+        return 7  # white-ish
+    if rd and gr:
+        return 3  # yellow
+    if rd and bl:
+        return 5  # magenta
+    if gr and bl:
+        return 6  # cyan
+    if rd:
+        return 1
+    if gr:
+        return 2
+    if bl:
+        return 4
     return 0
 
 
@@ -546,13 +895,14 @@ def _encode_color_text(path: str, max_w: int, max_h: int):
     except ImportError:
         return None
     try:
-        img = Image.open(path).convert('RGB')
+        img = Image.open(path).convert("RGB")
         img.thumbnail((max_w, max_h * 2), Image.LANCZOS)
         w, h = img.size
         if h % 2:
-            pad = Image.new('RGB', (w, h + 1), (0, 0, 0))
+            pad = Image.new("RGB", (w, h + 1), (0, 0, 0))
             pad.paste(img, (0, 0))
-            img = pad; h += 1
+            img = pad
+            h += 1
         pix = img.load()
         lines = []
         for row in range(0, h, 2):
@@ -563,13 +913,13 @@ def _encode_color_text(path: str, max_w: int, max_h: int):
                 if HAS_256COLOR:
                     tc = _rgb_to_256(tr, tg, tb)
                     bc = _rgb_to_256(br2, bg2, bb2)
-                    parts.append(f'\033[38;5;{tc};48;5;{bc}m▀')
+                    parts.append(f"\033[38;5;{tc};48;5;{bc}m▀")
                 else:
                     tc = _rgb_to_8(tr, tg, tb)
                     bc = _rgb_to_8(br2, bg2, bb2)
-                    parts.append(f'\033[3{tc};4{bc}m▀')
-            parts.append('\033[0m')
-            lines.append(''.join(parts))
+                    parts.append(f"\033[3{tc};4{bc}m▀")
+            parts.append("\033[0m")
+            lines.append("".join(parts))
         result = (lines, w, h // 2)
         _colortext_cache[key] = result
         return result
@@ -591,44 +941,70 @@ def _inline_render(children):
     styles: list = []
 
     def cur():
-        if not active: return None
+        if not active:
+            return None
         p, a = 0, 0
-        if 'bold'   in active: a |= curses.A_BOLD
-        if 'italic' in active: a |= curses.A_UNDERLINE
-        if 'strike' in active: a |= curses.A_DIM
-        if 'link'   in active: p  = 13
+        if "bold" in active:
+            a |= curses.A_BOLD
+        if "italic" in active:
+            a |= curses.A_UNDERLINE
+        if "strike" in active:
+            a |= curses.A_DIM
+        if "link" in active:
+            p = 13
         return (p, a) if (p or a) else None
 
-    for tok in (children or []):
+    for tok in children or []:
         t = tok.type
-        if   t == 'strong_open':  active.add('bold')
-        elif t == 'strong_close': active.discard('bold')
-        elif t == 'em_open':      active.add('italic')
-        elif t == 'em_close':     active.discard('italic')
-        elif t == 'link_open':    active.add('link')
-        elif t == 'link_close':   active.discard('link')
-        elif t == 's_open':       active.add('strike')
-        elif t == 's_close':      active.discard('strike')
-        elif t == 'text':
+        if t == "strong_open":
+            active.add("bold")
+        elif t == "strong_close":
+            active.discard("bold")
+        elif t == "em_open":
+            active.add("italic")
+        elif t == "em_close":
+            active.discard("italic")
+        elif t == "link_open":
+            active.add("link")
+        elif t == "link_close":
+            active.discard("link")
+        elif t == "s_open":
+            active.add("strike")
+        elif t == "s_close":
+            active.discard("strike")
+        elif t == "text":
             st = cur()
-            for ch in tok.content: chars.append(ch); styles.append(st)
-        elif t == 'code_inline':
-            for ch in tok.content: chars.append(ch); styles.append((10, 0))
-        elif t == 'image':
-            src = (tok.attrs or {}).get('src', '') if tok.attrs else ''
-            alt = tok.content or (tok.attrs or {}).get('alt', '') if tok.attrs else tok.content or ''
-            label = alt or (os.path.basename(src) if src else 'image')
-            st  = cur()
-            for ch in f'[{label}]': chars.append(ch); styles.append(st)
+            for ch in tok.content:
+                chars.append(ch)
+                styles.append(st)
+        elif t == "code_inline":
+            for ch in tok.content:
+                chars.append(ch)
+                styles.append((10, 0))
+        elif t == "image":
+            src = (tok.attrs or {}).get("src", "") if tok.attrs else ""
+            alt = (
+                tok.content or (tok.attrs or {}).get("alt", "")
+                if tok.attrs
+                else tok.content or ""
+            )
+            label = alt or (os.path.basename(src) if src else "image")
+            st = cur()
+            for ch in f"[{label}]":
+                chars.append(ch)
+                styles.append(st)
         # softbreak / hardbreak / html_inline: skip
 
-    vis = ''.join(chars)
+    vis = "".join(chars)
     spans, i = [], 0
     while i < len(styles):
         st = styles[i]
-        if st is None: i += 1; continue
+        if st is None:
+            i += 1
+            continue
         j = i + 1
-        while j < len(styles) and styles[j] == st: j += 1
+        while j < len(styles) and styles[j] == st:
+            j += 1
         spans.append((i, j, st))
         i = j
     return vis, spans
@@ -636,32 +1012,38 @@ def _inline_render(children):
 
 def _inline_text(children) -> str:
     """Extract plain text from inline token children (used for headings/cells)."""
-    return ''.join(tok.content for tok in (children or [])
-                   if tok.type in ('text', 'code_inline'))
+    return "".join(
+        tok.content for tok in (children or []) if tok.type in ("text", "code_inline")
+    )
 
 
 def _render_table_tokens(toks, lines):
     """Render a table token slice → {row_idx: (visual_line, spans)}."""
-    DIM  = (11, curses.A_DIM)
-    HEAD = (9,  curses.A_BOLD)
+    DIM = (11, curses.A_DIM)
+    HEAD = (9, curses.A_BOLD)
     in_head = False
     cur_ri = cur_hdr = None
     cur_cells: list = []
     rows = []
 
     for tok in toks:
-        if   tok.type == 'thead_open':  in_head = True
-        elif tok.type == 'thead_close': in_head = False
-        elif tok.type == 'tr_open':
+        if tok.type == "thead_open":
+            in_head = True
+        elif tok.type == "thead_close":
+            in_head = False
+        elif tok.type == "tr_open":
             cur_ri = tok.map[0] if tok.map else None
-            cur_hdr = in_head; cur_cells = []
-        elif tok.type == 'tr_close':
-            if cur_ri is not None: rows.append((cur_ri, cur_hdr, cur_cells[:]))
-        elif tok.type == 'inline' and cur_cells is not None:
+            cur_hdr = in_head
+            cur_cells = []
+        elif tok.type == "tr_close":
+            if cur_ri is not None:
+                rows.append((cur_ri, cur_hdr, cur_cells[:]))
+        elif tok.type == "inline" and cur_cells is not None:
             cur_cells.append(_inline_text(tok.children))
 
-    if not rows: return {}
-    ncols  = max(len(r[2]) for r in rows)
+    if not rows:
+        return {}
+    ncols = max(len(r[2]) for r in rows)
     widths = [1] * ncols
     for _, _, cells in rows:
         for ci, c in enumerate(cells[:ncols]):
@@ -669,41 +1051,53 @@ def _render_table_tokens(toks, lines):
 
     result = {}
     for ri, hdr, cells in rows:
-        parts = ['│']; spans = [(0, 1, DIM)]; pos = 1
+        parts = ["│"]
+        spans = [(0, 1, DIM)]
+        pos = 1
         for ci in range(ncols):
-            cell   = cells[ci] if ci < len(cells) else ''
-            padded = ' ' + cell.ljust(widths[ci]) + ' '
-            if hdr: spans.append((pos, pos + len(padded), HEAD))
-            parts.append(padded); pos += len(padded)
-            parts.append('│'); spans.append((pos, pos + 1, DIM)); pos += 1
-        result[ri] = (''.join(parts), spans)
+            cell = cells[ci] if ci < len(cells) else ""
+            padded = " " + cell.ljust(widths[ci]) + " "
+            if hdr:
+                spans.append((pos, pos + len(padded), HEAD))
+            parts.append(padded)
+            pos += len(padded)
+            parts.append("│")
+            spans.append((pos, pos + 1, DIM))
+            pos += 1
+        result[ri] = ("".join(parts), spans)
 
     # Separator row sits between last header row and first body row in the buffer
-    hdrs  = [r for r in rows if     r[1]]
+    hdrs = [r for r in rows if r[1]]
     bodys = [r for r in rows if not r[1]]
     if hdrs and bodys:
         for r in range(hdrs[-1][0] + 1, bodys[0][0]):
             if r < len(lines) and _TABLE_SEP_RE.match(lines[r]):
-                vis = '├' + '┼'.join('─' * (w + 2) for w in widths) + '┤'
-                result[r] = (vis, [(0, len(vis), DIM)]); break
+                vis = "├" + "┼".join("─" * (w + 2) for w in widths) + "┤"
+                result[r] = (vis, [(0, len(vis), DIM)])
+                break
     return result
 
 
 def _md_highlight(buf):
     key = (id(buf), buf._gen)
-    if key in _md_cache: return _md_cache[key]
+    if key in _md_cache:
+        return _md_cache[key]
     stale = [k for k in _md_cache if k[0] == id(buf)]
     for k in stale:
         del _md_cache[k]
         _md_img_cache.pop(k, None)
-    if len(_md_cache) > 20: _md_cache.clear(); _md_img_cache.clear()
+    if len(_md_cache) > 20:
+        _md_cache.clear()
+        _md_img_cache.clear()
 
-    lines  = buf.lines
-    by_row = [(ln, []) for ln in lines]   # default: raw, no styling
-    images: dict = {}                      # row → (abs_path, alt)
+    lines = buf.lines
+    by_row = [(ln, []) for ln in lines]  # default: raw, no styling
+    images: dict = {}  # row → (abs_path, alt)
 
     if _MD is None:
-        _md_cache[key] = by_row; _md_img_cache[key] = images; return by_row
+        _md_cache[key] = by_row
+        _md_img_cache[key] = images
+        return by_row
 
     H1 = (9, curses.A_BOLD | curses.A_UNDERLINE)
     H2 = (9, curses.A_BOLD)
@@ -712,69 +1106,91 @@ def _md_highlight(buf):
     FC = (14, 0)
     QU = (11, 0)
 
-    tokens = _MD.parse('\n'.join(lines))
+    tokens = _MD.parse("\n".join(lines))
     i = 0
     while i < len(tokens):
         tok = tokens[i]
 
-        if tok.type == 'heading_open' and tok.map:
-            lv  = int(tok.tag[1]) if tok.tag and len(tok.tag) > 1 and tok.tag[1].isdigit() else 2
-            inl = tokens[i + 1] if i + 1 < len(tokens) and tokens[i + 1].type == 'inline' else None
+        if tok.type == "heading_open" and tok.map:
+            lv = (
+                int(tok.tag[1])
+                if tok.tag and len(tok.tag) > 1 and tok.tag[1].isdigit()
+                else 2
+            )
+            inl = (
+                tokens[i + 1]
+                if i + 1 < len(tokens) and tokens[i + 1].type == "inline"
+                else None
+            )
             vis = _inline_text(inl.children if inl else [])
-            r   = tok.map[0]
-            if r < len(by_row):
-                by_row[r] = (vis, [(0, len(vis), H1 if lv == 1 else H2 if lv == 2 else H3)])
-            i += 3; continue
-
-        if tok.type == 'hr' and tok.map:
             r = tok.map[0]
             if r < len(by_row):
-                vis = '─' * max(len(lines[r]), 3)
-                by_row[r] = (vis, [(0, len(vis), DM)])
-            i += 1; continue
+                by_row[r] = (
+                    vis,
+                    [(0, len(vis), H1 if lv == 1 else H2 if lv == 2 else H3)],
+                )
+            i += 3
+            continue
 
-        if tok.type in ('fence', 'code_block') and tok.map:
+        if tok.type == "hr" and tok.map:
+            r = tok.map[0]
+            if r < len(by_row):
+                vis = "─" * max(len(lines[r]), 3)
+                by_row[r] = (vis, [(0, len(vis), DM)])
+            i += 1
+            continue
+
+        if tok.type in ("fence", "code_block") and tok.map:
             r0, r1 = tok.map
-            is_fence = tok.type == 'fence'
-            lang = tok.info.strip() if (is_fence and tok.info) else ''
-            LB = (13, curses.A_BOLD)   # language badge: cyan bold
+            is_fence = tok.type == "fence"
+            lang = tok.info.strip() if (is_fence and tok.info) else ""
+            LB = (13, curses.A_BOLD)  # language badge: cyan bold
             for r in range(r0, min(r1, len(by_row))):
                 if is_fence and r == r0:
-                    label = f' {lang}' if lang else ''
-                    vis = '╭─' + label
+                    label = f" {lang}" if lang else ""
+                    vis = "╭─" + label
                     spans = [(0, 2, DM)]
-                    if lang: spans.append((2, len(vis), LB))
+                    if lang:
+                        spans.append((2, len(vis), LB))
                     by_row[r] = (vis, spans)
                 elif is_fence and r == r1 - 1:
-                    by_row[r] = ('╰─', [(0, 2, DM)])
+                    by_row[r] = ("╰─", [(0, 2, DM)])
                 else:
-                    vis = '│ ' + lines[r]
+                    vis = "│ " + lines[r]
                     by_row[r] = (vis, [(0, 2, DM), (2, len(vis), FC)])
-            i += 1; continue
+            i += 1
+            continue
 
-        if tok.type == 'table_open' and tok.map:
+        if tok.type == "table_open" and tok.map:
             j, d = i + 1, 1
             while j < len(tokens):
-                if tokens[j].type == 'table_open':  d += 1
-                if tokens[j].type == 'table_close':
+                if tokens[j].type == "table_open":
+                    d += 1
+                if tokens[j].type == "table_close":
                     d -= 1
-                    if d == 0: break
+                    if d == 0:
+                        break
                 j += 1
-            for r, v in _render_table_tokens(tokens[i:j + 1], lines).items():
-                if r < len(by_row): by_row[r] = v
-            i = j + 1; continue
+            for r, v in _render_table_tokens(tokens[i : j + 1], lines).items():
+                if r < len(by_row):
+                    by_row[r] = v
+            i = j + 1
+            continue
 
-        if tok.type == 'inline' and tok.map:
+        if tok.type == "inline" and tok.map:
             r0 = tok.map[0]
             # Split children by softbreak → one visual line per source row
             groups: list = [[]]
-            for child in (tok.children or []):
-                if child.type in ('softbreak', 'hardbreak'): groups.append([])
-                else: groups[-1].append(child)
+            for child in tok.children or []:
+                if child.type in ("softbreak", "hardbreak"):
+                    groups.append([])
+                else:
+                    groups[-1].append(child)
 
             for gi, group in enumerate(groups):
                 r = r0 + gi
-                if r >= len(by_row): break
+                if r >= len(by_row):
+                    break
                 # Record image metadata before rendering the placeholder
                 img_info = _extract_img_src(group, buf.filename)
                 if img_info:
@@ -782,41 +1198,48 @@ def _md_highlight(buf):
                 vis, spans = _inline_render(group)
                 raw = lines[r]
                 # Detect block context from the raw buffer line, add visual prefix
-                bm = re.match(r'^(>+\s?)', raw)
-                lm = re.match(r'^(\s*)([-*+]|\d+\.)(\s)', raw)
+                bm = re.match(r"^(>+\s?)", raw)
+                lm = re.match(r"^(\s*)([-*+]|\d+\.)(\s)", raw)
                 if bm:
-                    vis   = '│ ' + vis
+                    vis = "│ " + vis
                     spans = [(0, 2, DM)] + [(s + 2, e + 2, st) for s, e, st in spans]
                     # re-apply quote color to unmarked text segments
                     spans = [(s, e, QU if st is None else st) for s, e, st in spans]
                 elif lm:
                     indent = lm.group(1)
                     marker = lm.group(2)
-                    task_m = re.match(r'^\[( |x|X)\] ?', vis) if marker in '-*+' else None
+                    task_m = (
+                        re.match(r"^\[( |x|X)\] ?", vis) if marker in "-*+" else None
+                    )
                     if task_m:
-                        done   = task_m.group(1).lower() == 'x'
-                        box    = '■ ' if done else '□ '
-                        rest   = vis[len(task_m.group(0)):]
-                        delta  = len(box) - len(task_m.group(0))
+                        done = task_m.group(1).lower() == "x"
+                        box = "■ " if done else "□ "
+                        rest = vis[len(task_m.group(0)) :]
+                        delta = len(box) - len(task_m.group(0))
                         # Shift existing spans, clamp negatives
                         new_sp = []
                         for s, e, st in spans:
                             ns, ne = max(0, s + delta), max(0, e + delta)
-                            if ne > ns: new_sp.append((ns, ne, st))
+                            if ne > ns:
+                                new_sp.append((ns, ne, st))
                         # Checkbox glyph span
                         box_st = (10, 0) if done else (9, curses.A_BOLD)
                         new_sp = [(0, len(box), box_st)] + new_sp
                         # Dim the text of completed items
                         if done and rest:
-                            new_sp.append((len(box), len(box) + len(rest), (0, curses.A_DIM)))
-                        vis = box + rest; spans = new_sp
+                            new_sp.append(
+                                (len(box), len(box) + len(rest), (0, curses.A_DIM))
+                            )
+                        vis = box + rest
+                        spans = new_sp
                         pre = indent  # no bullet — checkbox is the marker
                     else:
-                        pre = indent + ('• ' if marker in '-*+' else marker + ' ')
-                    vis   = pre + vis
+                        pre = indent + ("• " if marker in "-*+" else marker + " ")
+                    vis = pre + vis
                     spans = [(s + len(pre), e + len(pre), st) for s, e, st in spans]
                 by_row[r] = (vis, spans)
-            i += 1; continue
+            i += 1
+            continue
 
         i += 1
 
@@ -824,47 +1247,55 @@ def _md_highlight(buf):
     _md_img_cache[key] = images
     return by_row
 
+
 # ── Editor ───────────────────────────────────────────────────────────────────
 
+
 class Editor:
-    def __init__(self, stdscr, filename=None, stdin_content=None, follow=False, follow_fd=None):
+    def __init__(
+        self, stdscr, filename=None, stdin_content=None, follow=False, follow_fd=None
+    ):
         self.stdscr = stdscr
-        self.mode   = Mode.NORMAL
+        self.mode = Mode.NORMAL
         self.height = 0
-        self.width  = 0
+        self.width = 0
 
         # Pane management
         if stdin_content is not None:
-            initial_buf = Buffer.from_string(stdin_content, filename='[stdin]')
+            initial_buf = Buffer.from_string(stdin_content, filename="[stdin]")
         elif filename:
             initial_buf = Buffer.from_file(filename)
         else:
             initial_buf = Buffer()
+            if _DEBUG_OBSERVER_ENABLED:
+                initial_buf.observe(debug_observer, "all")
         p = Pane(initial_buf)
-        self._layout  = _Leaf(p)
-        self._panes   = [p]
-        self._pane_i  = 0
+        self._layout = _Leaf(p)
+        self._panes = [p]
+        self._pane_i = 0
 
         # Editor-global state
-        self.register_text    = ''
-        self.register_linewise= False
-        self.search_pat  = ''
-        self.search_dir  = 1
-        self.cmd_line    = ''
-        self.status_msg  = ''
-        self.status_err  = False
-        self.visual_start= None
-        self.pending_op  = None
-        self.pending_count = ''
-        self.show_numbers  = True
-        self.last_f_char   = None
-        self.last_f_forward= True
-        self.last_f_till   = False
-        self.marks   = {}
+        self.register_text = ""
+        self.register_linewise = False
+        self.search_pat = ""
+        self.search_dir = 1
+        self.cmd_line = ""
+        self.status_msg = ""
+        self.status_err = False
+        self.visual_start = None
+        self.pending_op = None
+        self.pending_count = ""
+        self.show_numbers = True
+        self.last_f_char = None
+        self.last_f_forward = True
+        self.last_f_till = False
+        self.marks = {}
         self.running = True
-        self._pending_sixels: list = []   # [(scr_y, scr_x, path, max_w, max_h)]
-        self._confirm_cb  = None
-        self._confirm_msg = ''
+        self.wrap = False
+        self._pending_sixels: list = []  # [(scr_y, scr_x, path, max_w, max_h)]
+        self._bg_msgs: list = []  # thread-safe status messages from bg threads
+        self._confirm_cb = None
+        self._confirm_msg = ""
         self.hist_sel = 0
         self.hist_top = 0
         self.hist_preview_scroll = 0
@@ -873,36 +1304,36 @@ class Editor:
         self._hist_preview_cache: dict = {}
 
         # Explorer state
-        self.ex_dir     = os.getcwd()
+        self.ex_dir = os.getcwd()
         self.ex_entries = []
-        self.ex_sel     = 0
-        self.ex_top     = 0
-        self._prev_buf    = None
+        self.ex_sel = 0
+        self.ex_top = 0
+        self._prev_buf = None
         self._prev_cursor = None
-        self.ex_search_query  = ''
-        self.ex_searching     = False
+        self.ex_search_query = ""
+        self.ex_searching = False
 
         # Jump stack + picker state
-        self._jump_stack    = []   # list of (row, col) for Ctrl-O
-        self.picker_entries = []   # list of (label, row, col)
-        self.picker_sel     = 0
-        self.picker_top     = 0
-        self.picker_title   = ''
-        self.picker_cb      = None  # if set, called with label on Enter instead of jumping
+        self._jump_stack = []  # list of (row, col) for Ctrl-O
+        self.picker_entries = []  # list of (label, row, col)
+        self.picker_sel = 0
+        self.picker_top = 0
+        self.picker_title = ""
+        self.picker_cb = None  # if set, called with label on Enter instead of jumping
 
         # Follow mode (tail -f)
-        self._follow         = follow
-        self._follow_fd      = follow_fd  # duped non-blocking stdin fd, or None
-        self._follow_file    = None       # open file handle for file-follow
-        self._follow_partial = ''         # incomplete last line not yet ended with \n
+        self._follow = follow
+        self._follow_fd = follow_fd  # duped non-blocking stdin fd, or None
+        self._follow_file = None  # open file handle for file-follow
+        self._follow_partial = ""  # incomplete last line not yet ended with \n
         if follow:
-            stdscr.timeout(250)           # getch returns -1 after 250 ms
+            stdscr.timeout(250)  # getch returns -1 after 250 ms
             if follow_fd is not None:
-                self.buf.filename = '[stdin]'
+                self.buf.filename = "[stdin]"
             elif filename:
                 try:
-                    self._follow_file = open(filename, 'r', errors='replace')
-                    self._follow_file.seek(0, 2)   # start at current EOF
+                    self._follow_file = open(filename, "r", errors="replace")
+                    self._follow_file.seek(0, 2)  # start at current EOF
                 except OSError:
                     pass
 
@@ -910,58 +1341,74 @@ class Editor:
         curses.use_default_colors()
         global HAS_256COLOR
         HAS_256COLOR = curses.COLORS >= 256
-        curses.init_pair(1,  curses.COLOR_BLACK,  curses.COLOR_CYAN)
-        curses.init_pair(2,  curses.COLOR_BLACK,  curses.COLOR_YELLOW)
-        curses.init_pair(3,  curses.COLOR_BLACK,  curses.COLOR_WHITE)
-        curses.init_pair(4,  curses.COLOR_RED,    -1)
-        curses.init_pair(5,  curses.COLOR_CYAN,   -1)
-        curses.init_pair(6,  curses.COLOR_WHITE,  -1)
-        curses.init_pair(7,  curses.COLOR_BLUE,   -1)
-        curses.init_pair(8,  curses.COLOR_BLACK,  curses.COLOR_CYAN)
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(4, curses.COLOR_RED, -1)
+        curses.init_pair(5, curses.COLOR_CYAN, -1)
+        curses.init_pair(6, curses.COLOR_WHITE, -1)
+        curses.init_pair(7, curses.COLOR_BLUE, -1)
+        curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_CYAN)
         # Syntax pairs — loaded from colorscheme config
         cfg = _load_pyvim_config()
-        _apply_scheme(cfg.get('colorscheme', 'default'), cfg.get('colors'))
+        _apply_scheme(cfg.get("colorscheme", "default"), cfg.get("colors"))
         # Diff viewer: green-bg for added, red-bg for removed
-        _diff_256=False
+        _diff_256 = False
         if HAS_256COLOR:
             try:
-                curses.init_pair(20, 255, 22)   # white on dark green
-                curses.init_pair(21, 255, 52)   # white on dark red
-                curses.init_pair(22, 255, 17)   # white on dark blue (hunk header)
-                _diff_256=True
-            except Exception: pass
+                curses.init_pair(20, 255, 22)  # white on dark green
+                curses.init_pair(21, 255, 52)  # white on dark red
+                curses.init_pair(22, 255, 17)  # white on dark blue (hunk header)
+                _diff_256 = True
+            except Exception:
+                pass
         if not _diff_256:
-            curses.init_pair(20, curses.COLOR_GREEN,   -1)
-            curses.init_pair(21, curses.COLOR_RED,     -1)
-            curses.init_pair(22, curses.COLOR_CYAN,    -1)
+            curses.init_pair(20, curses.COLOR_GREEN, -1)
+            curses.init_pair(21, curses.COLOR_RED, -1)
+            curses.init_pair(22, curses.COLOR_CYAN, -1)
 
         self.stdscr.keypad(True)
-        curses.raw(); curses.noecho(); curses.curs_set(1)
+        curses.raw()
+        curses.noecho()
+        curses.curs_set(1)
 
     # ── Pane accessors (properties delegate to active pane) ──────────────────
 
     @property
-    def _pane(self): return self._panes[self._pane_i]
+    def _pane(self):
+        return self._panes[self._pane_i]
 
     @property
-    def buf(self): return self._pane.buf
+    def buf(self):
+        return self._pane.buf
+
     @buf.setter
-    def buf(self, v): self._pane.buf = v
+    def buf(self, v):
+        self._pane.buf = v
 
     @property
-    def cursor(self): return self._pane.cursor
+    def cursor(self):
+        return self._pane.cursor
+
     @cursor.setter
-    def cursor(self, v): self._pane.cursor = v
+    def cursor(self, v):
+        self._pane.cursor = v
 
     @property
-    def top_row(self): return self._pane.top_row
+    def top_row(self):
+        return self._pane.top_row
+
     @top_row.setter
-    def top_row(self, v): self._pane.top_row = v
+    def top_row(self, v):
+        self._pane.top_row = v
 
     @property
-    def left_col(self): return self._pane.left_col
+    def left_col(self):
+        return self._pane.left_col
+
     @left_col.setter
-    def left_col(self, v): self._pane.left_col = v
+    def left_col(self, v):
+        self._pane.left_col = v
 
     def _pane_lnw(self, pane):
         return len(str(pane.buf.line_count())) + 1 if self.show_numbers else 0
@@ -971,11 +1418,14 @@ class Editor:
     def draw(self):
         self.height, self.width = self.stdscr.getmaxyx()
         if self.mode == Mode.EXPLORER:
-            self._draw_explorer(); return
+            self._draw_explorer()
+            return
         if self.mode == Mode.HISTORY:
-            self._draw_history(); return
+            self._draw_history()
+            return
         if self.mode == Mode.PICKER:
-            self._draw_picker(); return
+            self._draw_picker()
+            return
         self._pending_sixels = []
         self.stdscr.erase()
 
@@ -988,20 +1438,20 @@ class Editor:
 
         # Draw dividers
         for kind, dy, dx, dlen in divs:
-            if kind == 'h':
+            if kind == "h":
                 # Find pane whose bottom edge is this divider to show its name
-                label = ''
+                label = ""
                 for p in _lc_panes(self._layout):
                     if p.y + p.height == dy:
-                        fn = p.buf.filename or '[No Name]'
-                        mod = '[+]' if p.buf.modified else ''
-                        label = f' {fn} {mod} '
+                        fn = p.buf.filename or "[No Name]"
+                        mod = "[+]" if p.buf.modified else ""
+                        label = f" {fn} {mod} "
                         break
-                bar = (label + '─' * self.width)[:self.width]
+                bar = (label + "─" * self.width)[: self.width]
                 self._as(dy, 0, bar, curses.color_pair(1))
             else:
                 for i in range(dlen):
-                    self._as(dy + i, dx, '│', curses.color_pair(1))
+                    self._as(dy + i, dx, "│", curses.color_pair(1))
 
         self._draw_statusbar()
         self._place_cursor()
@@ -1017,103 +1467,280 @@ class Editor:
                 result = _encode_sixel(path, max_w, max_h)
                 if result:
                     data, _wc, _hc = result
-                    buf.append(f'\033[{scr_y + 1};{scr_x + 1}H{data}')
+                    buf.append(f"\033[{scr_y + 1};{scr_x + 1}H{data}")
             else:
                 result = _encode_color_text(path, max_w, max_h)
                 if result:
                     lines, _wc, _hc = result
                     for i, line in enumerate(lines):
-                        buf.append(f'\033[{scr_y + 1 + i};{scr_x + 1}H{line}')
+                        buf.append(f"\033[{scr_y + 1 + i};{scr_x + 1}H{line}")
         if buf:
-            os.write(sys.stdout.fileno(), ''.join(buf).encode('utf-8'))
+            os.write(sys.stdout.fileno(), "".join(buf).encode("utf-8"))
 
     def _draw_pane(self, pane, is_active):
         lnw = self._pane_lnw(pane)
-        tw  = pane.width - lnw
-        lc  = pane.left_col
+        tw = pane.width - lnw
+        lc = pane.left_col
 
         vis_rows = set()
         vis_range = {}
-        if is_active and self.mode in (Mode.VISUAL, Mode.VISUAL_LINE) and self.visual_start:
+        if (
+            is_active
+            and self.mode in (Mode.VISUAL, Mode.VISUAL_LINE)
+            and self.visual_start
+        ):
             sr, sc = self.visual_start
             er, ec = pane.cursor.row, pane.cursor.col
-            if (sr, sc) > (er, ec): sr, sc, er, ec = er, ec, sr, sc
-            for r in range(sr, er+1):
+            if (sr, sc) > (er, ec):
+                sr, sc, er, ec = er, ec, sr, sc
+            for r in range(sr, er + 1):
                 vis_rows.add(r)
                 if self.mode == Mode.VISUAL_LINE:
                     vis_range[r] = None
                 else:
                     ll = len(pane.buf.get_line(r))
-                    if sr == er:     vis_range[r] = (sc, ec)
-                    elif r == sr:    vis_range[r] = (sc, ll)
-                    elif r == er:    vis_range[r] = (0, ec)
-                    else:            vis_range[r] = None
+                    if sr == er:
+                        vis_range[r] = (sc, ec)
+                    elif r == sr:
+                        vis_range[r] = (sc, ll)
+                    elif r == er:
+                        vis_range[r] = (0, ec)
+                    else:
+                        vis_range[r] = None
 
         is_md = _is_markdown(pane.buf.filename)
         in_insert = is_active and self.mode == Mode.INSERT
-        md_table = (_md_highlight(pane.buf) if is_md else None)
-        img_map  = (_md_images(pane.buf) if is_md else {})
-        hl_table = (None if is_md else
-                    _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
+        md_table = _md_highlight(pane.buf) if is_md else None
+        img_map = _md_images(pane.buf) if is_md else {}
+        hl_table = (
+            None
+            if is_md
+            else _pg_highlight(pane.buf)
+            if _detect_lang(pane.buf.filename)
+            else None
+        )
 
         try:
-            spat = re.compile(self.search_pat,
-                re.IGNORECASE if self.search_pat == self.search_pat.lower() else 0
-            ) if self.search_pat else None
+            spat = (
+                re.compile(
+                    self.search_pat,
+                    re.IGNORECASE if self.search_pat == self.search_pat.lower() else 0,
+                )
+                if self.search_pat
+                else None
+            )
         except re.error:
             spat = None
 
         view_h = self._pane_view_height(pane)
-        for sy in range(view_h):
-            br = pane.top_row + sy
+        wrap = self.wrap and not pane.is_chat
+
+        sy = 0
+        br = pane.top_row
+        while sy < view_h:
             scr_y = pane.y + sy
             scr_x = pane.x
 
             if br >= pane.buf.line_count():
-                self._as(scr_y, scr_x, '~', curses.A_DIM); continue
+                if not pane.is_chat:
+                    self._as(scr_y, scr_x, "~", curses.A_DIM)
+                sy += 1
+                br += 1
+                continue
 
-            if self.show_numbers:
-                ns = str(br+1).rjust(lnw-1) + ' '
-                na = (curses.color_pair(6)|curses.A_BOLD
-                      if is_active and br == pane.cursor.row
-                      else curses.color_pair(5))
+            if self.show_numbers and not pane.is_chat:
+                ns = str(br + 1).rjust(lnw - 1) + " "
+                na = (
+                    curses.color_pair(6) | curses.A_BOLD
+                    if is_active and br == pane.cursor.row
+                    else curses.color_pair(5)
+                )
                 self._as(scr_y, scr_x, ns, na)
 
             line = pane.buf.get_line(br)
             if br in img_map and not (is_active and br == pane.cursor.row):
                 path, _alt = img_map[br]
                 self._pending_sixels.append(
-                    (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
-            if md_table:
+                    (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2)
+                )
+
+            if pane.is_chat:
+                self._draw_chat_line(scr_y, pane, br, line)
+                sy += 1
+                br += 1
+            elif wrap and len(line) > tw:
+                # Wrap: emit one screen row per tw-wide chunk
+                hl_row = hl_table[br] if hl_table and br < len(hl_table) else []
+                chunks = [line[i : i + tw] for i in range(0, max(1, len(line)), tw)]
+                for ci, chunk in enumerate(chunks):
+                    if sy >= view_h:
+                        break
+                    chunk_lc = ci * tw
+                    # shift hl spans into chunk-local coordinates
+                    chunk_hl = [
+                        (max(0, s - chunk_lc), min(tw, e - chunk_lc), a)
+                        for s, e, a in hl_row
+                        if e > chunk_lc and s < chunk_lc + tw
+                    ]
+                    self._render_line(
+                        pane.y + sy,
+                        scr_x + lnw,
+                        chunk,
+                        0,
+                        tw,
+                        vis_rows,
+                        vis_range,
+                        br,
+                        spat,
+                        chunk_hl,
+                        is_active,
+                    )
+                    sy += 1
+                br += 1
+            elif md_table:
                 is_cur = is_active and br == pane.cursor.row
-                # Table rows in normal mode: always show rendered (cell nav keeps
-                # cursor at cell-start so column accuracy isn't needed).
-                # Insert mode or non-table cursor row: show raw for accurate editing.
                 show_raw_cur = is_cur and (in_insert or not _is_table_row(line))
                 raw = show_raw_cur or br in vis_rows
-                display, hl_row = (line, []) if raw else (
-                    md_table[br] if br < len(md_table) else (line, []))
+                display, hl_row = (
+                    (line, [])
+                    if raw
+                    else (md_table[br] if br < len(md_table) else (line, []))
+                )
+                self._render_line(
+                    scr_y,
+                    scr_x + lnw,
+                    display,
+                    lc,
+                    tw,
+                    vis_rows,
+                    vis_range,
+                    br,
+                    spat,
+                    hl_row,
+                    is_active,
+                )
+                sy += 1
+                br += 1
             else:
-                display = line
-                hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
-            self._render_line(scr_y, scr_x + lnw, display, lc, tw,
-                              vis_rows, vis_range, br, spat, hl_row, is_active)
+                hl_row = hl_table[br] if hl_table and br < len(hl_table) else []
+                self._render_line(
+                    scr_y,
+                    scr_x + lnw,
+                    line,
+                    lc,
+                    tw,
+                    vis_rows,
+                    vis_range,
+                    br,
+                    spat,
+                    hl_row,
+                    is_active,
+                )
+                sy += 1
+                br += 1
 
-        # Chat pane: render input line at the bottom of this pane
+        # Chat pane: input bar pinned to the bottom of this pane
         if pane.is_chat:
-            inp_y = pane.y + pane.height - 1
-            if pane.chat_streaming:
-                inp_str = ' ● '
-            elif is_active and self.mode == Mode.CHAT:
-                inp_str = f'> {pane.chat_input}'
-            else:
-                inp_str = f'> {pane.chat_input}' if pane.chat_input else '> '
-            inp_str = inp_str[:pane.width].ljust(pane.width)
-            attr = curses.color_pair(1) | curses.A_BOLD if is_active else curses.color_pair(1)
-            self._as(inp_y, pane.x, inp_str, attr)
+            self._draw_chat_input(pane, is_active)
 
-    def _render_line(self, sy, sx, line, lc, tw, vis_rows, vis_range, br,
-                     spat, hl_row, is_active):
+    def _draw_chat_line(self, scr_y, pane, br, line):
+        """Render one line of a chat pane with speaker-aware styling."""
+        w = pane.width
+        sx = pane.x
+        if line.startswith("You: "):
+            label = "You: "
+            rest = line[len(label) :]
+            self._as(scr_y, sx, label, curses.color_pair(6) | curses.A_BOLD)
+            self._as(scr_y, sx + len(label), rest[: w - len(label)])
+        elif line.startswith("Claude: "):
+            label = "Claude: "
+            rest = line[len(label) :]
+            self._as(scr_y, sx, label, curses.color_pair(9) | curses.A_BOLD)
+            self._as(scr_y, sx + len(label), rest[: w - len(label)])
+        elif line.startswith("# "):
+            self._as(scr_y, sx, line[:w], curses.color_pair(1) | curses.A_BOLD)
+        else:
+            self._as(scr_y, sx, line[:w])
+
+    def _draw_chat_input(self, pane, is_active):
+        """Render a bordered, word-wrapped input box pinned to the bottom of the chat pane."""
+        box_h = self._chat_box_height(pane)
+        box_y = pane.y + pane.height - box_h
+        w = pane.width
+        inner_w = max(1, w - 2)
+
+        if is_active:
+            border_attr = curses.color_pair(6) | curses.A_BOLD
+            text_attr = 0
+        else:
+            border_attr = curses.color_pair(1)
+            text_attr = curses.A_DIM
+
+        if pane.chat_streaming:
+            dots = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            dot = dots[int(time.time() * 8) % len(dots)]
+            label = f" {dot} generating…"
+            self._as(box_y, pane.x, ("╭" + "─" * inner_w + "╮")[:w], border_attr)
+            self._as(
+                box_y + 1,
+                pane.x,
+                ("│" + label.ljust(inner_w) + "│")[:w],
+                curses.color_pair(9),
+            )
+            for r in range(2, box_h - 1):
+                self._as(
+                    box_y + r, pane.x, ("│" + " " * inner_w + "│")[:w], border_attr
+                )
+            self._as(
+                box_y + box_h - 1, pane.x, ("╰" + "─" * inner_w + "╯")[:w], border_attr
+            )
+            return
+
+        # Word-wrap the input text into inner_w-wide lines
+        raw_lines = pane.chat_input.split("\n") if pane.chat_input else [""]
+        wrapped: list[str] = []
+        for raw in raw_lines:
+            if not raw:
+                wrapped.append("")
+            else:
+                for i in range(0, max(1, len(raw)), inner_w):
+                    wrapped.append(raw[i : i + inner_w])
+
+        inner_rows = box_h - 2  # rows between the borders
+        # Show the tail of the wrapped lines so the cursor is always visible
+        display = wrapped[-inner_rows:] if len(wrapped) > inner_rows else wrapped
+
+        # Top border with hint
+        hint = " Enter to send · Esc to browse "
+        top_fill = inner_w - len(hint)
+        if top_fill >= 0 and is_active and self.mode == Mode.CHAT:
+            top_bar = (
+                "─" * (top_fill // 2)
+                + hint
+                + "─" * (inner_w - top_fill // 2 - len(hint))
+            )
+        else:
+            top_bar = "─" * inner_w
+        self._as(box_y, pane.x, ("╭" + top_bar + "╮")[:w], border_attr)
+
+        # Text rows
+        for r in range(inner_rows):
+            row_text = display[r] if r < len(display) else ""
+            self._as(
+                box_y + 1 + r,
+                pane.x,
+                ("│ " + row_text.ljust(inner_w - 1) + "│")[:w],
+                text_attr,
+            )
+
+        # Bottom border
+        self._as(
+            box_y + box_h - 1, pane.x, ("╰" + "─" * inner_w + "╯")[:w], border_attr
+        )
+
+    def _render_line(
+        self, sy, sx, line, lc, tw, vis_rows, vis_range, br, spat, hl_row, is_active
+    ):
         # Build span list: (start_in_line, end_in_line, attr)
         spans = []
 
@@ -1134,7 +1761,7 @@ class Editor:
                 spans.append((0, len(line), curses.color_pair(3)))
             else:
                 sc2, ec2 = rng
-                spans.append((sc2, ec2+1, curses.color_pair(3)))
+                spans.append((sc2, ec2 + 1, curses.color_pair(3)))
 
         # Sort spans so that higher-priority (later-added) ones can override
         # We draw in priority order: paint low→high, last wins per cell
@@ -1143,7 +1770,7 @@ class Editor:
         attrs = [0] * vis_len
 
         for ts, te, attr in spans:
-            for i in range(max(0, ts-lc), min(vis_len, te-lc)):
+            for i in range(max(0, ts - lc), min(vis_len, te - lc)):
                 attrs[i] = attr
 
         # Draw character by character (group consecutive same-attr runs)
@@ -1153,70 +1780,108 @@ class Editor:
         while i < vis_len and col_in_line < len(line):
             a = attrs[i]
             j = i + 1
-            while j < vis_len and attrs[j] == a and col_in_line + (j-i) < len(line):
+            while j < vis_len and attrs[j] == a and col_in_line + (j - i) < len(line):
                 j += 1
-            seg = line[col_in_line: col_in_line + (j-i)]
+            seg = line[col_in_line : col_in_line + (j - i)]
             if a:
                 self._as(sy, scr_col, seg, a)
             else:
                 self._as(sy, scr_col, seg)
-            scr_col += len(seg); col_in_line += len(seg); i = j
+            scr_col += len(seg)
+            col_in_line += len(seg)
+            i = j
 
         # Fill remainder with spaces (clear to end of pane width)
-        rest = line[lc + i: lc + tw] if lc + i < len(line) else ''
+        rest = line[lc + i : lc + tw] if lc + i < len(line) else ""
         if rest:
             self._as(sy, scr_col, rest)
 
     def _draw_statusbar(self):
-        _tbl_nm = (self.mode == Mode.NORMAL and
-                   _is_table_row(self.buf.get_line(self.cursor.row)))
+        _tbl_nm = self.mode == Mode.NORMAL and _is_table_row(
+            self.buf.get_line(self.cursor.row)
+        )
         ml = {
-            Mode.NORMAL:' TABLE  ' if _tbl_nm else ' NORMAL ',
-            Mode.INSERT:' INSERT ',
-            Mode.VISUAL:' VISUAL ', Mode.VISUAL_LINE:' V-LINE ',
-            Mode.COMMAND:' COMMAND', Mode.SEARCH:' SEARCH ',
-            Mode.CHAT:  '  CHAT  ',
-        }.get(self.mode, ' NORMAL ')
-        fname = self.buf.filename or '[No Name]'
-        mod   = ' [+]' if self.buf.modified else ''
-        pos   = f' {self.cursor.row+1}:{self.cursor.col+1} '
+            Mode.NORMAL: " TABLE  " if _tbl_nm else " NORMAL ",
+            Mode.INSERT: " INSERT ",
+            Mode.VISUAL: " VISUAL ",
+            Mode.VISUAL_LINE: " V-LINE ",
+            Mode.COMMAND: " COMMAND",
+            Mode.SEARCH: " SEARCH ",
+            Mode.CHAT: "  CHAT  ",
+        }.get(self.mode, " NORMAL ")
+        fname = self.buf.filename or "[No Name]"
+        mod = " [+]" if self.buf.modified else ""
+        pos = f" {self.cursor.row + 1}:{self.cursor.col + 1} "
 
         if self._confirm_cb is not None:
-            self._as(self.height-1, 0, (self._confirm_msg+' '*self.width)[:self.width-1], curses.color_pair(4))
+            self._as(
+                self.height - 1,
+                0,
+                (self._confirm_msg + " " * self.width)[: self.width - 1],
+                curses.color_pair(4),
+            )
         elif self.mode in (Mode.COMMAND, Mode.SEARCH):
-            self._as(self.height-1, 0, (self.cmd_line+' '*self.width)[:self.width-1])
+            self._as(
+                self.height - 1, 0, (self.cmd_line + " " * self.width)[: self.width - 1]
+            )
         elif self.status_msg:
-            self._as(self.height-1, 0,
-                     (self.status_msg+' '*self.width)[:self.width-1],
-                     curses.color_pair(4) if self.status_err else 0)
+            self._as(
+                self.height - 1,
+                0,
+                (self.status_msg + " " * self.width)[: self.width - 1],
+                curses.color_pair(4) if self.status_err else 0,
+            )
         else:
-            info = f' {ml}  {fname}{mod}'
-            bar  = info.ljust(self.width-len(pos)-1) + pos
-            self._as(self.height-1, 0, bar[:self.width-1], curses.color_pair(1))
+            info = f" {ml}  {fname}{mod}"
+            bar = info.ljust(self.width - len(pos) - 1) + pos
+            self._as(self.height - 1, 0, bar[: self.width - 1], curses.color_pair(1))
 
-        cnt  = f' {self.pending_count}' if self.pending_count else ''
-        bar2 = (ml+cnt).ljust(self.width-1)
-        self._as(self.height-2, 0, bar2[:self.width-1], curses.color_pair(1))
+        cnt = f" {self.pending_count}" if self.pending_count else ""
+        bar2 = (ml + cnt).ljust(self.width - 1)
+        self._as(self.height - 2, 0, bar2[: self.width - 1], curses.color_pair(1))
 
     def _place_cursor(self):
         if self.mode in (Mode.COMMAND, Mode.SEARCH):
-            try: self.stdscr.move(self.height-1, min(len(self.cmd_line), self.width-1))
-            except curses.error: pass
+            try:
+                self.stdscr.move(
+                    self.height - 1, min(len(self.cmd_line), self.width - 1)
+                )
+            except curses.error:
+                pass
             return
         if self.mode == Mode.CHAT and self._pane.is_chat:
             p = self._pane
-            cx = p.x + min(2 + len(p.chat_input), p.width - 1)
-            cy = p.y + p.height - 1
-            try: self.stdscr.move(cy, cx)
-            except curses.error: pass
+            box_h = self._chat_box_height(p)
+            inner_w = max(1, p.width - 2)
+            # cursor row = last wrapped line inside the box (accounting for scroll)
+            raw_lines = p.chat_input.split("\n") if p.chat_input else [""]
+            wrapped: list[str] = []
+            for raw in raw_lines:
+                if not raw:
+                    wrapped.append("")
+                else:
+                    for i in range(0, max(1, len(raw)), inner_w):
+                        wrapped.append(raw[i : i + inner_w])
+            inner_rows = box_h - 2
+            cur_wrapped_row = len(wrapped) - 1
+            display_row = min(cur_wrapped_row, inner_rows - 1)
+            last_line = wrapped[-1] if wrapped else ""
+            cy = p.y + p.height - box_h + 1 + display_row
+            cx = p.x + 2 + len(last_line)  # 2 = '│ '
+            try:
+                self.stdscr.move(
+                    min(cy, p.y + p.height - 2), min(cx, p.x + p.width - 2)
+                )
+            except curses.error:
+                pass
             return
         p = self._pane
         lnw = self._pane_lnw(p)
-        sy  = p.y + p.cursor.row - p.top_row
+        sy = p.y + p.cursor.row - p.top_row
         col = p.cursor.col
         # TABLE mode: cursor.col is a buffer col, but the screen shows rendered
         # box-drawing where cells are padded to equal widths.  Map to visual col.
-        if (self.mode == Mode.NORMAL and _is_markdown(p.buf.filename)):
+        if self.mode == Mode.NORMAL and _is_markdown(p.buf.filename):
             raw = p.buf.get_line(p.cursor.row)
             if _is_table_row(raw):
                 md = _md_highlight(p.buf)
@@ -1224,61 +1889,95 @@ class Editor:
                     vis_line, _ = md[p.cursor.row]
                     info = _table_cell_at(raw, col)
                     if info:
-                        pipes = [i for i, c in enumerate(vis_line) if c == '│']
+                        pipes = [i for i, c in enumerate(vis_line) if c == "│"]
                         ci = info[0]
                         if ci + 1 < len(pipes):
                             col = pipes[ci] + 2  # land after '│ '
         sx = p.x + lnw + col - p.left_col
         try:
-            self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)),
-                             max(p.x, min(sx, p.x+p.width-1)))
-        except curses.error: pass
+            self.stdscr.move(
+                max(p.y, min(sy, p.y + p.height - 1)),
+                max(p.x, min(sx, p.x + p.width - 1)),
+            )
+        except curses.error:
+            pass
 
     def _as(self, y, x, text, attr=0):
         try:
-            if y < 0 or y >= self.height or x < 0 or x >= self.width: return
+            if y < 0 or y >= self.height or x < 0 or x >= self.width:
+                return
             ml = self.width - x
-            if ml <= 0: return
-            if attr: self.stdscr.addstr(y, x, text[:ml], attr)
-            else:    self.stdscr.addstr(y, x, text[:ml])
-        except curses.error: pass
+            if ml <= 0:
+                return
+            if attr:
+                self.stdscr.addstr(y, x, text[:ml], attr)
+            else:
+                self.stdscr.addstr(y, x, text[:ml])
+        except curses.error:
+            pass
 
     # ── Cursor / scroll ───────────────────────────────────────────────────────
 
     def _clamp(self):
         p = self._pane
-        p.cursor.row = max(0, min(p.cursor.row, p.buf.line_count()-1))
+        p.cursor.row = max(0, min(p.cursor.row, p.buf.line_count() - 1))
         line = p.buf.get_line(p.cursor.row)
-        mc = len(line) if self.mode == Mode.INSERT else max(0, len(line)-1)
+        mc = len(line) if self.mode == Mode.INSERT else max(0, len(line) - 1)
         p.cursor.col = max(0, min(p.cursor.col, mc))
 
     def _scroll(self):
         p = self._pane
         th = self._pane_view_height(p)
         lnw = self._pane_lnw(p)
-        tw  = p.width - lnw
-        if p.cursor.row < p.top_row: p.top_row = p.cursor.row
-        elif p.cursor.row >= p.top_row + th: p.top_row = p.cursor.row - th + 1
-        if p.cursor.col < p.left_col: p.left_col = max(0, p.cursor.col-5)
-        elif p.cursor.col >= p.left_col + tw: p.left_col = p.cursor.col - tw + 6
+        tw = p.width - lnw
+
+        if p.cursor.row < p.top_row:
+            p.top_row = p.cursor.row
+        elif self.wrap and not p.is_chat and tw > 0:
+            # Count screen rows from top_row through cursor.row; scroll if they overflow
+            used = sum(
+                max(1, (len(p.buf.get_line(r)) + tw - 1) // tw)
+                for r in range(p.top_row, p.cursor.row + 1)
+            )
+            if used > th:
+                # Walk backwards from cursor to find new top_row
+                budget = th
+                r = p.cursor.row
+                while r > 0:
+                    cost = max(1, (len(p.buf.get_line(r)) + tw - 1) // tw)
+                    if budget - cost < 1:
+                        break
+                    budget -= cost
+                    r -= 1
+                p.top_row = r
+        else:
+            if p.cursor.row >= p.top_row + th:
+                p.top_row = p.cursor.row - th + 1
+
+        if not (self.wrap and not p.is_chat):
+            if p.cursor.col < p.left_col:
+                p.left_col = max(0, p.cursor.col - 5)
+            elif p.cursor.col >= p.left_col + tw:
+                p.left_col = p.cursor.col - tw + 6
 
     def _move(self, dr, dc):
         p = self._pane
         if dr:
-            p.cursor.row = max(0, min(p.cursor.row+dr, p.buf.line_count()-1))
+            p.cursor.row = max(0, min(p.cursor.row + dr, p.buf.line_count() - 1))
             line = p.buf.get_line(p.cursor.row)
-            mc = max(0, len(line)-(0 if self.mode==Mode.INSERT else 1))
+            mc = max(0, len(line) - (0 if self.mode == Mode.INSERT else 1))
             p.cursor.col = min(p.cursor.col_want, mc)
         else:
             line = p.buf.get_line(p.cursor.row)
-            mc = max(0, len(line)-(0 if self.mode==Mode.INSERT else 1))
-            p.cursor.col = max(0, min(p.cursor.col+dc, mc))
+            mc = max(0, len(line) - (0 if self.mode == Mode.INSERT else 1))
+            p.cursor.col = max(0, min(p.cursor.col + dc, mc))
             p.cursor.col_want = p.cursor.col
 
     def _cell_next(self):
         line = self.buf.get_line(self.cursor.row)
         cells = _table_cells(line)
-        if not cells: return
+        if not cells:
+            return
         info = _table_cell_at(line, self.cursor.col)
         idx = info[0] if info else -1
         if idx + 1 < len(cells):
@@ -1288,12 +1987,14 @@ class Editor:
             if nr < self.buf.line_count():
                 self.cursor.row = nr
                 c2 = _table_cells(self.buf.get_line(nr))
-                if c2: self.cursor.col = c2[0][0]
+                if c2:
+                    self.cursor.col = c2[0][0]
 
     def _cell_prev(self):
         line = self.buf.get_line(self.cursor.row)
         cells = _table_cells(line)
-        if not cells: return
+        if not cells:
+            return
         info = _table_cell_at(line, self.cursor.col)
         idx = info[0] if info else len(cells)
         if idx > 0:
@@ -1303,7 +2004,8 @@ class Editor:
             if nr >= 0:
                 self.cursor.row = nr
                 c2 = _table_cells(self.buf.get_line(nr))
-                if c2: self.cursor.col = c2[-1][0]
+                if c2:
+                    self.cursor.col = c2[-1][0]
 
     def _cell_down(self):
         line = self.buf.get_line(self.cursor.row)
@@ -1312,7 +2014,9 @@ class Editor:
         nr = self.cursor.row + 1
         while nr < self.buf.line_count():
             nl = self.buf.get_line(nr)
-            if _TABLE_SEP_RE.match(nl): nr += 1; continue
+            if _TABLE_SEP_RE.match(nl):
+                nr += 1
+                continue
             c2 = _table_cells(nl)
             if c2:
                 self.cursor.row = nr
@@ -1328,7 +2032,9 @@ class Editor:
         nr = self.cursor.row - 1
         while nr >= 0:
             nl = self.buf.get_line(nr)
-            if _TABLE_SEP_RE.match(nl): nr -= 1; continue
+            if _TABLE_SEP_RE.match(nl):
+                nr -= 1
+                continue
             c2 = _table_cells(nl)
             if c2:
                 self.cursor.row = nr
@@ -1341,13 +2047,16 @@ class Editor:
         r = self.cursor.row if row is None else row
         line = self.buf.get_line(r)
         for i, c in enumerate(line):
-            if not c.isspace(): self.cursor.col = i; return
+            if not c.isspace():
+                self.cursor.col = i
+                return
         self.cursor.col = 0
 
     # ── Word motions ──────────────────────────────────────────────────────────
 
     @staticmethod
-    def _is_word(c): return c.isalnum() or c == '_'
+    def _is_word(c):
+        return c.isalnum() or c == "_"
 
     def _word_fwd(self, big=False):
         test = (lambda c: not c.isspace()) if big else self._is_word
@@ -1355,32 +2064,49 @@ class Editor:
         line = self.buf.get_line(row)
         if col < len(line):
             if test(line[col]):
-                while col < len(line) and test(line[col]): col += 1
+                while col < len(line) and test(line[col]):
+                    col += 1
             else:
-                while col < len(line) and not line[col].isspace() and not test(line[col]): col += 1
+                while (
+                    col < len(line) and not line[col].isspace() and not test(line[col])
+                ):
+                    col += 1
         while True:
-            while col < len(line) and line[col].isspace(): col += 1
-            if col < len(line): break
-            if row+1 >= self.buf.line_count(): break
-            row += 1; line = self.buf.get_line(row); col = 0
+            while col < len(line) and line[col].isspace():
+                col += 1
+            if col < len(line):
+                break
+            if row + 1 >= self.buf.line_count():
+                break
+            row += 1
+            line = self.buf.get_line(row)
+            col = 0
         self.cursor.row = row
-        self.cursor.col = min(col, max(0, len(self.buf.get_line(row))-1))
+        self.cursor.col = min(col, max(0, len(self.buf.get_line(row)) - 1))
 
     def _word_bwd(self, big=False):
         test = (lambda c: not c.isspace()) if big else self._is_word
         row, col = self.cursor.row, self.cursor.col
         if col == 0:
-            if row == 0: return
-            row -= 1; col = len(self.buf.get_line(row))
+            if row == 0:
+                return
+            row -= 1
+            col = len(self.buf.get_line(row))
         col -= 1
         line = self.buf.get_line(row)
-        while col > 0 and line[col].isspace(): col -= 1
+        while col > 0 and line[col].isspace():
+            col -= 1
         if col >= 0 and not line[col].isspace():
             if test(line[col]):
-                while col > 0 and test(line[col-1]): col -= 1
+                while col > 0 and test(line[col - 1]):
+                    col -= 1
             else:
-                while col > 0 and not line[col-1].isspace() and not test(line[col-1]): col -= 1
-        self.cursor.row = row; self.cursor.col = col
+                while (
+                    col > 0 and not line[col - 1].isspace() and not test(line[col - 1])
+                ):
+                    col -= 1
+        self.cursor.row = row
+        self.cursor.col = col
 
     def _word_end(self, big=False):
         test = (lambda c: not c.isspace()) if big else self._is_word
@@ -1388,210 +2114,325 @@ class Editor:
         line = self.buf.get_line(row)
         col += 1
         if col >= len(line):
-            if row+1 < self.buf.line_count(): row += 1; line = self.buf.get_line(row); col = 0
-        while col < len(line) and line[col].isspace(): col += 1
+            if row + 1 < self.buf.line_count():
+                row += 1
+                line = self.buf.get_line(row)
+                col = 0
+        while col < len(line) and line[col].isspace():
+            col += 1
         if col < len(line):
             if test(line[col]):
-                while col+1 < len(line) and test(line[col+1]): col += 1
+                while col + 1 < len(line) and test(line[col + 1]):
+                    col += 1
             else:
-                while col+1 < len(line) and not line[col+1].isspace() and not test(line[col+1]): col += 1
-        self.cursor.row = row; self.cursor.col = col
+                while (
+                    col + 1 < len(line)
+                    and not line[col + 1].isspace()
+                    and not test(line[col + 1])
+                ):
+                    col += 1
+        self.cursor.row = row
+        self.cursor.col = col
 
     def _para_fwd(self):
         r = self.cursor.row
-        while r < self.buf.line_count()-1 and self.buf.get_line(r).strip(): r += 1
-        while r < self.buf.line_count()-1 and not self.buf.get_line(r).strip(): r += 1
-        self.cursor.row = r; self._first_nonblank()
+        while r < self.buf.line_count() - 1 and self.buf.get_line(r).strip():
+            r += 1
+        while r < self.buf.line_count() - 1 and not self.buf.get_line(r).strip():
+            r += 1
+        self.cursor.row = r
+        self._first_nonblank()
 
     def _para_bwd(self):
         r = self.cursor.row
-        while r > 0 and self.buf.get_line(r).strip(): r -= 1
-        while r > 0 and not self.buf.get_line(r-1).strip(): r -= 1
-        self.cursor.row = r; self._first_nonblank()
+        while r > 0 and self.buf.get_line(r).strip():
+            r -= 1
+        while r > 0 and not self.buf.get_line(r - 1).strip():
+            r -= 1
+        self.cursor.row = r
+        self._first_nonblank()
 
     # ── Search ────────────────────────────────────────────────────────────────
 
     def _search_next(self, direction):
-        if not self.search_pat: return
+        if not self.search_pat:
+            return
         try:
-            flags = re.IGNORECASE if self.search_pat==self.search_pat.lower() else 0
+            flags = re.IGNORECASE if self.search_pat == self.search_pat.lower() else 0
             pat = re.compile(self.search_pat, flags)
         except re.error:
-            self.status_msg = f'Bad regex: {self.search_pat}'; return
+            self.status_msg = f"Bad regex: {self.search_pat}"
+            return
         row, col = self.cursor.row, self.cursor.col
         if direction > 0:
             for r in range(row, self.buf.line_count()):
-                m = pat.search(self.buf.get_line(r), col+1 if r==row else 0)
-                if m: self.cursor.row, self.cursor.col = r, m.start(); return
-            for r in range(0, row+1):
+                m = pat.search(self.buf.get_line(r), col + 1 if r == row else 0)
+                if m:
+                    self.cursor.row, self.cursor.col = r, m.start()
+                    return
+            for r in range(0, row + 1):
                 m = pat.search(self.buf.get_line(r))
-                if m: self.cursor.row, self.cursor.col = r, m.start(); self.status_msg='search wrapped'; return
+                if m:
+                    self.cursor.row, self.cursor.col = r, m.start()
+                    self.status_msg = "search wrapped"
+                    return
         else:
             for r in range(row, -1, -1):
-                ms = [m for m in pat.finditer(self.buf.get_line(r)) if r<row or m.start()<col]
-                if ms: m=ms[-1]; self.cursor.row,self.cursor.col=r,m.start(); return
-            for r in range(self.buf.line_count()-1, row-1, -1):
+                ms = [
+                    m
+                    for m in pat.finditer(self.buf.get_line(r))
+                    if r < row or m.start() < col
+                ]
+                if ms:
+                    m = ms[-1]
+                    self.cursor.row, self.cursor.col = r, m.start()
+                    return
+            for r in range(self.buf.line_count() - 1, row - 1, -1):
                 ms = list(pat.finditer(self.buf.get_line(r)))
-                if r==row: ms=[m for m in ms if m.start()>=col]
-                if ms: m=ms[-1]; self.cursor.row,self.cursor.col=r,m.start(); self.status_msg='search wrapped'; return
-        self.status_msg = f'Pattern not found: {self.search_pat}'
+                if r == row:
+                    ms = [m for m in ms if m.start() >= col]
+                if ms:
+                    m = ms[-1]
+                    self.cursor.row, self.cursor.col = r, m.start()
+                    self.status_msg = "search wrapped"
+                    return
+        self.status_msg = f"Pattern not found: {self.search_pat}"
 
     # ── Operators ─────────────────────────────────────────────────────────────
 
     def _op_lines(self, op, r1, r2):
-        r1=max(0,r1); r2=min(self.buf.line_count()-1,r2)
-        self.register_text = '\n'.join(self.buf.lines[r1:r2+1])
+        r1 = max(0, r1)
+        r2 = min(self.buf.line_count() - 1, r2)
+        self.register_text = "\n".join(self.buf.lines[r1 : r2 + 1])
         self.register_linewise = True
-        if op in ('d','c'):
+        if op in ("d", "c"):
             self.buf.save_undo()
-            n = r2-r1+1
+            n = r2 - r1 + 1
             for _ in range(n):
-                if self.buf.line_count()>1: self.buf.delete_line(r1)
-                else: self.buf.set_line(0,'')
-            self.cursor.row = min(r1, self.buf.line_count()-1)
+                if self.buf.line_count() > 1:
+                    self.buf.delete_line(r1)
+                else:
+                    self.buf.set_line(0, "")
+            self.cursor.row = min(r1, self.buf.line_count() - 1)
             self._first_nonblank()
-            if op=='c':
-                ind=self._indent(self.cursor.row)
-                self.buf.save_undo(); self.buf.insert_line(self.cursor.row,ind)
-                self.buf.delete_line(self.cursor.row+1); self.cursor.col=len(ind)
-                self.mode=Mode.INSERT
-        elif op=='y':
-            self.cursor.row=r1; self._first_nonblank()
-            self.status_msg=f'Yanked {r2-r1+1} lines'
+            if op == "c":
+                ind = self._indent(self.cursor.row)
+                self.buf.save_undo()
+                self.buf.insert_line(self.cursor.row, ind)
+                self.buf.delete_line(self.cursor.row + 1)
+                self.cursor.col = len(ind)
+                self.mode = Mode.INSERT
+        elif op == "y":
+            self.cursor.row = r1
+            self._first_nonblank()
+            self.status_msg = f"Yanked {r2 - r1 + 1} lines"
 
     def _op_range(self, op, r1, c1, r2, c2):
-        if r1==r2:
-            line=self.buf.get_line(r1); self.register_text=line[c1:c2]; self.register_linewise=False
-            if op in ('d','c'):
-                self.buf.save_undo(); self.buf.set_line(r1,line[:c1]+line[c2:])
-                self.cursor.row,self.cursor.col=r1,c1
-                if op=='c': self.mode=Mode.INSERT
-        else:
-            parts=[self.buf.get_line(r1)[c1:]]
-            for r in range(r1+1,r2): parts.append(self.buf.get_line(r))
-            parts.append(self.buf.get_line(r2)[:c2])
-            self.register_text='\n'.join(parts); self.register_linewise=False
-            if op in ('d','c'):
+        if r1 == r2:
+            line = self.buf.get_line(r1)
+            self.register_text = line[c1:c2]
+            self.register_linewise = False
+            if op in ("d", "c"):
                 self.buf.save_undo()
-                nl=self.buf.get_line(r1)[:c1]+self.buf.get_line(r2)[c2:]
-                self.buf.set_line(r1,nl)
-                for r in range(r2,r1,-1): self.buf.delete_line(r)
-                self.cursor.row,self.cursor.col=r1,c1
-                if op=='c': self.mode=Mode.INSERT
+                self.buf.set_line(r1, line[:c1] + line[c2:])
+                self.cursor.row, self.cursor.col = r1, c1
+                if op == "c":
+                    self.mode = Mode.INSERT
+        else:
+            parts = [self.buf.get_line(r1)[c1:]]
+            for r in range(r1 + 1, r2):
+                parts.append(self.buf.get_line(r))
+            parts.append(self.buf.get_line(r2)[:c2])
+            self.register_text = "\n".join(parts)
+            self.register_linewise = False
+            if op in ("d", "c"):
+                self.buf.save_undo()
+                nl = self.buf.get_line(r1)[:c1] + self.buf.get_line(r2)[c2:]
+                self.buf.set_line(r1, nl)
+                for r in range(r2, r1, -1):
+                    self.buf.delete_line(r)
+                self.cursor.row, self.cursor.col = r1, c1
+                if op == "c":
+                    self.mode = Mode.INSERT
 
     # ── Text objects ──────────────────────────────────────────────────────────
 
     def _text_object(self, kind, obj):
-        row,col=self.cursor.row,self.cursor.col; line=self.buf.get_line(row)
-        if obj in ('w','W'):
-            test=(lambda c:not c.isspace()) if obj=='W' else self._is_word
-            s=col
-            while s>0 and test(line[s-1]): s-=1
-            e=col
-            while e<len(line) and test(line[e]): e+=1
-            if kind=='a':
-                while e<len(line) and line[e]==' ': e+=1
-            return row,s,row,e
-        if obj in ('"',"'",'`'):
-            q=obj; s=line.rfind(q,0,col)
-            if s==-1:
-                s=line.find(q,col)
-                if s==-1: return None,None,None,None
-                e=line.find(q,s+1)
-            else: e=line.find(q,s+1)
-            if e==-1: return None,None,None,None
-            return (row,s+1,row,e) if kind=='i' else (row,s,row,e+1)
-        pairs={'(':('(',')'),')':(  '(',')'),'b':('(',')'),'{':('{','}'),
-               '}':('{','}'),'B':('{','}'),'[':('[',']'),']':('[',']'),
-               '<':('<','>'),'>':(  '<','>')}
+        row, col = self.cursor.row, self.cursor.col
+        line = self.buf.get_line(row)
+        if obj in ("w", "W"):
+            test = (lambda c: not c.isspace()) if obj == "W" else self._is_word
+            s = col
+            while s > 0 and test(line[s - 1]):
+                s -= 1
+            e = col
+            while e < len(line) and test(line[e]):
+                e += 1
+            if kind == "a":
+                while e < len(line) and line[e] == " ":
+                    e += 1
+            return row, s, row, e
+        if obj in ('"', "'", "`"):
+            q = obj
+            s = line.rfind(q, 0, col)
+            if s == -1:
+                s = line.find(q, col)
+                if s == -1:
+                    return None, None, None, None
+                e = line.find(q, s + 1)
+            else:
+                e = line.find(q, s + 1)
+            if e == -1:
+                return None, None, None, None
+            return (row, s + 1, row, e) if kind == "i" else (row, s, row, e + 1)
+        pairs = {
+            "(": ("(", ")"),
+            ")": ("(", ")"),
+            "b": ("(", ")"),
+            "{": ("{", "}"),
+            "}": ("{", "}"),
+            "B": ("{", "}"),
+            "[": ("[", "]"),
+            "]": ("[", "]"),
+            "<": ("<", ">"),
+            ">": ("<", ">"),
+        }
         if obj in pairs:
-            oc,cc=pairs[obj]; return self._find_pair(row,col,oc,cc,kind=='a')
-        return None,None,None,None
+            oc, cc = pairs[obj]
+            return self._find_pair(row, col, oc, cc, kind == "a")
+        return None, None, None, None
 
     def _find_pair(self, row, col, oc, cc, inclusive):
-        depth=0; r,c=row,col; sr,sc=None,None
-        while r>=0:
-            ln=self.buf.get_line(r); end=c if r==row else len(ln)-1
-            for i in range(min(end,len(ln)-1),-1,-1):
-                if ln[i]==cc: depth+=1
-                elif ln[i]==oc:
-                    if depth==0: sr,sc=r,i; break
-                    depth-=1
-            if sr is not None: break
-            r-=1; c=99999
-        if sr is None: return None,None,None,None
-        depth=0; r,c=sr,sc; er,ec=None,None
-        while r<self.buf.line_count():
-            ln=self.buf.get_line(r); s2=c if r==sr else 0
-            for i in range(s2,len(ln)):
-                if ln[i]==oc: depth+=1
-                elif ln[i]==cc:
-                    depth-=1
-                    if depth==0: er,ec=r,i; break
-            if er is not None: break
-            r+=1; c=0
-        if er is None: return None,None,None,None
-        return (sr,sc,er,ec+1) if inclusive else (sr,sc+1,er,ec)
+        depth = 0
+        r, c = row, col
+        sr, sc = None, None
+        while r >= 0:
+            ln = self.buf.get_line(r)
+            end = c if r == row else len(ln) - 1
+            for i in range(min(end, len(ln) - 1), -1, -1):
+                if ln[i] == cc:
+                    depth += 1
+                elif ln[i] == oc:
+                    if depth == 0:
+                        sr, sc = r, i
+                        break
+                    depth -= 1
+            if sr is not None:
+                break
+            r -= 1
+            c = 99999
+        if sr is None:
+            return None, None, None, None
+        depth = 0
+        r, c = sr, sc
+        er, ec = None, None
+        while r < self.buf.line_count():
+            ln = self.buf.get_line(r)
+            s2 = c if r == sr else 0
+            for i in range(s2, len(ln)):
+                if ln[i] == oc:
+                    depth += 1
+                elif ln[i] == cc:
+                    depth -= 1
+                    if depth == 0:
+                        er, ec = r, i
+                        break
+            if er is not None:
+                break
+            r += 1
+            c = 0
+        if er is None:
+            return None, None, None, None
+        return (sr, sc, er, ec + 1) if inclusive else (sr, sc + 1, er, ec)
 
     # ── Paste / indent / misc ─────────────────────────────────────────────────
 
     def _paste(self, after):
-        if not self.register_text: return
+        if not self.register_text:
+            return
         self.buf.save_undo()
         if self.register_linewise:
-            lines=self.register_text.split('\n')
-            ins=self.cursor.row+(1 if after else 0)
-            for i,l in enumerate(lines): self.buf.insert_line(ins+i,l)
-            self.cursor.row=ins; self._first_nonblank()
+            lines = self.register_text.split("\n")
+            ins = self.cursor.row + (1 if after else 0)
+            for i, l in enumerate(lines):
+                self.buf.insert_line(ins + i, l)
+            self.cursor.row = ins
+            self._first_nonblank()
         else:
-            line=self.buf.get_line(self.cursor.row)
-            ipos=self.cursor.col+(1 if after and line else 0)
-            self.buf.set_line(self.cursor.row,line[:ipos]+self.register_text+line[ipos:])
-            self.cursor.col=ipos+len(self.register_text)-1
+            line = self.buf.get_line(self.cursor.row)
+            ipos = self.cursor.col + (1 if after and line else 0)
+            self.buf.set_line(
+                self.cursor.row, line[:ipos] + self.register_text + line[ipos:]
+            )
+            self.cursor.col = ipos + len(self.register_text) - 1
 
     def _indent(self, row):
-        line=self.buf.get_line(row); return line[:len(line)-len(line.lstrip())]
+        line = self.buf.get_line(row)
+        return line[: len(line) - len(line.lstrip())]
 
     def _indent_lines(self, r1, r2, direction):
         self.buf.save_undo()
-        for r in range(r1,r2+1):
-            line=self.buf.get_line(r)
-            if direction>0: self.buf.set_line(r,'    '+line)
+        for r in range(r1, r2 + 1):
+            line = self.buf.get_line(r)
+            if direction > 0:
+                self.buf.set_line(r, "    " + line)
             else:
-                if line.startswith('    '): self.buf.set_line(r,line[4:])
-                elif line.startswith('\t'): self.buf.set_line(r,line[1:])
+                if line.startswith("    "):
+                    self.buf.set_line(r, line[4:])
+                elif line.startswith("\t"):
+                    self.buf.set_line(r, line[1:])
 
     def _word_under_cursor(self):
-        line=self.buf.get_line(self.cursor.row); col=self.cursor.col
-        if col>=len(line) or not self._is_word(line[col]): return None
-        s=col
-        while s>0 and self._is_word(line[s-1]): s-=1
-        e=col
-        while e<len(line) and self._is_word(line[e]): e+=1
+        line = self.buf.get_line(self.cursor.row)
+        col = self.cursor.col
+        if col >= len(line) or not self._is_word(line[col]):
+            return None
+        s = col
+        while s > 0 and self._is_word(line[s - 1]):
+            s -= 1
+        e = col
+        while e < len(line) and self._is_word(line[e]):
+            e += 1
         return line[s:e]
 
     def _char_search(self, ch, forward, till, count=1):
-        self.last_f_char=ch; self.last_f_forward=forward; self.last_f_till=till
-        line=self.buf.get_line(self.cursor.row); col=self.cursor.col; found=0
+        self.last_f_char = ch
+        self.last_f_forward = forward
+        self.last_f_till = till
+        line = self.buf.get_line(self.cursor.row)
+        col = self.cursor.col
+        found = 0
         if forward:
-            for i in range(col+1,len(line)):
-                if line[i]==ch:
-                    found+=1
-                    if found==count: self.cursor.col=i-(1 if till else 0); return
+            for i in range(col + 1, len(line)):
+                if line[i] == ch:
+                    found += 1
+                    if found == count:
+                        self.cursor.col = i - (1 if till else 0)
+                        return
         else:
-            for i in range(col-1,-1,-1):
-                if line[i]==ch:
-                    found+=1
-                    if found==count: self.cursor.col=i+(1 if till else 0); return
+            for i in range(col - 1, -1, -1):
+                if line[i] == ch:
+                    found += 1
+                    if found == count:
+                        self.cursor.col = i + (1 if till else 0)
+                        return
 
     # ── Splits ────────────────────────────────────────────────────────────────
 
     def _split(self, vertical, filename=None):
-        new_buf = Buffer.from_file(filename) if filename else Buffer.from_file(self.buf.filename) if self.buf.filename else Buffer(list(self.buf.lines))
+        new_buf = (
+            Buffer.from_file(filename)
+            if filename
+            else Buffer.from_file(self.buf.filename)
+            if self.buf.filename
+            else Buffer(list(self.buf.lines))
+        )
+        if _DEBUG_OBSERVER_ENABLED and new_buf not in [p.buf for p in self._panes]:
+            new_buf.observe(debug_observer, "all")
         new_pane = Pane(new_buf)
         new_pane.cursor.row = self.cursor.row
         new_pane.cursor.col = self.cursor.col
-        new_pane.top_row    = self.top_row
+        new_pane.top_row = self.top_row
         orig_i = self._pane_i
         self._layout = _lc_split(self._layout, self._pane, new_pane, vertical)
         self._panes.append(new_pane)
@@ -1601,66 +2442,91 @@ class Editor:
         if len(self._panes) == 1:
             # Last pane: behave like :q
             if self.buf.modified and not force:
-                self.status_msg='No write since last change (add ! to override)'
-                self.status_err=True; return
-            self.running=False; return
-        p=self._pane
+                self.status_msg = "No write since last change (add ! to override)"
+                self.status_err = True
+                return
+            self.running = False
+            return
+        p = self._pane
         if p.buf.modified and not force:
-            self.status_msg='No write since last change (add ! to override)'
-            self.status_err=True; return
-        new_layout=_lc_close(self._layout, p)
-        if new_layout is None: self.running=False; return
-        self._layout=new_layout
-        self._panes=[x for x in self._panes if x is not p]
-        self._pane_i=min(self._pane_i, len(self._panes)-1)
+            self.status_msg = "No write since last change (add ! to override)"
+            self.status_err = True
+            return
+        new_layout = _lc_close(self._layout, p)
+        if new_layout is None:
+            self.running = False
+            return
+        self._layout = new_layout
+        self._panes = [x for x in self._panes if x is not p]
+        self._pane_i = min(self._pane_i, len(self._panes) - 1)
 
     def _next_pane(self, delta=1):
-        self._pane_i=(self._pane_i+delta)%len(self._panes)
+        self._pane_i = (self._pane_i + delta) % len(self._panes)
 
     def _goto_pane_dir(self, d):
-        cur=self._pane; best=None; best_score=10**9
+        cur = self._pane
+        best = None
+        best_score = 10**9
         for i, p in enumerate(self._panes):
-            if p is cur: continue
-            ov_h = p.y < cur.y+cur.height and p.y+p.height > cur.y
-            ov_v = p.x < cur.x+cur.width  and p.x+p.width  > cur.x
-            if   d=='h' and p.x+p.width < cur.x and ov_h:
-                score = cur.x - (p.x+p.width)
-            elif d=='l' and p.x > cur.x+cur.width and ov_h:
-                score = p.x - (cur.x+cur.width)
-            elif d=='k' and p.y+p.height < cur.y and ov_v:
-                score = cur.y - (p.y+p.height)
-            elif d=='j' and p.y > cur.y+cur.height and ov_v:
-                score = p.y - (cur.y+cur.height)
-            else: continue
-            if score < best_score: best_score=score; best=i
-        if best is not None: self._pane_i=best
+            if p is cur:
+                continue
+            ov_h = p.y < cur.y + cur.height and p.y + p.height > cur.y
+            ov_v = p.x < cur.x + cur.width and p.x + p.width > cur.x
+            if d == "h" and p.x + p.width < cur.x and ov_h:
+                score = cur.x - (p.x + p.width)
+            elif d == "l" and p.x > cur.x + cur.width and ov_h:
+                score = p.x - (cur.x + cur.width)
+            elif d == "k" and p.y + p.height < cur.y and ov_v:
+                score = cur.y - (p.y + p.height)
+            elif d == "j" and p.y > cur.y + cur.height and ov_v:
+                score = p.y - (cur.y + cur.height)
+            else:
+                continue
+            if score < best_score:
+                best_score = score
+                best = i
+        if best is not None:
+            self._pane_i = best
 
     # ── Mode transitions ──────────────────────────────────────────────────────
 
     def _enter_insert(self, col_delta=0):
         if self._pane.is_chat:
-            self.mode = Mode.CHAT; self.status_msg = ''; return
-        self.buf.save_undo(); self.cursor.col+=col_delta
-        self.mode=Mode.INSERT; self.status_msg=''
+            self.mode = Mode.CHAT
+            self.status_msg = ""
+            return
+        self.buf.save_undo()
+        self.cursor.col += col_delta
+        self.mode = Mode.INSERT
+        self.status_msg = ""
 
     def _enter_normal(self):
-        self.mode=Mode.NORMAL; self.pending_op=None; self.pending_count=''
-        line=self.buf.get_line(self.cursor.row)
-        if self.cursor.col>0 and self.cursor.col>=len(line):
-            self.cursor.col=max(0,len(line)-1)
-        self.status_msg=''
+        self.mode = Mode.NORMAL
+        self.pending_op = None
+        self.pending_count = ""
+        line = self.buf.get_line(self.cursor.row)
+        if self.cursor.col > 0 and self.cursor.col >= len(line):
+            self.cursor.col = max(0, len(line) - 1)
+        self.status_msg = ""
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
         while self.running:
-            self._clamp(); self._scroll(); self.draw()
-            key=self.stdscr.getch()
+            self._clamp()
+            self._scroll()
+            self.draw()
+            key = self.stdscr.getch()
             if key == -1:
-                if self._follow: self._follow_check()
+                if self._follow:
+                    self._follow_check()
                 self._chat_panes_check()
+                if self._bg_msgs:
+                    self.status_msg = self._bg_msgs.pop(0)
+                    self.status_err = True
                 continue
-            self.status_msg=''; self.status_err=False
+            self.status_msg = ""
+            self.status_err = False
             self._dispatch(key)
 
     def _apply_follow_text(self, new_text):
@@ -1669,32 +2535,35 @@ class Editor:
         _follow_partial tracks any incomplete last line (no trailing \\n yet).
         When non-empty it is always the last element of buf.lines.
         """
-        if not new_text: return
+        if not new_text:
+            return
         near_bottom = self.cursor.row >= self.buf.line_count() - 2
         # Clear the initial one-line empty-buffer placeholder on first write.
-        if not self._follow_partial and self.buf.lines == ['']:
+        if not self._follow_partial and self.buf.lines == [""]:
             self.buf.lines = []
         full = self._follow_partial + new_text
-        parts = full.split('\n')
-        new_partial = parts[-1]   # '' when new_text ended with \n
-        complete    = parts[:-1]  # lines that ended with \n
+        parts = full.split("\n")
+        new_partial = parts[-1]  # '' when new_text ended with \n
+        complete = parts[:-1]  # lines that ended with \n
         if self._follow_partial and self.buf.lines:
             self.buf.lines.pop()  # remove old partial; will be replaced below
         self.buf.lines.extend(complete)
         if new_partial:
             self.buf.lines.append(new_partial)
         if not self.buf.lines:
-            self.buf.lines = ['']
+            self.buf.lines = [""]
         self._follow_partial = new_partial
         self.buf._gen += 1
         if near_bottom:
-            self.cursor.row = self.buf.line_count() - 1; self._clamp()
+            self.cursor.row = self.buf.line_count() - 1
+            self._clamp()
 
     def _follow_check(self):
-        new_text = ''
+        new_text = ""
         if self._follow_file:
             chunk = self._follow_file.read()
-            if chunk: new_text = chunk
+            if chunk:
+                new_text = chunk
         elif self._follow_fd is not None:
             r, _, _ = select.select([self._follow_fd], [], [], 0)
             if r:
@@ -1703,40 +2572,52 @@ class Editor:
                     while True:
                         chunk = os.read(self._follow_fd, 65536)
                         if not chunk:
-                            os.close(self._follow_fd); self._follow_fd = None; break
+                            os.close(self._follow_fd)
+                            self._follow_fd = None
+                            break
                         raw_chunks.append(chunk)
                 except BlockingIOError:
                     pass
                 except OSError:
                     pass
                 if raw_chunks:
-                    new_text = b''.join(raw_chunks).decode('utf-8', errors='replace')
+                    new_text = b"".join(raw_chunks).decode("utf-8", errors="replace")
         self._apply_follow_text(new_text)
 
     # ── Chat pane ─────────────────────────────────────────────────────────────
 
+    def _chat_box_height(self, pane):
+        """Rows consumed by the chat input box (borders + wrapped text, min 3 max 6)."""
+        inner_w = max(1, pane.width - 2)  # minus left/right border chars
+        lines = pane.chat_input.split("\n")
+        wrapped = sum(max(1, (len(l) + inner_w - 1) // inner_w) for l in lines)
+        return min(6, max(3, wrapped + 2))  # +2 for top/bottom border
+
     def _pane_view_height(self, pane):
-        """Usable display rows for a pane (chat panes reserve one row for input)."""
-        return pane.height - 1 if pane.is_chat else pane.height
+        """Usable display rows for a pane (chat panes reserve space for the input box)."""
+        if not pane.is_chat:
+            return pane.height
+        return max(1, pane.height - self._chat_box_height(pane))
 
     def _chat_pane_apply_text(self, pane, new_text):
         """Stream new_text into a chat pane's buffer (mirrors _apply_follow_text)."""
-        if not new_text: return
+        if not new_text:
+            return
         vh = self._pane_view_height(pane)
         near_bottom = pane.cursor.row >= pane.buf.line_count() - 2
-        if not pane.chat_follow_partial and pane.buf.lines == ['']:
+        if not pane.chat_follow_partial and pane.buf.lines == [""]:
             pane.buf.lines = []
         full = pane.chat_follow_partial + new_text
-        parts = full.split('\n')
+        parts = full.split("\n")
         new_partial = parts[-1]
-        complete    = parts[:-1]
+        complete = parts[:-1]
         if pane.chat_follow_partial and pane.buf.lines:
             pane.buf.lines.pop()
         pane.buf.lines.extend(complete)
         if new_partial:
             pane.buf.lines.append(new_partial)
         if not pane.buf.lines:
-            pane.buf.lines = ['']
+            pane.buf.lines = [""]
         pane.chat_follow_partial = new_partial
         pane.buf._gen += 1
         if near_bottom:
@@ -1764,101 +2645,191 @@ class Editor:
             except BlockingIOError:
                 pass
             except OSError:
-                try: os.close(pane.chat_follow_fd)
-                except OSError: pass
+                try:
+                    os.close(pane.chat_follow_fd)
+                except OSError:
+                    pass
                 pane.chat_follow_fd = None
                 pane.chat_streaming = False
             if raw_chunks:
                 self._chat_pane_apply_text(
-                    pane, b''.join(raw_chunks).decode('utf-8', errors='replace'))
+                    pane, b"".join(raw_chunks).decode("utf-8", errors="replace")
+                )
 
     def _open_chat(self):
-        """Open (or focus) the Claude chat pane in a vertical split."""
+        """Open (or focus) the Claude chat pane, split direction chosen by terminal size."""
         for i, p in enumerate(self._panes):
             if p.is_chat:
                 self._pane_i = i
                 self.mode = Mode.CHAT
                 return
-        buf = Buffer(['# Claude Chat', '',
-                      'Press i to start typing, Enter to send, Esc to browse.', ''])
-        buf.filename = '[claude-chat]'
+        # Vertical (side-by-side) only when each pane would be at least 80 cols wide
+        vertical = self.width >= 160
+        buf = Buffer(
+            [
+                "# Claude Chat",
+                "",
+                "Press i to type, Enter to send, Esc to browse history.",
+                "",
+            ]
+        )
+        if _DEBUG_OBSERVER_ENABLED:
+            buf.observe(debug_observer, "all")
+        buf.filename = "[claude-chat]"
         chat_pane = Pane(buf)
         chat_pane.is_chat = True
         chat_pane.cursor.row = buf.line_count() - 1
-        self._layout = _lc_split(self._layout, self._pane, chat_pane, vertical=True)
+        self._layout = _lc_split(self._layout, self._pane, chat_pane, vertical=vertical)
         self._panes.append(chat_pane)
         self._pane_i = len(self._panes) - 1
         self.mode = Mode.CHAT
-        self.stdscr.timeout(250)  # enable non-blocking getch for streaming updates
+        self.stdscr.timeout(250)
 
     def _chat_send(self, chat_pane, message):
         """Append user message, call Claude API streaming into the pane's buffer."""
         if chat_pane.chat_streaming:
-            self.status_msg = 'Claude is still responding…'; self.status_err = True; return
-        chat_pane.chat_history.append({'role': 'user', 'content': message})
+            self.status_msg = "Claude is still responding…"
+            self.status_err = True
+            return
+        chat_pane.chat_history.append({"role": "user", "content": message})
         # Append formatted user turn + Claude prefix to buffer
-        if chat_pane.buf.lines[-1] != '':
-            chat_pane.buf.lines.append('')
-        chat_pane.buf.lines.extend([f'You: {message}', '', 'Claude: '])
+        if chat_pane.buf.lines[-1] != "":
+            chat_pane.buf.lines.append("")
+        chat_pane.buf.lines.extend([f"You: {message}", "", "Claude: "])
         chat_pane.buf._gen += 1
         # Position cursor at the new Claude: line
         chat_pane.cursor.row = chat_pane.buf.line_count() - 1
         vh = self._pane_view_height(chat_pane)
         chat_pane.top_row = max(0, chat_pane.cursor.row - vh + 1)
 
-        # Build context from the first non-chat editing pane
+        # Snapshot refs for background thread
         edit_pane = next((p for p in self._panes if not p.is_chat), None)
-        ctx_file  = edit_pane.buf.filename if edit_pane else None
-        ctx_text  = '\n'.join(edit_pane.buf.lines) if edit_pane else None
+        ctx_file = edit_pane.buf.filename if edit_pane else None
 
-        # Pipe for streaming
+        # Keep API history small (last 10 turns); full history kept for display
+        trimmed_history = list(chat_pane.chat_history[-10:])
+
+        # Pipe for streaming output into the chat buffer
         r_fd, w_fd = os.pipe()
         flags = fcntl.fcntl(r_fd, fcntl.F_GETFL)
         fcntl.fcntl(r_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-        chat_pane.chat_follow_fd      = r_fd
-        chat_pane.chat_follow_partial = 'Claude: '  # matches the last line we just appended
-        chat_pane.chat_streaming      = True
+        chat_pane.chat_follow_fd = r_fd
+        chat_pane.chat_follow_partial = "Claude: "
+        chat_pane.chat_streaming = True
         self.stdscr.timeout(250)
 
-        history = list(chat_pane.chat_history)
+        bg_msgs = self._bg_msgs
+        pane_ref = edit_pane  # captured for tool execution
 
         def _stream():
             try:
-                import anthropic
-                client = anthropic.Anthropic()
+                client = _anthropic_client()
                 sys_prompt = (
-                    'You are an expert pair programmer embedded in pym, '
-                    'a terminal-based vi-like editor written in Python. '
-                    'Be concise and actionable. Use markdown sparingly.'
+                    "You are a pair programming agent embedded in pym, a terminal vi-like editor.\n"
+                    "You have tools to read and edit the active buffer, run shell commands, and read files.\n"
+                    "Work autonomously: use view_file to read code, edit_file to change it, "
+                    "run_command to test it. Fix problems you find. Be terse — show, don't tell."
                 )
-                if ctx_file and ctx_text is not None:
-                    lang = ctx_file.rsplit('.', 1)[-1] if '.' in (ctx_file or '') else ''
-                    sys_prompt += (
-                        f'\n\nThe user is editing: {ctx_file}\n\n'
-                        f'```{lang}\n{ctx_text}\n```'
-                    )
-                response_text = ''
-                with anthropic.Anthropic().messages.stream(
-                    model='claude-opus-4-5',
-                    max_tokens=4096,
-                    system=sys_prompt,
-                    messages=history,
-                ) as stream:
-                    w_file = os.fdopen(w_fd, 'w', buffering=1)
-                    for text in stream.text_stream:
-                        w_file.write(text)
+                if ctx_file:
+                    sys_prompt += f"\n\nActive file: {ctx_file} ({len(pane_ref.buf.lines) if pane_ref else 0} lines)"
+
+                w_file = os.fdopen(w_fd, "w", buffering=1)
+                messages = trimmed_history  # grows as tool loops iterate
+
+                while True:
+                    text_buf = ""
+                    with client.messages.stream(
+                        model="claude-haiku-4-5",
+                        max_tokens=2048,
+                        system=sys_prompt,
+                        tools=_PYMI_TOOLS,
+                        messages=messages,
+                    ) as stream:
+                        for text in stream.text_stream:
+                            w_file.write(text)
+                            w_file.flush()
+                            text_buf += text
+                        final = stream.get_final_message()
+
+                    # Build assistant content block for history
+                    asst_content = []
+                    for blk in final.content:
+                        if blk.type == "text":
+                            asst_content.append({"type": "text", "text": blk.text})
+                        elif blk.type == "tool_use":
+                            asst_content.append(
+                                {
+                                    "type": "tool_use",
+                                    "id": blk.id,
+                                    "name": blk.name,
+                                    "input": blk.input,
+                                }
+                            )
+                    messages = messages + [
+                        {"role": "assistant", "content": asst_content}
+                    ]
+
+                    if final.stop_reason != "tool_use":
+                        # Done — persist to full chat history and close pipe
+                        chat_pane.chat_history.append(
+                            {"role": "assistant", "content": text_buf}
+                        )
+                        w_file.write("\n\n")
                         w_file.flush()
-                        response_text += text
-                chat_pane.chat_history.append(
-                    {'role': 'assistant', 'content': response_text})
-                w_file.write('\n\n')
-                w_file.flush()
-                w_file.close()
+                        w_file.close()
+                        break
+
+                    # Execute each tool and stream indicators
+                    tool_results = []
+                    for blk in final.content:
+                        if blk.type != "tool_use":
+                            continue
+                        # Format args concisely for display
+                        inp = blk.input
+                        if blk.name == "edit_file":
+                            arg_str = (
+                                f"lines {inp.get('start_line')}–{inp.get('end_line')}"
+                            )
+                        elif blk.name == "run_command":
+                            arg_str = inp.get("command", "")[:60]
+                        elif blk.name in ("view_file",):
+                            arg_str = (
+                                f"lines {inp.get('start_line')}–{inp.get('end_line')}"
+                            )
+                        else:
+                            arg_str = ", ".join(
+                                f"{k}={v}" for k, v in list(inp.items())[:2]
+                            )
+
+                        w_file.write(f"\n⚙ {blk.name}({arg_str})\n")
+                        w_file.flush()
+                        result = (
+                            _exec_tool(blk.name, inp, pane_ref)
+                            if pane_ref
+                            else "no active buffer"
+                        )
+                        # Show a short preview of the result
+                        preview = result.split("\n")[0][:80]
+                        w_file.write(f"→ {preview}\n")
+                        w_file.flush()
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": blk.id,
+                                "content": result,
+                            }
+                        )
+
+                    messages = messages + [{"role": "user", "content": tool_results}]
+
             except Exception as e:
+                err = str(e)
+                bg_msgs.append(f"Claude error: {err[:120]}")
                 try:
-                    wf = os.fdopen(w_fd, 'w')
-                    wf.write(f'\n[Error: {e}]\n\n')
-                    wf.flush(); wf.close()
+                    wf = os.fdopen(w_fd, "w")
+                    wf.write(f"\n[Error: {err}]\n\n")
+                    wf.flush()
+                    wf.close()
                 except Exception:
                     pass
 
@@ -1868,225 +2839,358 @@ class Editor:
         """Handle keystrokes in CHAT input mode."""
         pane = self._pane
         if not pane.is_chat:
-            self.mode = Mode.NORMAL; return
-        if key == 27:                          # Esc — browse mode
             self.mode = Mode.NORMAL
-        elif key in (10, 13):                  # Enter — send
+            return
+        if key == 27:  # Esc — browse history
+            self.mode = Mode.NORMAL
+        elif key in (10, 13, curses.KEY_ENTER):  # Enter — send
             msg = pane.chat_input.strip()
-            pane.chat_input = ''
+            pane.chat_input = ""
             if msg:
                 self._chat_send(pane, msg)
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
+        elif key in (curses.KEY_BACKSPACE, 127, 8):  # Backspace
             pane.chat_input = pane.chat_input[:-1]
         elif 32 <= key <= 126:
             pane.chat_input += chr(key)
 
     def _dispatch(self, key):
         if self._confirm_cb is not None:
-            if key in (ord('y'), ord('Y')):
-                cb=self._confirm_cb; self._confirm_cb=None; self._confirm_msg=''; cb()
+            if key in (ord("y"), ord("Y")):
+                cb = self._confirm_cb
+                self._confirm_cb = None
+                self._confirm_msg = ""
+                cb()
             else:
-                self._confirm_cb=None; self._confirm_msg=''
-                self.status_msg='Cancelled'; self.status_err=False
+                self._confirm_cb = None
+                self._confirm_msg = ""
+                self.status_msg = "Cancelled"
+                self.status_err = False
             return
-        if   self.mode==Mode.NORMAL:      self._normal(key)
-        elif self.mode==Mode.INSERT:      self._insert(key)
-        elif self.mode==Mode.VISUAL:      self._visual(key)
-        elif self.mode==Mode.VISUAL_LINE: self._visual_line(key)
-        elif self.mode==Mode.COMMAND:     self._command_key(key)
-        elif self.mode==Mode.SEARCH:      self._search_key(key)
-        elif self.mode==Mode.EXPLORER:    self._explorer_key(key)
-        elif self.mode==Mode.HISTORY:     self._history_key(key)
-        elif self.mode==Mode.PICKER:      self._picker_key(key)
-        elif self.mode==Mode.CHAT:        self._chat_key(key)
+        if self.mode == Mode.NORMAL:
+            self._normal(key)
+        elif self.mode == Mode.INSERT:
+            self._insert(key)
+        elif self.mode == Mode.VISUAL:
+            self._visual(key)
+        elif self.mode == Mode.VISUAL_LINE:
+            self._visual_line(key)
+        elif self.mode == Mode.COMMAND:
+            self._command_key(key)
+        elif self.mode == Mode.SEARCH:
+            self._search_key(key)
+        elif self.mode == Mode.EXPLORER:
+            self._explorer_key(key)
+        elif self.mode == Mode.HISTORY:
+            self._history_key(key)
+        elif self.mode == Mode.PICKER:
+            self._picker_key(key)
+        elif self.mode == Mode.CHAT:
+            self._chat_key(key)
 
     # ── Normal mode ───────────────────────────────────────────────────────────
 
     def _normal(self, key):
-        ch=chr(key) if 32<=key<=126 else None
-        if ch and ch.isdigit() and (ch!='0' or self.pending_count):
-            self.pending_count+=ch; return
-        count=int(self.pending_count) if self.pending_count else 1
-        self.pending_count=''
+        ch = chr(key) if 32 <= key <= 126 else None
+        if ch and ch.isdigit() and (ch != "0" or self.pending_count):
+            self.pending_count += ch
+            return
+        count = int(self.pending_count) if self.pending_count else 1
+        self.pending_count = ""
 
         _on_tbl = _is_table_row(self.buf.get_line(self.cursor.row))
-        if   key in (curses.KEY_LEFT,)  or ch=='h':
-            if _on_tbl: [self._cell_prev() for _ in range(count)]
-            else: [self._move(0,-1) for _ in range(count)]
-        elif key in (curses.KEY_RIGHT,) or ch=='l':
-            if _on_tbl: [self._cell_next() for _ in range(count)]
-            else: [self._move(0,1) for _ in range(count)]
-        elif key in (curses.KEY_UP,)    or ch=='k':
-            if _on_tbl: [self._cell_up()   for _ in range(count)]
-            else: [self._move(-1,0) for _ in range(count)]
-        elif key in (curses.KEY_DOWN,)  or ch=='j':
-            if _on_tbl: [self._cell_down() for _ in range(count)]
-            else: [self._move(1,0)  for _ in range(count)]
-        elif key==9 and _on_tbl: [self._cell_next() for _ in range(count)]
-        elif key==353 and _on_tbl: [self._cell_prev() for _ in range(count)]  # Shift-Tab
-        elif ch=='0': self.cursor.col=0; self.cursor.col_want=0
-        elif ch=='^': self._first_nonblank()
-        elif ch=='$':
-            line=self.buf.get_line(self.cursor.row)
-            self.cursor.col=max(0,len(line)-1); self.cursor.col_want=999999
-        elif ch=='G':
-            self.cursor.row=(count-1 if self.pending_count else self.buf.line_count()-1)
+        if key in (curses.KEY_LEFT,) or ch == "h":
+            if _on_tbl:
+                [self._cell_prev() for _ in range(count)]
+            else:
+                [self._move(0, -1) for _ in range(count)]
+        elif key in (curses.KEY_RIGHT,) or ch == "l":
+            if _on_tbl:
+                [self._cell_next() for _ in range(count)]
+            else:
+                [self._move(0, 1) for _ in range(count)]
+        elif key in (curses.KEY_UP,) or ch == "k":
+            if _on_tbl:
+                [self._cell_up() for _ in range(count)]
+            else:
+                [self._move(-1, 0) for _ in range(count)]
+        elif key in (curses.KEY_DOWN,) or ch == "j":
+            if _on_tbl:
+                [self._cell_down() for _ in range(count)]
+            else:
+                [self._move(1, 0) for _ in range(count)]
+        elif key == 9 and _on_tbl:
+            [self._cell_next() for _ in range(count)]
+        elif key == 353 and _on_tbl:
+            [self._cell_prev() for _ in range(count)]  # Shift-Tab
+        elif ch == "0":
+            self.cursor.col = 0
+            self.cursor.col_want = 0
+        elif ch == "^":
             self._first_nonblank()
-        elif ch=='g': self._normal_g(count)
-        elif ch=='w': [self._word_fwd(False) for _ in range(count)]
-        elif ch=='W': [self._word_fwd(True)  for _ in range(count)]
-        elif ch=='b': [self._word_bwd(False) for _ in range(count)]
-        elif ch=='B': [self._word_bwd(True)  for _ in range(count)]
-        elif ch=='e': [self._word_end(False) for _ in range(count)]
-        elif ch=='E': [self._word_end(True)  for _ in range(count)]
-        elif ch=='{': [self._para_bwd() for _ in range(count)]
-        elif ch=='}': [self._para_fwd() for _ in range(count)]
-        elif ch=='f':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),True,False,count)
-        elif ch=='F':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),False,False,count)
-        elif ch=='t':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),True,True,count)
-        elif ch=='T':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),False,True,count)
-        elif ch==';' and self.last_f_char: self._char_search(self.last_f_char,self.last_f_forward,self.last_f_till,count)
-        elif ch==',' and self.last_f_char: self._char_search(self.last_f_char,not self.last_f_forward,self.last_f_till,count)
-        elif key==6  or key==curses.KEY_NPAGE: self._scroll_page(count)
-        elif key==2  or key==curses.KEY_PPAGE: self._scroll_page(-count)
-        elif key==4:  self._scroll_half(count)
-        elif key==21 and self.mode==Mode.NORMAL: self._scroll_half(-count)
-        elif ch=='i': self._enter_insert()
-        elif ch=='I': self._first_nonblank(); self._enter_insert()
-        elif ch=='a':
-            line=self.buf.get_line(self.cursor.row)
+        elif ch == "$":
+            line = self.buf.get_line(self.cursor.row)
+            self.cursor.col = max(0, len(line) - 1)
+            self.cursor.col_want = 999999
+        elif ch == "G":
+            self.cursor.row = (
+                count - 1 if self.pending_count else self.buf.line_count() - 1
+            )
+            self._first_nonblank()
+        elif ch == "g":
+            self._normal_g(count)
+        elif ch == "w":
+            [self._word_fwd(False) for _ in range(count)]
+        elif ch == "W":
+            [self._word_fwd(True) for _ in range(count)]
+        elif ch == "b":
+            [self._word_bwd(False) for _ in range(count)]
+        elif ch == "B":
+            [self._word_bwd(True) for _ in range(count)]
+        elif ch == "e":
+            [self._word_end(False) for _ in range(count)]
+        elif ch == "E":
+            [self._word_end(True) for _ in range(count)]
+        elif ch == "{":
+            [self._para_bwd() for _ in range(count)]
+        elif ch == "}":
+            [self._para_fwd() for _ in range(count)]
+        elif ch == "f":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self._char_search(chr(k2), True, False, count)
+        elif ch == "F":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self._char_search(chr(k2), False, False, count)
+        elif ch == "t":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self._char_search(chr(k2), True, True, count)
+        elif ch == "T":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self._char_search(chr(k2), False, True, count)
+        elif ch == ";" and self.last_f_char:
+            self._char_search(
+                self.last_f_char, self.last_f_forward, self.last_f_till, count
+            )
+        elif ch == "," and self.last_f_char:
+            self._char_search(
+                self.last_f_char, not self.last_f_forward, self.last_f_till, count
+            )
+        elif key == 6 or key == curses.KEY_NPAGE:
+            self._scroll_page(count)
+        elif key == 2 or key == curses.KEY_PPAGE:
+            self._scroll_page(-count)
+        elif key == 4:
+            self._scroll_half(count)
+        elif key == 21 and self.mode == Mode.NORMAL:
+            self._scroll_half(-count)
+        elif ch == "i":
+            self._enter_insert()
+        elif ch == "I":
+            self._first_nonblank()
+            self._enter_insert()
+        elif ch == "a":
+            line = self.buf.get_line(self.cursor.row)
             self._enter_insert(1 if line else 0)
-        elif ch=='A':
-            line=self.buf.get_line(self.cursor.row)
-            self.cursor.col=len(line); self._enter_insert()
-        elif ch=='o':
-            self.buf.save_undo(); ind=self._indent(self.cursor.row)
-            self.buf.insert_line(self.cursor.row+1,ind)
-            self.cursor.row+=1; self.cursor.col=len(ind); self.mode=Mode.INSERT
-        elif ch=='O':
-            self.buf.save_undo(); ind=self._indent(self.cursor.row)
-            self.buf.insert_line(self.cursor.row,ind)
-            self.cursor.col=len(ind); self.mode=Mode.INSERT
-        elif ch=='x':
+        elif ch == "A":
+            line = self.buf.get_line(self.cursor.row)
+            self.cursor.col = len(line)
+            self._enter_insert()
+        elif ch == "o":
+            self.buf.save_undo()
+            ind = self._indent(self.cursor.row)
+            self.buf.insert_line(self.cursor.row + 1, ind)
+            self.cursor.row += 1
+            self.cursor.col = len(ind)
+            self.mode = Mode.INSERT
+        elif ch == "O":
+            self.buf.save_undo()
+            ind = self._indent(self.cursor.row)
+            self.buf.insert_line(self.cursor.row, ind)
+            self.cursor.col = len(ind)
+            self.mode = Mode.INSERT
+        elif ch == "x":
             self.buf.save_undo()
             for _ in range(count):
-                c=self.buf.delete_char(self.cursor.row,self.cursor.col)
-                if c: self.register_text=c; self.register_linewise=False
-        elif ch=='X':
+                c = self.buf.delete_char(self.cursor.row, self.cursor.col)
+                if c:
+                    self.register_text = c
+                    self.register_linewise = False
+        elif ch == "X":
             self.buf.save_undo()
             for _ in range(count):
-                if self.cursor.col>0:
-                    self.cursor.col-=1; self.buf.delete_char(self.cursor.row,self.cursor.col)
-        elif ch=='r':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126:
-                self.buf.save_undo(); line=self.buf.get_line(self.cursor.row)
-                if self.cursor.col<len(line):
-                    self.buf.set_line(self.cursor.row,
-                        line[:self.cursor.col]+chr(k2)+line[self.cursor.col+1:])
-        elif ch=='s':
-            self.buf.save_undo()
-            for _ in range(count): self.buf.delete_char(self.cursor.row,self.cursor.col)
-            self.mode=Mode.INSERT
-        elif ch=='S':
-            self.buf.save_undo(); ind=self._indent(self.cursor.row)
-            self.buf.set_line(self.cursor.row,ind); self.cursor.col=len(ind); self.mode=Mode.INSERT
-        elif ch=='C':
-            self.buf.save_undo(); line=self.buf.get_line(self.cursor.row)
-            self.register_text=line[self.cursor.col:]; self.register_linewise=False
-            self.buf.set_line(self.cursor.row,line[:self.cursor.col]); self.mode=Mode.INSERT
-        elif ch=='D':
-            self.buf.save_undo(); line=self.buf.get_line(self.cursor.row)
-            self.register_text=line[self.cursor.col:]; self.register_linewise=False
-            self.buf.set_line(self.cursor.row,line[:self.cursor.col])
-        elif ch=='~':
-            self.buf.save_undo(); line=self.buf.get_line(self.cursor.row)
-            if self.cursor.col<len(line):
-                c=line[self.cursor.col]
-                self.buf.set_line(self.cursor.row,
-                    line[:self.cursor.col]+c.swapcase()+line[self.cursor.col+1:])
-                self._move(0,1)
-        elif ch=='J':
+                if self.cursor.col > 0:
+                    self.cursor.col -= 1
+                    self.buf.delete_char(self.cursor.row, self.cursor.col)
+        elif ch == "r":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self.buf.save_undo()
+                line = self.buf.get_line(self.cursor.row)
+                if self.cursor.col < len(line):
+                    self.buf.set_line(
+                        self.cursor.row,
+                        line[: self.cursor.col] + chr(k2) + line[self.cursor.col + 1 :],
+                    )
+        elif ch == "s":
             self.buf.save_undo()
             for _ in range(count):
-                line=self.buf.get_line(self.cursor.row)
-                nxt=self.buf.get_line(self.cursor.row+1).lstrip()
-                self.buf.set_line(self.cursor.row,(line.rstrip()+' '+nxt) if nxt else line.rstrip())
-                if self.cursor.row+1<self.buf.line_count(): self.buf.delete_line(self.cursor.row+1)
-        elif ch=='d': self._await_motion('d',count)
-        elif ch=='c': self._await_motion('c',count)
-        elif ch=='y': self._await_motion('y',count)
-        elif ch=='>': self._indent_lines(self.cursor.row,self.cursor.row,1)
-        elif ch=='<': self._indent_lines(self.cursor.row,self.cursor.row,-1)
-        elif ch=='p': self._paste(True)
-        elif ch=='P': self._paste(False)
-        elif ch=='u':
-            if not self.buf.undo(): self.status_msg='Already at oldest change'
-            else: self.status_msg='Undo'; self._clamp()
-        elif key==18:
-            if not self.buf.redo(): self.status_msg='Already at newest change'
-            else: self.status_msg='Redo'; self._clamp()
-        elif ch=='v': self.mode=Mode.VISUAL;      self.visual_start=(self.cursor.row,self.cursor.col)
-        elif ch=='V': self.mode=Mode.VISUAL_LINE; self.visual_start=(self.cursor.row,self.cursor.col)
-        elif ch=='/': self.mode=Mode.SEARCH; self.search_dir=1;  self.cmd_line='/'
-        elif ch=='?': self.mode=Mode.SEARCH; self.search_dir=-1; self.cmd_line='?'
-        elif ch=='n': self._search_next(self.search_dir)
-        elif ch=='N': self._search_next(-self.search_dir)
-        elif ch=='*':
-            w=self._word_under_cursor()
-            if w: self.search_pat=r'\b'+re.escape(w)+r'\b'; self._search_next(1)
-        elif ch=='#':
-            w=self._word_under_cursor()
-            if w: self.search_pat=r'\b'+re.escape(w)+r'\b'; self._search_next(-1)
-        elif ch=='m':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126 and chr(k2).isalpha(): self.marks[chr(k2)]=(self.cursor.row,self.cursor.col)
-        elif ch=="'":
-            k2=self.stdscr.getch()
-            if 32<=k2<=126 and chr(k2) in self.marks:
-                self.cursor.row=self.marks[chr(k2)][0]; self._first_nonblank()
-        elif ch=='`':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126 and chr(k2) in self.marks:
-                self.cursor.row,self.cursor.col=self.marks[chr(k2)]
-        elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
-        elif ch=='z': self._normal_z()
-        elif key==5:  self._eval_region(self.cursor.row, self.cursor.row)  # Ctrl-E
-        elif key==15: self._jump_back()   # Ctrl-O
-        elif key==23: self._ctrl_w()   # Ctrl-W
-        elif key==26:                  # Ctrl-Z suspend
+                self.buf.delete_char(self.cursor.row, self.cursor.col)
+            self.mode = Mode.INSERT
+        elif ch == "S":
+            self.buf.save_undo()
+            ind = self._indent(self.cursor.row)
+            self.buf.set_line(self.cursor.row, ind)
+            self.cursor.col = len(ind)
+            self.mode = Mode.INSERT
+        elif ch == "C":
+            self.buf.save_undo()
+            line = self.buf.get_line(self.cursor.row)
+            self.register_text = line[self.cursor.col :]
+            self.register_linewise = False
+            self.buf.set_line(self.cursor.row, line[: self.cursor.col])
+            self.mode = Mode.INSERT
+        elif ch == "D":
+            self.buf.save_undo()
+            line = self.buf.get_line(self.cursor.row)
+            self.register_text = line[self.cursor.col :]
+            self.register_linewise = False
+            self.buf.set_line(self.cursor.row, line[: self.cursor.col])
+        elif ch == "~":
+            self.buf.save_undo()
+            line = self.buf.get_line(self.cursor.row)
+            if self.cursor.col < len(line):
+                c = line[self.cursor.col]
+                self.buf.set_line(
+                    self.cursor.row,
+                    line[: self.cursor.col]
+                    + c.swapcase()
+                    + line[self.cursor.col + 1 :],
+                )
+                self._move(0, 1)
+        elif ch == "J":
+            self.buf.save_undo()
+            for _ in range(count):
+                line = self.buf.get_line(self.cursor.row)
+                nxt = self.buf.get_line(self.cursor.row + 1).lstrip()
+                self.buf.set_line(
+                    self.cursor.row,
+                    (line.rstrip() + " " + nxt) if nxt else line.rstrip(),
+                )
+                if self.cursor.row + 1 < self.buf.line_count():
+                    self.buf.delete_line(self.cursor.row + 1)
+        elif ch == "d":
+            self._await_motion("d", count)
+        elif ch == "c":
+            self._await_motion("c", count)
+        elif ch == "y":
+            self._await_motion("y", count)
+        elif ch == ">":
+            self._indent_lines(self.cursor.row, self.cursor.row, 1)
+        elif ch == "<":
+            self._indent_lines(self.cursor.row, self.cursor.row, -1)
+        elif ch == "p":
+            self._paste(True)
+        elif ch == "P":
+            self._paste(False)
+        elif ch == "u":
+            if not self.buf.undo():
+                self.status_msg = "Already at oldest change"
+            else:
+                self.status_msg = "Undo"
+                self._clamp()
+        elif key == 18:
+            if not self.buf.redo():
+                self.status_msg = "Already at newest change"
+            else:
+                self.status_msg = "Redo"
+                self._clamp()
+        elif ch == "v":
+            self.mode = Mode.VISUAL
+            self.visual_start = (self.cursor.row, self.cursor.col)
+        elif ch == "V":
+            self.mode = Mode.VISUAL_LINE
+            self.visual_start = (self.cursor.row, self.cursor.col)
+        elif ch == "/":
+            self.mode = Mode.SEARCH
+            self.search_dir = 1
+            self.cmd_line = "/"
+        elif ch == "?":
+            self.mode = Mode.SEARCH
+            self.search_dir = -1
+            self.cmd_line = "?"
+        elif ch == "n":
+            self._search_next(self.search_dir)
+        elif ch == "N":
+            self._search_next(-self.search_dir)
+        elif ch == "*":
+            w = self._word_under_cursor()
+            if w:
+                self.search_pat = r"\b" + re.escape(w) + r"\b"
+                self._search_next(1)
+        elif ch == "#":
+            w = self._word_under_cursor()
+            if w:
+                self.search_pat = r"\b" + re.escape(w) + r"\b"
+                self._search_next(-1)
+        elif ch == "m":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126 and chr(k2).isalpha():
+                self.marks[chr(k2)] = (self.cursor.row, self.cursor.col)
+        elif ch == "'":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126 and chr(k2) in self.marks:
+                self.cursor.row = self.marks[chr(k2)][0]
+                self._first_nonblank()
+        elif ch == "`":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126 and chr(k2) in self.marks:
+                self.cursor.row, self.cursor.col = self.marks[chr(k2)]
+        elif ch == ":":
+            self.mode = Mode.COMMAND
+            self.cmd_line = ":"
+        elif ch == "z":
+            self._normal_z()
+        elif key == 5:
+            self._eval_region(self.cursor.row, self.cursor.row)  # Ctrl-E
+        elif key == 15:
+            self._jump_back()  # Ctrl-O
+        elif key == 23:
+            self._ctrl_w()  # Ctrl-W
+        elif key == 26:  # Ctrl-Z suspend
             import signal
+
             curses.endwin()
             os.kill(os.getpid(), signal.SIGTSTP)
             self.stdscr.refresh()
-        elif key==27: self.search_pat=''; self.status_msg=''
-        elif key==curses.KEY_HOME: self.cursor.col=0
-        elif key==curses.KEY_END:
-            self.cursor.col=max(0,len(self.buf.get_line(self.cursor.row))-1)
-        elif key in (10,13):  # Enter — toggle task item if on one, else next non-blank
-            line=self.buf.get_line(self.cursor.row)
+        elif key == 27:
+            self.search_pat = ""
+            self.status_msg = ""
+        elif key == curses.KEY_HOME:
+            self.cursor.col = 0
+        elif key == curses.KEY_END:
+            self.cursor.col = max(0, len(self.buf.get_line(self.cursor.row)) - 1)
+        elif key in (10, 13):  # Enter — toggle task item if on one, else next non-blank
+            line = self.buf.get_line(self.cursor.row)
             if _is_markdown(self.buf.filename) and _task_state(line):
                 self._toggle_task()
             else:
-                self._move(1,0); self._first_nonblank()
+                self._move(1, 0)
+                self._first_nonblank()
 
     def _toggle_task(self):
         """Flip [ ] ↔ [x] on the current line."""
-        row=self.cursor.row; line=self.buf.get_line(row)
-        m=_TASK_RE.match(line)
-        if not m: return
-        i=m.start(3)
-        new_char=' ' if line[i].lower()=='x' else 'x'
+        row = self.cursor.row
+        line = self.buf.get_line(row)
+        m = _TASK_RE.match(line)
+        if not m:
+            return
+        i = m.start(3)
+        new_char = " " if line[i].lower() == "x" else "x"
         self.buf.save_undo()
-        self.buf.set_line(row, line[:i]+new_char+line[i+1:])
+        self.buf.set_line(row, line[:i] + new_char + line[i + 1 :])
 
     # ── Jump stack ────────────────────────────────────────────────────────────
 
@@ -2096,528 +3200,740 @@ class Editor:
     def _jump_back(self):
         if self._jump_stack:
             row, col = self._jump_stack.pop()
-            self.cursor.row = row; self.cursor.col = col; self._clamp()
+            self.cursor.row = row
+            self.cursor.col = col
+            self._clamp()
         else:
-            self.status_msg = 'Already at oldest position'
+            self.status_msg = "Already at oldest position"
 
     # ── AST navigation ────────────────────────────────────────────────────────
 
     def _ast_defs(self, name, src):
-        try: tree = ast.parse(src)
-        except SyntaxError: return []
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return []
         results = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if node.name == name:
-                    results.append((node.lineno-1, node.col_offset))
+                    results.append((node.lineno - 1, node.col_offset))
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
                     if isinstance(t, ast.Name) and t.id == name:
-                        results.append((t.lineno-1, t.col_offset))
+                        results.append((t.lineno - 1, t.col_offset))
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
                 t = node.target
                 if isinstance(t, ast.Name) and t.id == name:
-                    results.append((t.lineno-1, t.col_offset))
+                    results.append((t.lineno - 1, t.col_offset))
             elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    n = alias.asname or alias.name.split('.')[0]
+                    n = alias.asname or alias.name.split(".")[0]
                     if n == name:
-                        results.append((node.lineno-1, node.col_offset))
+                        results.append((node.lineno - 1, node.col_offset))
             elif isinstance(node, ast.ImportFrom):
                 for alias in node.names:
                     n = alias.asname or alias.name
                     if n == name:
-                        results.append((node.lineno-1, node.col_offset))
+                        results.append((node.lineno - 1, node.col_offset))
             elif isinstance(node, (ast.For, ast.AsyncFor)):
                 t = node.target
                 if isinstance(t, ast.Name) and t.id == name:
-                    results.append((t.lineno-1, t.col_offset))
+                    results.append((t.lineno - 1, t.col_offset))
             elif isinstance(node, ast.NamedExpr):
                 if node.target.id == name:
-                    results.append((node.target.lineno-1, node.target.col_offset))
+                    results.append((node.target.lineno - 1, node.target.col_offset))
             elif isinstance(node, ast.comprehension):
                 t = node.target
                 if isinstance(t, ast.Name) and t.id == name:
-                    results.append((t.lineno-1, t.col_offset))
+                    results.append((t.lineno - 1, t.col_offset))
         results.sort()
         return list(dict.fromkeys(results))
 
     def _ast_refs(self, name, src):
-        try: tree = ast.parse(src)
-        except SyntaxError: return []
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return []
         results = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and node.id == name:
-                results.append((node.lineno-1, node.col_offset))
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                results.append((node.lineno - 1, node.col_offset))
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
                 if node.name == name:
-                    results.append((node.lineno-1, node.col_offset))
+                    results.append((node.lineno - 1, node.col_offset))
         results.sort()
         return list(dict.fromkeys(results))
 
     def _py_file(self):
-        return bool(self.buf.filename and self.buf.filename.endswith(('.py', '.pyw')))
+        return bool(self.buf.filename and self.buf.filename.endswith((".py", ".pyw")))
 
     def _gd(self):
         if not self._py_file():
-            self.status_msg = 'gd: Python files only'; self.status_err = True; return
+            self.status_msg = "gd: Python files only"
+            self.status_err = True
+            return
         word = self._word_under_cursor()
-        if not word: self.status_msg = 'No word under cursor'; return
-        src = '\n'.join(self.buf.lines)
+        if not word:
+            self.status_msg = "No word under cursor"
+            return
+        src = "\n".join(self.buf.lines)
         defs = self._ast_defs(word, src)
         if not defs:
-            self.status_msg = f'No definition: {word!r}'; self.status_err = True; return
+            self.status_msg = f"No definition: {word!r}"
+            self.status_err = True
+            return
         self._push_jump()
         if len(defs) == 1:
-            self.cursor.row, self.cursor.col = defs[0]; self._first_nonblank(); return
-        entries = [(f'L{r+1}: {self.buf.get_line(r).strip()[:60]}', r, 0) for r, _ in defs]
-        self._open_picker(f'Definitions of {word!r}', entries)
+            self.cursor.row, self.cursor.col = defs[0]
+            self._first_nonblank()
+            return
+        entries = [
+            (f"L{r + 1}: {self.buf.get_line(r).strip()[:60]}", r, 0) for r, _ in defs
+        ]
+        self._open_picker(f"Definitions of {word!r}", entries)
 
     def _gr(self):
         if not self._py_file():
-            self.status_msg = 'gr: Python files only'; self.status_err = True; return
+            self.status_msg = "gr: Python files only"
+            self.status_err = True
+            return
         word = self._word_under_cursor()
-        if not word: self.status_msg = 'No word under cursor'; return
-        src = '\n'.join(self.buf.lines)
+        if not word:
+            self.status_msg = "No word under cursor"
+            return
+        src = "\n".join(self.buf.lines)
         refs = self._ast_refs(word, src)
         if not refs:
-            self.status_msg = f'No references: {word!r}'; self.status_err = True; return
-        entries = [(f'L{r+1}: {self.buf.get_line(r).strip()[:60]}', r, c) for r, c in refs]
+            self.status_msg = f"No references: {word!r}"
+            self.status_err = True
+            return
+        entries = [
+            (f"L{r + 1}: {self.buf.get_line(r).strip()[:60]}", r, c) for r, c in refs
+        ]
         self._push_jump()
-        self._open_picker(f'References to {word!r} ({len(refs)})', entries)
+        self._open_picker(f"References to {word!r} ({len(refs)})", entries)
 
     # ── Picker (multi-result navigation) ─────────────────────────────────────
 
     def _open_picker(self, title, entries, cb=None):
         self.picker_title = title
         self.picker_entries = entries
-        self.picker_sel = 0; self.picker_top = 0
+        self.picker_sel = 0
+        self.picker_top = 0
         self.picker_cb = cb
         self.mode = Mode.PICKER
 
     def _draw_picker(self):
-        self.stdscr.erase(); w = self.width
-        self._as(0, 0, f' {self.picker_title} '[:w-1].ljust(w-1), curses.color_pair(1)|curses.A_BOLD)
-        self._as(1, 0, '─'*(w-1), curses.A_DIM)
-        body_h = self.height - 4; n = len(self.picker_entries)
-        if self.picker_sel < self.picker_top: self.picker_top = self.picker_sel
-        elif self.picker_sel >= self.picker_top+body_h: self.picker_top = self.picker_sel-body_h+1
+        self.stdscr.erase()
+        w = self.width
+        self._as(
+            0,
+            0,
+            f" {self.picker_title} "[: w - 1].ljust(w - 1),
+            curses.color_pair(1) | curses.A_BOLD,
+        )
+        self._as(1, 0, "─" * (w - 1), curses.A_DIM)
+        body_h = self.height - 4
+        n = len(self.picker_entries)
+        if self.picker_sel < self.picker_top:
+            self.picker_top = self.picker_sel
+        elif self.picker_sel >= self.picker_top + body_h:
+            self.picker_top = self.picker_sel - body_h + 1
         for i in range(body_h):
-            idx = self.picker_top+i
-            if idx >= n: break
+            idx = self.picker_top + i
+            if idx >= n:
+                break
             label, row, col = self.picker_entries[idx]
-            display = ('  '+label)[:w-1].ljust(w-1)
-            attr = (curses.color_pair(8)|curses.A_BOLD if idx == self.picker_sel else 0)
-            self._as(2+i, 0, display, attr)
-        footer = ' j/k:move  Enter:jump  q/Esc:close  Ctrl-O:back '
-        self._as(self.height-2, 0, footer[:w-1].ljust(w-1), curses.color_pair(1))
+            display = ("  " + label)[: w - 1].ljust(w - 1)
+            attr = curses.color_pair(8) | curses.A_BOLD if idx == self.picker_sel else 0
+            self._as(2 + i, 0, display, attr)
+        footer = " j/k:move  Enter:jump  q/Esc:close  Ctrl-O:back "
+        self._as(self.height - 2, 0, footer[: w - 1].ljust(w - 1), curses.color_pair(1))
         if self.status_msg:
-            self._as(self.height-1, 0, self.status_msg[:w-1],
-                     curses.color_pair(4) if self.status_err else 0)
+            self._as(
+                self.height - 1,
+                0,
+                self.status_msg[: w - 1],
+                curses.color_pair(4) if self.status_err else 0,
+            )
         self.stdscr.refresh()
 
     def _picker_key(self, key):
-        ch = chr(key) if 32<=key<=126 else None
+        ch = chr(key) if 32 <= key <= 126 else None
         n = len(self.picker_entries)
-        if   key==curses.KEY_UP   or ch=='k': self.picker_sel = max(0, self.picker_sel-1)
-        elif key==curses.KEY_DOWN or ch=='j': self.picker_sel = min(n-1, self.picker_sel+1)
-        elif key==6  or key==curses.KEY_NPAGE: self.picker_sel=min(n-1,self.picker_sel+max(1,self.height-6))
-        elif key==2  or key==curses.KEY_PPAGE: self.picker_sel=max(0,self.picker_sel-max(1,self.height-6))
-        elif key==curses.KEY_HOME: self.picker_sel = 0
-        elif key==curses.KEY_END:  self.picker_sel = n-1
-        elif key in (10, 13) or key==curses.KEY_RIGHT:
+        if key == curses.KEY_UP or ch == "k":
+            self.picker_sel = max(0, self.picker_sel - 1)
+        elif key == curses.KEY_DOWN or ch == "j":
+            self.picker_sel = min(n - 1, self.picker_sel + 1)
+        elif key == 6 or key == curses.KEY_NPAGE:
+            self.picker_sel = min(n - 1, self.picker_sel + max(1, self.height - 6))
+        elif key == 2 or key == curses.KEY_PPAGE:
+            self.picker_sel = max(0, self.picker_sel - max(1, self.height - 6))
+        elif key == curses.KEY_HOME:
+            self.picker_sel = 0
+        elif key == curses.KEY_END:
+            self.picker_sel = n - 1
+        elif key in (10, 13) or key == curses.KEY_RIGHT:
             if self.picker_entries:
                 label, row, col = self.picker_entries[self.picker_sel]
                 self.mode = Mode.NORMAL
                 if self.picker_cb:
-                    cb = self.picker_cb; self.picker_cb = None; cb(label)
+                    cb = self.picker_cb
+                    self.picker_cb = None
+                    cb(label)
                 else:
-                    self.cursor.row = row; self.cursor.col = col; self._clamp()
-        elif ch=='q' or key==27 or key==15:   # q / Esc / Ctrl-O
-            self.picker_cb = None; self.mode = Mode.NORMAL; self._jump_back()
+                    self.cursor.row = row
+                    self.cursor.col = col
+                    self._clamp()
+        elif ch == "q" or key == 27 or key == 15:  # q / Esc / Ctrl-O
+            self.picker_cb = None
+            self.mode = Mode.NORMAL
+            self._jump_back()
 
     def _normal_g(self, count):
-        k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
-        if ch2=='g': self.cursor.row=max(0,count-1); self._first_nonblank()
-        elif ch2=='_':
-            line=self.buf.get_line(self.cursor.row); self.cursor.col=max(0,len(line.rstrip())-1)
-        elif ch2=='e': self._word_end(False)
-        elif ch2=='E': self._word_end(True)
-        elif ch2=='d': self._gd()
-        elif ch2=='r': self._gr()
+        k2 = self.stdscr.getch()
+        ch2 = chr(k2) if 32 <= k2 <= 126 else None
+        if ch2 == "g":
+            self.cursor.row = max(0, count - 1)
+            self._first_nonblank()
+        elif ch2 == "_":
+            line = self.buf.get_line(self.cursor.row)
+            self.cursor.col = max(0, len(line.rstrip()) - 1)
+        elif ch2 == "e":
+            self._word_end(False)
+        elif ch2 == "E":
+            self._word_end(True)
+        elif ch2 == "d":
+            self._gd()
+        elif ch2 == "r":
+            self._gr()
 
     def _normal_z(self):
-        k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
-        th=self._pane.height
-        if   ch2=='z': self.top_row=max(0,self.cursor.row-th//2)
-        elif ch2=='t': self.top_row=self.cursor.row
-        elif ch2=='b': self.top_row=max(0,self.cursor.row-th+1)
+        k2 = self.stdscr.getch()
+        ch2 = chr(k2) if 32 <= k2 <= 126 else None
+        th = self._pane.height
+        if ch2 == "z":
+            self.top_row = max(0, self.cursor.row - th // 2)
+        elif ch2 == "t":
+            self.top_row = self.cursor.row
+        elif ch2 == "b":
+            self.top_row = max(0, self.cursor.row - th + 1)
 
     def _ctrl_w(self):
-        k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
-        if   k2==23 or ch2=='w': self._next_pane(1)
-        elif ch2=='W':           self._next_pane(-1)
-        elif ch2=='h' or k2==curses.KEY_LEFT:  self._goto_pane_dir('h')
-        elif ch2=='l' or k2==curses.KEY_RIGHT: self._goto_pane_dir('l')
-        elif ch2=='j' or k2==curses.KEY_DOWN:  self._goto_pane_dir('j')
-        elif ch2=='k' or k2==curses.KEY_UP:    self._goto_pane_dir('k')
-        elif ch2 in ('q','c'): self._close_pane()
-        elif ch2=='v': self._split(vertical=True)
-        elif ch2=='s': self._split(vertical=False)
-        elif ch2=='=': pass  # equalize (TODO)
+        k2 = self.stdscr.getch()
+        ch2 = chr(k2) if 32 <= k2 <= 126 else None
+        if k2 == 23 or ch2 == "w":
+            self._next_pane(1)
+        elif ch2 == "W":
+            self._next_pane(-1)
+        elif ch2 == "h" or k2 == curses.KEY_LEFT:
+            self._goto_pane_dir("h")
+        elif ch2 == "l" or k2 == curses.KEY_RIGHT:
+            self._goto_pane_dir("l")
+        elif ch2 == "j" or k2 == curses.KEY_DOWN:
+            self._goto_pane_dir("j")
+        elif ch2 == "k" or k2 == curses.KEY_UP:
+            self._goto_pane_dir("k")
+        elif ch2 in ("q", "c"):
+            self._close_pane()
+        elif ch2 == "v":
+            self._split(vertical=True)
+        elif ch2 == "s":
+            self._split(vertical=False)
+        elif ch2 == "=":
+            pass  # equalize (TODO)
 
     def _scroll_page(self, count):
-        p=self._pane; th=p.height; dr=th*abs(count)*(1 if count>0 else -1)
-        p.top_row=max(0,min(p.top_row+dr,p.buf.line_count()-1))
-        p.cursor.row=max(0,min(p.cursor.row+dr,p.buf.line_count()-1)); self._clamp()
+        p = self._pane
+        th = p.height
+        dr = th * abs(count) * (1 if count > 0 else -1)
+        p.top_row = max(0, min(p.top_row + dr, p.buf.line_count() - 1))
+        p.cursor.row = max(0, min(p.cursor.row + dr, p.buf.line_count() - 1))
+        self._clamp()
 
     def _scroll_half(self, count):
-        p=self._pane; half=max(1,p.height//2); dr=half*abs(count)*(1 if count>0 else -1)
-        p.top_row=max(0,min(p.top_row+dr,p.buf.line_count()-1))
-        p.cursor.row=max(0,min(p.cursor.row+dr,p.buf.line_count()-1)); self._clamp()
+        p = self._pane
+        half = max(1, p.height // 2)
+        dr = half * abs(count) * (1 if count > 0 else -1)
+        p.top_row = max(0, min(p.top_row + dr, p.buf.line_count() - 1))
+        p.cursor.row = max(0, min(p.cursor.row + dr, p.buf.line_count() - 1))
+        self._clamp()
 
     # ── Operator + motion ─────────────────────────────────────────────────────
 
     def _await_motion(self, op, count):
-        k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
-        if ch2 is None: return
-        if ch2==op:
-            r1=self.cursor.row; r2=min(r1+count-1,self.buf.line_count()-1)
-            self._op_lines(op,r1,r2); return
-        if ch2 in ('i','a'):
-            k3=self.stdscr.getch()
-            if 32<=k3<=126:
-                r1,c1,r2,c2=self._text_object(ch2,chr(k3))
-                if r1 is not None: self._op_range(op,r1,c1,r2,c2)
+        k2 = self.stdscr.getch()
+        ch2 = chr(k2) if 32 <= k2 <= 126 else None
+        if ch2 is None:
             return
-        orig_r,orig_c=self.cursor.row,self.cursor.col
-        if ch2=='k' or k2==curses.KEY_UP:
-            self._op_lines(op,max(0,orig_r-count),orig_r); return
-        if ch2=='j' or k2==curses.KEY_DOWN:
-            self._op_lines(op,orig_r,min(orig_r+count,self.buf.line_count()-1)); return
-        if ch2=='G':
-            self._op_lines(op,orig_r,self.buf.line_count()-1); return
-        if ch2=='g':
-            k3=self.stdscr.getch()
-            if chr(k3)=='g': self._op_lines(op,0,orig_r)
+        if ch2 == op:
+            r1 = self.cursor.row
+            r2 = min(r1 + count - 1, self.buf.line_count() - 1)
+            self._op_lines(op, r1, r2)
             return
-        moved=True
-        if   ch2=='h' or k2==curses.KEY_LEFT:  self._move(0,-count)
-        elif ch2=='l' or k2==curses.KEY_RIGHT:  self._move(0, count)
-        elif ch2=='0': self.cursor.col=0
-        elif ch2=='^': self._first_nonblank()
-        elif ch2=='$':
-            line=self.buf.get_line(self.cursor.row); self.cursor.col=len(line)
-        elif ch2=='w':
-            for _ in range(count): self._word_fwd(False)
-        elif ch2=='W':
-            for _ in range(count): self._word_fwd(True)
-        elif ch2=='b':
-            for _ in range(count): self._word_bwd(False)
-        elif ch2=='e':
-            for _ in range(count): self._word_end(False); self.cursor.col+=1
-        elif ch2=='E':
-            for _ in range(count): self._word_end(True);  self.cursor.col+=1
-        elif ch2=='f':
-            k3=self.stdscr.getch()
-            if 32<=k3<=126: self._char_search(chr(k3),True,False,count); self.cursor.col+=1
-        elif ch2=='t':
-            k3=self.stdscr.getch()
-            if 32<=k3<=126: self._char_search(chr(k3),True,True,count); self.cursor.col+=1
-        else: moved=False
+        if ch2 in ("i", "a"):
+            k3 = self.stdscr.getch()
+            if 32 <= k3 <= 126:
+                r1, c1, r2, c2 = self._text_object(ch2, chr(k3))
+                if r1 is not None:
+                    self._op_range(op, r1, c1, r2, c2)
+            return
+        orig_r, orig_c = self.cursor.row, self.cursor.col
+        if ch2 == "k" or k2 == curses.KEY_UP:
+            self._op_lines(op, max(0, orig_r - count), orig_r)
+            return
+        if ch2 == "j" or k2 == curses.KEY_DOWN:
+            self._op_lines(op, orig_r, min(orig_r + count, self.buf.line_count() - 1))
+            return
+        if ch2 == "G":
+            self._op_lines(op, orig_r, self.buf.line_count() - 1)
+            return
+        if ch2 == "g":
+            k3 = self.stdscr.getch()
+            if chr(k3) == "g":
+                self._op_lines(op, 0, orig_r)
+            return
+        moved = True
+        if ch2 == "h" or k2 == curses.KEY_LEFT:
+            self._move(0, -count)
+        elif ch2 == "l" or k2 == curses.KEY_RIGHT:
+            self._move(0, count)
+        elif ch2 == "0":
+            self.cursor.col = 0
+        elif ch2 == "^":
+            self._first_nonblank()
+        elif ch2 == "$":
+            line = self.buf.get_line(self.cursor.row)
+            self.cursor.col = len(line)
+        elif ch2 == "w":
+            for _ in range(count):
+                self._word_fwd(False)
+        elif ch2 == "W":
+            for _ in range(count):
+                self._word_fwd(True)
+        elif ch2 == "b":
+            for _ in range(count):
+                self._word_bwd(False)
+        elif ch2 == "e":
+            for _ in range(count):
+                self._word_end(False)
+                self.cursor.col += 1
+        elif ch2 == "E":
+            for _ in range(count):
+                self._word_end(True)
+                self.cursor.col += 1
+        elif ch2 == "f":
+            k3 = self.stdscr.getch()
+            if 32 <= k3 <= 126:
+                self._char_search(chr(k3), True, False, count)
+                self.cursor.col += 1
+        elif ch2 == "t":
+            k3 = self.stdscr.getch()
+            if 32 <= k3 <= 126:
+                self._char_search(chr(k3), True, True, count)
+                self.cursor.col += 1
+        else:
+            moved = False
         if moved:
-            nr,nc=self.cursor.row,self.cursor.col
-            self.cursor.row,self.cursor.col=orig_r,orig_c
-            if (orig_r,orig_c)<=(nr,nc): self._op_range(op,orig_r,orig_c,nr,nc)
-            else: self._op_range(op,nr,nc,orig_r,orig_c)
-            if op!='c':
-                self.cursor.row=min(orig_r,nr)
-                self.cursor.col=(min(orig_c,nc) if orig_r==nr
-                                 else orig_c if orig_r<nr else nc)
+            nr, nc = self.cursor.row, self.cursor.col
+            self.cursor.row, self.cursor.col = orig_r, orig_c
+            if (orig_r, orig_c) <= (nr, nc):
+                self._op_range(op, orig_r, orig_c, nr, nc)
+            else:
+                self._op_range(op, nr, nc, orig_r, orig_c)
+            if op != "c":
+                self.cursor.row = min(orig_r, nr)
+                self.cursor.col = (
+                    min(orig_c, nc) if orig_r == nr else orig_c if orig_r < nr else nc
+                )
 
     # ── Insert mode ───────────────────────────────────────────────────────────
 
     def _insert(self, key):
-        ch=chr(key) if 32<=key<=126 else None
-        if key==27: self._enter_normal()
-        elif key in (curses.KEY_BACKSPACE,127,8):
-            if self.cursor.col>0:
-                self.cursor.col-=1; self.buf.delete_char(self.cursor.row,self.cursor.col)
-            elif self.cursor.row>0:
-                prev_len=len(self.buf.get_line(self.cursor.row-1))
-                self.buf.join_lines(self.cursor.row-1)
-                self.cursor.row-=1; self.cursor.col=prev_len
-        elif key==curses.KEY_DC: self.buf.delete_char(self.cursor.row,self.cursor.col)
-        elif key in (10,13):
-            ind=self._indent(self.cursor.row)
-            self.buf.split_line(self.cursor.row,self.cursor.col)
-            self.cursor.row+=1; self.cursor.col=len(ind)
-            self.buf.set_line(self.cursor.row,ind+self.buf.get_line(self.cursor.row))
-        elif key==9:
-            if _is_table_row(self.buf.get_line(self.cursor.row)): self._cell_next()
+        ch = chr(key) if 32 <= key <= 126 else None
+        if key == 27:
+            self._enter_normal()
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.cursor.col > 0:
+                self.cursor.col -= 1
+                self.buf.delete_char(self.cursor.row, self.cursor.col)
+            elif self.cursor.row > 0:
+                prev_len = len(self.buf.get_line(self.cursor.row - 1))
+                self.buf.join_lines(self.cursor.row - 1)
+                self.cursor.row -= 1
+                self.cursor.col = prev_len
+        elif key == curses.KEY_DC:
+            self.buf.delete_char(self.cursor.row, self.cursor.col)
+        elif key in (10, 13):
+            ind = self._indent(self.cursor.row)
+            self.buf.split_line(self.cursor.row, self.cursor.col)
+            self.cursor.row += 1
+            self.cursor.col = len(ind)
+            self.buf.set_line(self.cursor.row, ind + self.buf.get_line(self.cursor.row))
+        elif key == 9:
+            if _is_table_row(self.buf.get_line(self.cursor.row)):
+                self._cell_next()
             else:
-                for _ in range(4): self.buf.insert_char(self.cursor.row,self.cursor.col,' '); self.cursor.col+=1
-        elif key==353:  # Shift-Tab
-            if _is_table_row(self.buf.get_line(self.cursor.row)): self._cell_prev()
-        elif key==23:  # Ctrl-W delete word back
-            line=self.buf.get_line(self.cursor.row); c=self.cursor.col
-            while c>0 and line[c-1]==' ': c-=1
-            while c>0 and line[c-1]!=' ': c-=1
-            n=self.cursor.col-c
-            for _ in range(n): self.buf.delete_char(self.cursor.row,c)
-            self.cursor.col=c
-        elif key==21:  # Ctrl-U delete to line start
-            line=self.buf.get_line(self.cursor.row)
-            self.buf.set_line(self.cursor.row,line[self.cursor.col:]); self.cursor.col=0
-        elif key in (curses.KEY_LEFT,):  self._move(0,-1)
-        elif key in (curses.KEY_RIGHT,): self._move(0, 1)
-        elif key in (curses.KEY_UP,):    self._move(-1,0)
-        elif key in (curses.KEY_DOWN,):  self._move(1, 0)
-        elif key==curses.KEY_HOME: self.cursor.col=0
-        elif key==curses.KEY_END:  self.cursor.col=len(self.buf.get_line(self.cursor.row))
-        elif ch is not None: self.buf.insert_char(self.cursor.row,self.cursor.col,ch); self.cursor.col+=1
+                for _ in range(4):
+                    self.buf.insert_char(self.cursor.row, self.cursor.col, " ")
+                    self.cursor.col += 1
+        elif key == 353:  # Shift-Tab
+            if _is_table_row(self.buf.get_line(self.cursor.row)):
+                self._cell_prev()
+        elif key == 23:  # Ctrl-W delete word back
+            line = self.buf.get_line(self.cursor.row)
+            c = self.cursor.col
+            while c > 0 and line[c - 1] == " ":
+                c -= 1
+            while c > 0 and line[c - 1] != " ":
+                c -= 1
+            n = self.cursor.col - c
+            for _ in range(n):
+                self.buf.delete_char(self.cursor.row, c)
+            self.cursor.col = c
+        elif key == 21:  # Ctrl-U delete to line start
+            line = self.buf.get_line(self.cursor.row)
+            self.buf.set_line(self.cursor.row, line[self.cursor.col :])
+            self.cursor.col = 0
+        elif key in (curses.KEY_LEFT,):
+            self._move(0, -1)
+        elif key in (curses.KEY_RIGHT,):
+            self._move(0, 1)
+        elif key in (curses.KEY_UP,):
+            self._move(-1, 0)
+        elif key in (curses.KEY_DOWN,):
+            self._move(1, 0)
+        elif key == curses.KEY_HOME:
+            self.cursor.col = 0
+        elif key == curses.KEY_END:
+            self.cursor.col = len(self.buf.get_line(self.cursor.row))
+        elif ch is not None:
+            self.buf.insert_char(self.cursor.row, self.cursor.col, ch)
+            self.cursor.col += 1
 
     # ── Visual modes ──────────────────────────────────────────────────────────
 
     def _vmove(self, key, count=1):
         """Handle a motion key in visual mode. Returns True if consumed."""
-        ch=chr(key) if 32<=key<=126 else None
-        if   key==curses.KEY_LEFT  or ch=='h': [self._move(0,-1) for _ in range(count)]
-        elif key==curses.KEY_RIGHT or ch=='l': [self._move(0, 1) for _ in range(count)]
-        elif key==curses.KEY_UP    or ch=='k': [self._move(-1,0) for _ in range(count)]
-        elif key==curses.KEY_DOWN  or ch=='j': [self._move(1, 0) for _ in range(count)]
-        elif ch=='0': self.cursor.col=0; self.cursor.col_want=0
-        elif ch=='^': self._first_nonblank()
-        elif ch=='$':
-            self.cursor.col=max(0,len(self.buf.get_line(self.cursor.row))-1)
-            self.cursor.col_want=999999
-        elif ch=='w': [self._word_fwd(False) for _ in range(count)]
-        elif ch=='W': [self._word_fwd(True)  for _ in range(count)]
-        elif ch=='b': [self._word_bwd(False) for _ in range(count)]
-        elif ch=='B': [self._word_bwd(True)  for _ in range(count)]
-        elif ch=='e': [self._word_end(False) for _ in range(count)]
-        elif ch=='E': [self._word_end(True)  for _ in range(count)]
-        elif ch=='{': [self._para_bwd() for _ in range(count)]
-        elif ch=='}': [self._para_fwd() for _ in range(count)]
-        elif key==6  or key==curses.KEY_NPAGE: self._scroll_page(count)
-        elif key==2  or key==curses.KEY_PPAGE: self._scroll_page(-count)
-        elif key==4:  self._scroll_half(count)
-        elif key==21: self._scroll_half(-count)
-        elif ch=='f':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),True,False,count)
-        elif ch=='F':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),False,False,count)
-        elif ch=='t':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),True,True,count)
-        elif ch=='T':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126: self._char_search(chr(k2),False,True,count)
-        elif ch==';' and self.last_f_char: self._char_search(self.last_f_char,self.last_f_forward,self.last_f_till,count)
-        elif ch==',' and self.last_f_char: self._char_search(self.last_f_char,not self.last_f_forward,self.last_f_till,count)
-        elif ch=='G': self.cursor.row=self.buf.line_count()-1; self._first_nonblank()
-        elif ch=='g':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126 and chr(k2)=='g': self.cursor.row=0; self._first_nonblank()
-        elif key==curses.KEY_HOME: self.cursor.col=0
-        elif key==curses.KEY_END:
-            self.cursor.col=max(0,len(self.buf.get_line(self.cursor.row))-1)
-        else: return False
+        ch = chr(key) if 32 <= key <= 126 else None
+        if key == curses.KEY_LEFT or ch == "h":
+            [self._move(0, -1) for _ in range(count)]
+        elif key == curses.KEY_RIGHT or ch == "l":
+            [self._move(0, 1) for _ in range(count)]
+        elif key == curses.KEY_UP or ch == "k":
+            [self._move(-1, 0) for _ in range(count)]
+        elif key == curses.KEY_DOWN or ch == "j":
+            [self._move(1, 0) for _ in range(count)]
+        elif ch == "0":
+            self.cursor.col = 0
+            self.cursor.col_want = 0
+        elif ch == "^":
+            self._first_nonblank()
+        elif ch == "$":
+            self.cursor.col = max(0, len(self.buf.get_line(self.cursor.row)) - 1)
+            self.cursor.col_want = 999999
+        elif ch == "w":
+            [self._word_fwd(False) for _ in range(count)]
+        elif ch == "W":
+            [self._word_fwd(True) for _ in range(count)]
+        elif ch == "b":
+            [self._word_bwd(False) for _ in range(count)]
+        elif ch == "B":
+            [self._word_bwd(True) for _ in range(count)]
+        elif ch == "e":
+            [self._word_end(False) for _ in range(count)]
+        elif ch == "E":
+            [self._word_end(True) for _ in range(count)]
+        elif ch == "{":
+            [self._para_bwd() for _ in range(count)]
+        elif ch == "}":
+            [self._para_fwd() for _ in range(count)]
+        elif key == 6 or key == curses.KEY_NPAGE:
+            self._scroll_page(count)
+        elif key == 2 or key == curses.KEY_PPAGE:
+            self._scroll_page(-count)
+        elif key == 4:
+            self._scroll_half(count)
+        elif key == 21:
+            self._scroll_half(-count)
+        elif ch == "f":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self._char_search(chr(k2), True, False, count)
+        elif ch == "F":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self._char_search(chr(k2), False, False, count)
+        elif ch == "t":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self._char_search(chr(k2), True, True, count)
+        elif ch == "T":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                self._char_search(chr(k2), False, True, count)
+        elif ch == ";" and self.last_f_char:
+            self._char_search(
+                self.last_f_char, self.last_f_forward, self.last_f_till, count
+            )
+        elif ch == "," and self.last_f_char:
+            self._char_search(
+                self.last_f_char, not self.last_f_forward, self.last_f_till, count
+            )
+        elif ch == "G":
+            self.cursor.row = self.buf.line_count() - 1
+            self._first_nonblank()
+        elif ch == "g":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126 and chr(k2) == "g":
+                self.cursor.row = 0
+                self._first_nonblank()
+        elif key == curses.KEY_HOME:
+            self.cursor.col = 0
+        elif key == curses.KEY_END:
+            self.cursor.col = max(0, len(self.buf.get_line(self.cursor.row)) - 1)
+        else:
+            return False
         return True
 
     def _vis_yank(self):
-        r1,c1,r2,c2=self._vis_range()
-        if r1==r2: self.register_text=self.buf.get_line(r1)[c1:c2+1]
+        r1, c1, r2, c2 = self._vis_range()
+        if r1 == r2:
+            self.register_text = self.buf.get_line(r1)[c1 : c2 + 1]
         else:
-            pts=[self.buf.get_line(r1)[c1:]]
-            for r in range(r1+1,r2): pts.append(self.buf.get_line(r))
-            pts.append(self.buf.get_line(r2)[:c2+1])
-            self.register_text='\n'.join(pts)
-        self.register_linewise=False
-        self.cursor.row,self.cursor.col=r1,c1
+            pts = [self.buf.get_line(r1)[c1:]]
+            for r in range(r1 + 1, r2):
+                pts.append(self.buf.get_line(r))
+            pts.append(self.buf.get_line(r2)[: c2 + 1])
+            self.register_text = "\n".join(pts)
+        self.register_linewise = False
+        self.cursor.row, self.cursor.col = r1, c1
 
     def _vis_case(self, fn):
-        r1,c1,r2,c2=self._vis_range()
+        r1, c1, r2, c2 = self._vis_range()
         self.buf.save_undo()
-        if r1==r2:
-            ln=self.buf.get_line(r1)
-            self.buf.set_line(r1, ln[:c1]+fn(ln[c1:c2+1])+ln[c2+1:])
+        if r1 == r2:
+            ln = self.buf.get_line(r1)
+            self.buf.set_line(r1, ln[:c1] + fn(ln[c1 : c2 + 1]) + ln[c2 + 1 :])
         else:
-            ln=self.buf.get_line(r1); self.buf.set_line(r1, ln[:c1]+fn(ln[c1:]))
-            for r in range(r1+1,r2): self.buf.set_line(r, fn(self.buf.get_line(r)))
-            ln=self.buf.get_line(r2); self.buf.set_line(r2, fn(ln[:c2+1])+ln[c2+1:])
+            ln = self.buf.get_line(r1)
+            self.buf.set_line(r1, ln[:c1] + fn(ln[c1:]))
+            for r in range(r1 + 1, r2):
+                self.buf.set_line(r, fn(self.buf.get_line(r)))
+            ln = self.buf.get_line(r2)
+            self.buf.set_line(r2, fn(ln[: c2 + 1]) + ln[c2 + 1 :])
         self._enter_normal()
 
     def _visual(self, key):
-        ch=chr(key) if 32<=key<=126 else None
+        ch = chr(key) if 32 <= key <= 126 else None
 
         # Count prefix
-        if ch and ch.isdigit() and (ch!='0' or self.pending_count):
-            self.pending_count+=ch; return
-        count=int(self.pending_count) if self.pending_count else 1
-        self.pending_count=''
-
-        if key==27 or ch=='v': self._enter_normal(); return
-        if ch=='V':
-            self.mode=Mode.VISUAL_LINE
-            self.visual_start=(self.visual_start[0], 0)
+        if ch and ch.isdigit() and (ch != "0" or self.pending_count):
+            self.pending_count += ch
             return
-        if ch=='o':  # swap cursor and anchor
-            self.visual_start, (self.cursor.row, self.cursor.col) = \
-                (self.cursor.row, self.cursor.col), self.visual_start
-            return
-        if ch==':':
-            self.mode=Mode.COMMAND; self.cmd_line=":'<,'>"; return
-        if key==5:   # Ctrl-E — eval selection
-            sr,sc=self.visual_start; er,ec=self.cursor.row,self.cursor.col
-            if (sr,sc)>(er,ec): sr,sc,er,ec=er,ec,sr,sc
-            self._eval_region(sr, er); self._enter_normal(); return
-        if ch=='n': self._search_next(self.search_dir); return
-        if ch=='N': self._search_next(-self.search_dir); return
-        if self._vmove(key, count): return
+        count = int(self.pending_count) if self.pending_count else 1
+        self.pending_count = ""
 
-        r1,c1,r2,c2=self._vis_range()
-        if ch in ('d','x'):
-            self._op_range('d',r1,c1,r2,c2+1); self._enter_normal()
-        elif ch=='y':
-            self._vis_yank(); self._enter_normal()
-            self.status_msg='Yanked'
-        elif ch=='c': self._op_range('c',r1,c1,r2,c2+1)
-        elif ch=='s': self._op_range('c',r1,c1,r2,c2+1)
-        elif ch=='p' or ch=='P':
+        if key == 27 or ch == "v":
+            self._enter_normal()
+            return
+        if ch == "V":
+            self.mode = Mode.VISUAL_LINE
+            self.visual_start = (self.visual_start[0], 0)
+            return
+        if ch == "o":  # swap cursor and anchor
+            self.visual_start, (self.cursor.row, self.cursor.col) = (
+                (self.cursor.row, self.cursor.col),
+                self.visual_start,
+            )
+            return
+        if ch == ":":
+            self.mode = Mode.COMMAND
+            self.cmd_line = ":'<,'>"
+            return
+        if key == 5:  # Ctrl-E — eval selection
+            sr, sc = self.visual_start
+            er, ec = self.cursor.row, self.cursor.col
+            if (sr, sc) > (er, ec):
+                sr, sc, er, ec = er, ec, sr, sc
+            self._eval_region(sr, er)
+            self._enter_normal()
+            return
+        if ch == "n":
+            self._search_next(self.search_dir)
+            return
+        if ch == "N":
+            self._search_next(-self.search_dir)
+            return
+        if self._vmove(key, count):
+            return
+
+        r1, c1, r2, c2 = self._vis_range()
+        if ch in ("d", "x"):
+            self._op_range("d", r1, c1, r2, c2 + 1)
+            self._enter_normal()
+        elif ch == "y":
+            self._vis_yank()
+            self._enter_normal()
+            self.status_msg = "Yanked"
+        elif ch == "c":
+            self._op_range("c", r1, c1, r2, c2 + 1)
+        elif ch == "s":
+            self._op_range("c", r1, c1, r2, c2 + 1)
+        elif ch == "p" or ch == "P":
             # Replace selection with register
-            self._op_range('d',r1,c1,r2,c2+1)
-            self.cursor.row,self.cursor.col=r1,c1
+            self._op_range("d", r1, c1, r2, c2 + 1)
+            self.cursor.row, self.cursor.col = r1, c1
             self._paste(False)
             self._enter_normal()
-        elif ch=='>': self._indent_lines(r1,r2,1); self._enter_normal()
-        elif ch=='<': self._indent_lines(r1,r2,-1); self._enter_normal()
-        elif ch=='~': self._vis_case(str.swapcase)
-        elif ch=='u': self._vis_case(str.lower)
-        elif ch=='U': self._vis_case(str.upper)
-        elif ch=='r':
-            k2=self.stdscr.getch()
-            if 32<=k2<=126:
-                repl=chr(k2); self.buf.save_undo()
-                if r1==r2:
-                    ln=self.buf.get_line(r1)
-                    self.buf.set_line(r1,ln[:c1]+repl*(c2-c1+1)+ln[c2+1:])
+        elif ch == ">":
+            self._indent_lines(r1, r2, 1)
+            self._enter_normal()
+        elif ch == "<":
+            self._indent_lines(r1, r2, -1)
+            self._enter_normal()
+        elif ch == "~":
+            self._vis_case(str.swapcase)
+        elif ch == "u":
+            self._vis_case(str.lower)
+        elif ch == "U":
+            self._vis_case(str.upper)
+        elif ch == "r":
+            k2 = self.stdscr.getch()
+            if 32 <= k2 <= 126:
+                repl = chr(k2)
+                self.buf.save_undo()
+                if r1 == r2:
+                    ln = self.buf.get_line(r1)
+                    self.buf.set_line(r1, ln[:c1] + repl * (c2 - c1 + 1) + ln[c2 + 1 :])
                 else:
-                    ln=self.buf.get_line(r1); self.buf.set_line(r1,ln[:c1]+repl*len(ln[c1:]))
-                    for r in range(r1+1,r2):
-                        self.buf.set_line(r,repl*len(self.buf.get_line(r)))
-                    ln=self.buf.get_line(r2); self.buf.set_line(r2,repl*(c2+1)+ln[c2+1:])
+                    ln = self.buf.get_line(r1)
+                    self.buf.set_line(r1, ln[:c1] + repl * len(ln[c1:]))
+                    for r in range(r1 + 1, r2):
+                        self.buf.set_line(r, repl * len(self.buf.get_line(r)))
+                    ln = self.buf.get_line(r2)
+                    self.buf.set_line(r2, repl * (c2 + 1) + ln[c2 + 1 :])
                 self._enter_normal()
-        elif ch=='J':
+        elif ch == "J":
             self.buf.save_undo()
-            for _ in range(r2-r1):
-                ln=self.buf.get_line(r1); nxt=self.buf.get_line(r1+1).lstrip()
-                self.buf.set_line(r1,(ln.rstrip()+' '+nxt) if nxt else ln.rstrip())
-                self.buf.delete_line(r1+1)
-            self.cursor.row=r1; self._enter_normal()
+            for _ in range(r2 - r1):
+                ln = self.buf.get_line(r1)
+                nxt = self.buf.get_line(r1 + 1).lstrip()
+                self.buf.set_line(r1, (ln.rstrip() + " " + nxt) if nxt else ln.rstrip())
+                self.buf.delete_line(r1 + 1)
+            self.cursor.row = r1
+            self._enter_normal()
 
     def _visual_line(self, key):
-        ch=chr(key) if 32<=key<=126 else None
+        ch = chr(key) if 32 <= key <= 126 else None
 
         # Count prefix
-        if ch and ch.isdigit() and (ch!='0' or self.pending_count):
-            self.pending_count+=ch; return
-        count=int(self.pending_count) if self.pending_count else 1
-        self.pending_count=''
-
-        if key==27 or ch=='V': self._enter_normal(); return
-        if ch=='v': self.mode=Mode.VISUAL; return
-        if ch=='o':  # swap anchor
-            self.visual_start, (self.cursor.row, self.cursor.col) = \
-                (self.cursor.row, self.cursor.col), self.visual_start
+        if ch and ch.isdigit() and (ch != "0" or self.pending_count):
+            self.pending_count += ch
             return
-        if ch==':':
-            self.mode=Mode.COMMAND; self.cmd_line=":'<,'>"; return
-        if ch=='n': self._search_next(self.search_dir); return
-        if ch=='N': self._search_next(-self.search_dir); return
-        if key==5:   # Ctrl-E — eval selection (line-wise)
-            r1,r2=self._vis_lrange()
-            self._eval_region(r1, r2); self._enter_normal(); return
+        count = int(self.pending_count) if self.pending_count else 1
+        self.pending_count = ""
+
+        if key == 27 or ch == "V":
+            self._enter_normal()
+            return
+        if ch == "v":
+            self.mode = Mode.VISUAL
+            return
+        if ch == "o":  # swap anchor
+            self.visual_start, (self.cursor.row, self.cursor.col) = (
+                (self.cursor.row, self.cursor.col),
+                self.visual_start,
+            )
+            return
+        if ch == ":":
+            self.mode = Mode.COMMAND
+            self.cmd_line = ":'<,'>"
+            return
+        if ch == "n":
+            self._search_next(self.search_dir)
+            return
+        if ch == "N":
+            self._search_next(-self.search_dir)
+            return
+        if key == 5:  # Ctrl-E — eval selection (line-wise)
+            r1, r2 = self._vis_lrange()
+            self._eval_region(r1, r2)
+            self._enter_normal()
+            return
 
         # All motions (line-mode cares about row movement mainly)
-        moved=self._vmove(key, count)
+        moved = self._vmove(key, count)
 
-        r1,r2=self._vis_lrange()
-        if moved: return  # motion only, no operator
-        if ch in ('d','x'): self._op_lines('d',r1,r2); self._enter_normal()
-        elif ch=='y':
-            self.register_text='\n'.join(self.buf.lines[r1:r2+1])
-            self.register_linewise=True
-            self.cursor.row=r1; self._first_nonblank(); self._enter_normal()
-            self.status_msg=f'Yanked {r2-r1+1} lines'
-        elif ch=='c': self._op_lines('c',r1,r2)
-        elif ch=='s': self._op_lines('c',r1,r2)
-        elif ch=='p' or ch=='P':
-            self._op_lines('d',r1,r2)
-            self._paste(False); self._enter_normal()
-        elif ch=='>': self._indent_lines(r1,r2,1); self._enter_normal()
-        elif ch=='<': self._indent_lines(r1,r2,-1); self._enter_normal()
-        elif ch=='~':
-            self.buf.save_undo()
-            for r in range(r1,r2+1): self.buf.set_line(r,self.buf.get_line(r).swapcase())
+        r1, r2 = self._vis_lrange()
+        if moved:
+            return  # motion only, no operator
+        if ch in ("d", "x"):
+            self._op_lines("d", r1, r2)
             self._enter_normal()
-        elif ch=='u':
-            self.buf.save_undo()
-            for r in range(r1,r2+1): self.buf.set_line(r,self.buf.get_line(r).lower())
+        elif ch == "y":
+            self.register_text = "\n".join(self.buf.lines[r1 : r2 + 1])
+            self.register_linewise = True
+            self.cursor.row = r1
+            self._first_nonblank()
             self._enter_normal()
-        elif ch=='U':
-            self.buf.save_undo()
-            for r in range(r1,r2+1): self.buf.set_line(r,self.buf.get_line(r).upper())
+            self.status_msg = f"Yanked {r2 - r1 + 1} lines"
+        elif ch == "c":
+            self._op_lines("c", r1, r2)
+        elif ch == "s":
+            self._op_lines("c", r1, r2)
+        elif ch == "p" or ch == "P":
+            self._op_lines("d", r1, r2)
+            self._paste(False)
             self._enter_normal()
-        elif ch=='J':
+        elif ch == ">":
+            self._indent_lines(r1, r2, 1)
+            self._enter_normal()
+        elif ch == "<":
+            self._indent_lines(r1, r2, -1)
+            self._enter_normal()
+        elif ch == "~":
             self.buf.save_undo()
-            for _ in range(r2-r1):
-                ln=self.buf.get_line(r1); nxt=self.buf.get_line(r1+1).lstrip()
-                self.buf.set_line(r1,(ln.rstrip()+' '+nxt) if nxt else ln.rstrip())
-                self.buf.delete_line(r1+1)
-            self.cursor.row=r1; self._enter_normal()
-
-    def _vis_range(self):
-        sr,sc=self.visual_start; er,ec=self.cursor.row,self.cursor.col
-        return (er,ec,sr,sc) if (sr,sc)>(er,ec) else (sr,sc,er,ec)
-
-    def _vis_lrange(self):
-        sr=self.visual_start[0]; er=self.cursor.row; return min(sr,er),max(sr,er)
-
-    # ── Command mode ──────────────────────────────────────────────────────────
-
-    def _command_key(self, key):
-        if key==27: self.mode=Mode.NORMAL; self.cmd_line=''
-        elif key in (10,13):
-            cmd=self.cmd_line[1:]; self.mode=Mode.NORMAL; self.cmd_line=''; self._exec_cmd(cmd)
-        elif key in (curses.KEY_BACKSPACE,127,8):
-            if len(self.cmd_line)>1: self.cmd_line=self.cmd_line[:-1]
-            else: self.mode=Mode.NORMAL; self.cmd_line=''
-        elif 32<=key<=126: self.cmd_line+=chr(key)
+            for r in range(r1, r2 + 1):
+                self.buf.set_line(r, self.buf.get_line(r).swapcase())
+            self._enter_normal()
+        elif ch == "u":
+            self.buf.save_undo()
+            for r in range(r1, r2 + 1):
+                self.buf.set_line(r, self.buf.get_line(r).lower())
+            self._enter_normal()
+        elif ch == "U":
+            self.buf.save_undo()
+            for r in range(r1, r2 + 1):
+                self.buf.set_line(r, self.buf.get_line(r).upper())
+            self._enter_normal()
 
     # ── Python eval integration ───────────────────────────────────────────────
 
     def _eval_ns(self):
         """Return the persistent eval namespace, seeded with live editor refs."""
-        if not hasattr(self, '_py_ns'):
+        if not hasattr(self, "_py_ns"):
             self._py_ns = {}
-        self._py_ns.update({'ed': self, 'buf': self.buf, 'pane': self._pane})
+        self._py_ns.update({"ed": self, "buf": self.buf, "pane": self._pane})
         return self._py_ns
 
     @staticmethod
     def _buf_is_python(buf):
         """True if the buffer looks like Python — .py extension or valid ast.parse."""
         import ast
-        if buf.filename and buf.filename.endswith(('.py', '.pyw')):
+
+        if buf.filename and buf.filename.endswith((".py", ".pyw")):
             return True
         if buf.filename:
             return False  # named non-Python file — don't even try
         # Unnamed buffer: try parsing first non-blank lines as a heuristic
-        sample = '\n'.join(l for l in buf.lines[:20] if l.strip())
+        sample = "\n".join(l for l in buf.lines[:20] if l.strip())
         try:
-            ast.parse(sample); return True
+            ast.parse(sample)
+            return True
         except SyntaxError:
             return False
 
@@ -2630,13 +3946,18 @@ class Editor:
         anything already present in the eval namespace.
         """
         import ast
+
         if not self._buf_is_python(self.buf):
             return []
         ns = self._eval_ns()
-        builtins = set(dir(__builtins__)) if isinstance(__builtins__, dict) else set(dir(__builtins__))
+        builtins = (
+            set(dir(__builtins__))
+            if isinstance(__builtins__, dict)
+            else set(dir(__builtins__))
+        )
 
         # 1. Find names the selection uses but doesn't define locally.
-        sel_src = '\n'.join(self.buf.get_line(r) for r in range(r1, r2+1))
+        sel_src = "\n".join(self.buf.get_line(r) for r in range(r1, r2 + 1))
         try:
             sel_tree = ast.parse(sel_src)
         except SyntaxError:
@@ -2649,8 +3970,10 @@ class Editor:
             elif isinstance(node, ast.Attribute):
                 # dotted access: collect root name (random.gauss → random)
                 n = node
-                while isinstance(n, ast.Attribute): n = n.value
-                if isinstance(n, ast.Name): used.add(n.id)
+                while isinstance(n, ast.Attribute):
+                    n = n.value
+                if isinstance(n, ast.Name):
+                    used.add(n.id)
 
         local_defs = set()
         for node in ast.walk(sel_tree):
@@ -2658,17 +3981,18 @@ class Editor:
                 local_defs.add(node.name)
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
-                    if isinstance(t, ast.Name): local_defs.add(t.id)
+                    if isinstance(t, ast.Name):
+                        local_defs.add(t.id)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 for a in node.names:
-                    local_defs.add(a.asname or a.name.split('.')[0])
+                    local_defs.add(a.asname or a.name.split(".")[0])
 
         free = used - local_defs - builtins - set(ns)
         if not free:
             return []
 
         # 2. Walk the file's top-level nodes to find what supplies each free name.
-        full_src = '\n'.join(self.buf.lines)
+        full_src = "\n".join(self.buf.lines)
         try:
             full_tree = ast.parse(full_src)
         except SyntaxError:
@@ -2678,26 +4002,29 @@ class Editor:
         seen_names = set()
         for node in ast.iter_child_nodes(full_tree):
             node_r1 = node.lineno - 1  # convert to 0-indexed
-            if node_r1 >= r1:          # don't look at or past the selection
+            if node_r1 >= r1:  # don't look at or past the selection
                 continue
 
             provided = set()
             if isinstance(node, ast.Import):
                 for a in node.names:
-                    provided.add(a.asname or a.name.split('.')[0])
+                    provided.add(a.asname or a.name.split(".")[0])
             elif isinstance(node, ast.ImportFrom):
                 for a in node.names:
-                    provided.add(a.asname or (a.name if a.name != '*' else ''))
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    provided.add(a.asname or (a.name if a.name != "*" else ""))
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
                 provided.add(node.name)
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
-                    if isinstance(t, ast.Name): provided.add(t.id)
+                    if isinstance(t, ast.Name):
+                        provided.add(t.id)
 
             needed = provided & free - seen_names
             if needed:
-                end = getattr(node, 'end_lineno', node.lineno) - 1
-                src = '\n'.join(self.buf.lines[node_r1:end+1])
+                end = getattr(node, "end_lineno", node.lineno) - 1
+                src = "\n".join(self.buf.lines[node_r1 : end + 1])
                 deps.append(src)
                 seen_names |= needed
 
@@ -2706,28 +4033,29 @@ class Editor:
     def _eval_region(self, r1, r2):
         """Eval lines r1..r2 (inclusive), insert captured output after r2."""
         import io, contextlib, traceback
+
         ns = self._eval_ns()
         for dep in self._resolve_deps(r1, r2):
             try:
-                exec(compile(dep, '<dep>', 'exec'), ns)
+                exec(compile(dep, "<dep>", "exec"), ns)
             except Exception:
                 pass
-        code = '\n'.join(self.buf.get_line(r) for r in range(r1, r2+1))
+        code = "\n".join(self.buf.get_line(r) for r in range(r1, r2 + 1))
         out = io.StringIO()
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                exec(compile(code, '<pyvim>', 'exec'), self._eval_ns())
+                exec(compile(code, "<pyvim>", "exec"), self._eval_ns())
             result = out.getvalue()
-            self.status_msg = 'eval ok'
+            self.status_msg = "eval ok"
         except Exception:
             result = traceback.format_exc()
             self.status_err = True
             self.status_msg = result.splitlines()[-1]
         if result.strip():
             self.buf.save_undo()
-            lines = result.rstrip('\n').splitlines()
+            lines = result.rstrip("\n").splitlines()
             for i, line in enumerate(lines):
-                self.buf.insert_line(r2 + 1 + i, '# >> ' + line)
+                self.buf.insert_line(r2 + 1 + i, "# >> " + line)
             self.cursor.row = r2 + 1
 
     def _exec_file_toplevel(self):
@@ -2735,617 +4063,1001 @@ class Editor:
         Used to pre-populate the REPL so all imports and defs are available.
         """
         import ast
+
         if not self._buf_is_python(self.buf):
             return
         ns = self._eval_ns()
-        full_src = '\n'.join(self.buf.lines)
+        full_src = "\n".join(self.buf.lines)
         try:
             full_tree = ast.parse(full_src)
         except SyntaxError:
             return
         for node in ast.iter_child_nodes(full_tree):
             r1 = node.lineno - 1
-            end = getattr(node, 'end_lineno', node.lineno) - 1
-            src = '\n'.join(self.buf.lines[r1:end+1])
+            end = getattr(node, "end_lineno", node.lineno) - 1
+            src = "\n".join(self.buf.lines[r1 : end + 1])
             try:
-                exec(compile(src, '<toplevel>', 'exec'), ns)
+                exec(compile(src, "<toplevel>", "exec"), ns)
             except Exception:
                 pass
 
     def _py_repl(self):
         """Drop into an interactive Python REPL, then return to pyvim."""
         import code as _code
+
         self._exec_file_toplevel()
         curses.endwin()
-        print(f'\n  pyvim REPL  —  locals: ed, buf, pane  —  Ctrl-D to return\n')
-        _code.interact(local=self._eval_ns(), banner='')
+        print(f"\n  pyvim REPL  —  locals: ed, buf, pane  —  Ctrl-D to return\n")
+        _code.interact(local=self._eval_ns(), banner="")
         self.stdscr.refresh()
-        self.status_msg = 'returned from REPL'
+        self.status_msg = "returned from REPL"
 
     def _py_exec(self, expr):
         """Eval a single expression from command line, show result in status."""
         import io, contextlib, traceback
+
         out = io.StringIO()
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                result = eval(compile(expr, '<cmd>', 'eval'), self._eval_ns())
-            self.status_msg = repr(result) if result is not None else (out.getvalue().rstrip() or 'ok')
+                result = eval(compile(expr, "<cmd>", "eval"), self._eval_ns())
+            self.status_msg = (
+                repr(result)
+                if result is not None
+                else (out.getvalue().rstrip() or "ok")
+            )
         except SyntaxError:
             try:
                 with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                    exec(compile(expr, '<cmd>', 'exec'), self._eval_ns())
-                self.status_msg = out.getvalue().rstrip() or 'ok'
+                    exec(compile(expr, "<cmd>", "exec"), self._eval_ns())
+                self.status_msg = out.getvalue().rstrip() or "ok"
             except Exception:
-                self.status_msg = traceback.format_exc().splitlines()[-1]; self.status_err = True
+                self.status_msg = traceback.format_exc().splitlines()[-1]
+                self.status_err = True
         except Exception:
-            self.status_msg = traceback.format_exc().splitlines()[-1]; self.status_err = True
+            self.status_msg = traceback.format_exc().splitlines()[-1]
+            self.status_err = True
 
     def _disk_changed(self, fname=None):
         """Return True if the file on disk has been modified since we last read/wrote it."""
-        target=fname or self.buf.filename
-        if not target: return False
-        try: return os.path.getmtime(target) != self.buf._disk_mtime
-        except OSError: return False
+        target = fname or self.buf.filename
+        if not target:
+            return False
+        try:
+            return os.path.getmtime(target) != self.buf._disk_mtime
+        except OSError:
+            return False
 
     def _exec_cmd(self, cmd):
-        cmd=cmd.strip()
-        if not cmd: return
-        if cmd in ('py','python'):
-            self._py_repl(); return
-        elif cmd.startswith('py ') or cmd.startswith('python '):
-            self._py_exec(cmd.split(None,1)[1]); return
-        if cmd in ('qa','qall'):
-            dirty=[p for p in self._panes if p.buf.modified]
+        cmd = cmd.strip()
+        if not cmd:
+            return
+        if cmd in ("py", "python"):
+            self._py_repl()
+            return
+        elif cmd.startswith("py ") or cmd.startswith("python "):
+            self._py_exec(cmd.split(None, 1)[1])
+            return
+        if cmd in ("qa", "qall"):
+            dirty = [p for p in self._panes if p.buf.modified]
             if dirty:
-                names=', '.join(p.buf.filename or '[No Name]' for p in dirty)
-                self.status_msg=f'No write since last change: {names} (add ! to override)'; self.status_err=True
+                names = ", ".join(p.buf.filename or "[No Name]" for p in dirty)
+                self.status_msg = (
+                    f"No write since last change: {names} (add ! to override)"
+                )
+                self.status_err = True
             else:
-                self.running=False
-        elif cmd in ('qa!','qall!'):
-            self.running=False
-        elif cmd in ('q','quit'):
+                self.running = False
+        elif cmd in ("qa!", "qall!"):
+            self.running = False
+        elif cmd in ("q", "quit"):
             if self.buf.modified:
-                self.status_msg='No write since last change (add ! to override)'; self.status_err=True
+                self.status_msg = "No write since last change (add ! to override)"
+                self.status_err = True
             else:
                 self._close_pane()
-        elif cmd in ('q!','quit!'):
+        elif cmd in ("q!", "quit!"):
             self._close_pane(force=True)
-        elif re.match(r'^wq?!?$',cmd) or cmd in ('x','wq','x!'):
-            parts=cmd.split(None,1); fname=parts[1] if len(parts)>1 else None
-            force='!' in cmd or cmd=='x'
+        elif re.match(r"^wq?!?$", cmd) or cmd in ("x", "wq", "x!"):
+            parts = cmd.split(None, 1)
+            fname = parts[1] if len(parts) > 1 else None
+            force = "!" in cmd or cmd == "x"
             if not force and self._disk_changed(fname):
+
                 def _do_wq(f=fname):
-                    try: self.buf.save(f); self._close_pane(force=True)
-                    except Exception as e: self.status_msg=str(e); self.status_err=True
-                self._confirm_cb=_do_wq
-                self._confirm_msg=f'"{fname or self.buf.filename}" changed on disk. Overwrite? [y/N] '
-            else:
-                try: self.buf.save(fname); self._close_pane(force=True)
-                except Exception as e: self.status_msg=str(e); self.status_err=True
-        elif cmd.startswith('w') and (len(cmd)==1 or cmd[1] in ' !'):
-            parts=cmd.split(None,1); fname=parts[1] if len(parts)>1 else None
-            force='!' in cmd
-            if not force and self._disk_changed(fname):
-                def _do_w(f=fname):
                     try:
                         self.buf.save(f)
-                        self.status_msg=f'"{self.buf.filename}" {self.buf.line_count()}L written'
-                    except Exception as e: self.status_msg=str(e); self.status_err=True
-                self._confirm_cb=_do_w
-                self._confirm_msg=f'"{fname or self.buf.filename}" changed on disk. Overwrite? [y/N] '
+                        self._close_pane(force=True)
+                    except Exception as e:
+                        self.status_msg = str(e)
+                        self.status_err = True
+
+                self._confirm_cb = _do_wq
+                self._confirm_msg = (
+                    f'"{fname or self.buf.filename}" changed on disk. Overwrite? [y/N] '
+                )
             else:
                 try:
                     self.buf.save(fname)
-                    self.status_msg=f'"{self.buf.filename}" {self.buf.line_count()}L written'
-                except Exception as e: self.status_msg=str(e); self.status_err=True
-        elif cmd.startswith('e ') or cmd.startswith('edit '):
-            parts=cmd.split(None,1)
-            if len(parts)>1: self._load_file(parts[1].strip())
-        elif cmd.startswith('r '):
-            fname=cmd[2:].strip()
-            try:
-                with open(fname,errors='replace') as f: lines=f.read().splitlines()
-                self.buf.save_undo()
-                for i,l in enumerate(lines): self.buf.insert_line(self.cursor.row+1+i,l)
-                self.status_msg=f'Read {len(lines)} lines'
-            except Exception as e: self.status_msg=str(e); self.status_err=True
-        elif re.match(r'^\d+$',cmd):
-            self.cursor.row=max(0,min(int(cmd)-1,self.buf.line_count()-1)); self._first_nonblank()
-        elif cmd=='$':
-            self.cursor.row=self.buf.line_count()-1; self._first_nonblank()
-        elif re.match(r'^fin?d?\b', cmd):
+                    self._close_pane(force=True)
+                except Exception as e:
+                    self.status_msg = str(e)
+                    self.status_err = True
+        elif cmd.startswith("w") and (len(cmd) == 1 or cmd[1] in " !"):
             parts = cmd.split(None, 1)
-            self._cmd_find(parts[1].strip() if len(parts) > 1 else '')
-        elif re.match(r'^(%|\.|\d+(,(\d+|\.|\$))?)?s',cmd):
-            self._exec_sub(cmd)
-        elif cmd.startswith('set ') or cmd=='set':
-            self._exec_set(cmd[4:].strip() if cmd.startswith('set ') else '')
-        elif cmd.startswith('colorscheme') or cmd.startswith('colo'):
-            parts=cmd.split(None,1)
-            if len(parts)<2:
-                self.status_msg=f'colorscheme: {", ".join(_SCHEMES)}'; self.status_err=False
+            fname = parts[1] if len(parts) > 1 else None
+            force = "!" in cmd
+            if not force and self._disk_changed(fname):
+
+                def _do_w(f=fname):
+                    try:
+                        self.buf.save(f)
+                        self.status_msg = (
+                            f'"{self.buf.filename}" {self.buf.line_count()}L written'
+                        )
+                    except Exception as e:
+                        self.status_msg = str(e)
+                        self.status_err = True
+
+                self._confirm_cb = _do_w
+                self._confirm_msg = (
+                    f'"{fname or self.buf.filename}" changed on disk. Overwrite? [y/N] '
+                )
             else:
-                name=parts[1].strip()
+                try:
+                    self.buf.save(fname)
+                    self.status_msg = (
+                        f'"{self.buf.filename}" {self.buf.line_count()}L written'
+                    )
+                except Exception as e:
+                    self.status_msg = str(e)
+                    self.status_err = True
+        elif cmd.startswith("e ") or cmd.startswith("edit "):
+            parts = cmd.split(None, 1)
+            if len(parts) > 1:
+                self._load_file(parts[1].strip())
+        elif cmd.startswith("r "):
+            fname = cmd[2:].strip()
+            try:
+                with open(fname, errors="replace") as f:
+                    lines = f.read().splitlines()
+                self.buf.save_undo()
+                for i, l in enumerate(lines):
+                    self.buf.insert_line(self.cursor.row + 1 + i, l)
+                self.status_msg = f"Read {len(lines)} lines"
+            except Exception as e:
+                self.status_msg = str(e)
+                self.status_err = True
+        elif re.match(r"^\d+$", cmd):
+            self.cursor.row = max(0, min(int(cmd) - 1, self.buf.line_count() - 1))
+            self._first_nonblank()
+        elif cmd == "$":
+            self.cursor.row = self.buf.line_count() - 1
+            self._first_nonblank()
+        elif re.match(r"^fin?d?\b", cmd):
+            parts = cmd.split(None, 1)
+            self._cmd_find(parts[1].strip() if len(parts) > 1 else "")
+        elif re.match(r"^(%|\.|\d+(,(\d+|\.|\$))?)?s", cmd):
+            self._exec_sub(cmd)
+        elif cmd.startswith("set ") or cmd == "set":
+            self._exec_set(cmd[4:].strip() if cmd.startswith("set ") else "")
+        elif cmd.startswith("colorscheme") or cmd.startswith("colo"):
+            parts = cmd.split(None, 1)
+            if len(parts) < 2:
+                self.status_msg = f"colorscheme: {', '.join(_SCHEMES)}"
+                self.status_err = False
+            else:
+                name = parts[1].strip()
                 if name not in _SCHEMES:
-                    self.status_msg=f'Unknown colorscheme: {name}'; self.status_err=True
+                    self.status_msg = f"Unknown colorscheme: {name}"
+                    self.status_err = True
                 else:
                     _apply_scheme(name)
-                    self.status_msg=f'colorscheme: {name}'; self.status_err=False
-        elif cmd in ('noh','nohlsearch'): self.search_pat=''
-        elif cmd in ('close','clo'): self._close_pane()
-        elif cmd in ('close!','clo!'): self._close_pane(force=True)
-        elif cmd=='only':
-            while len(self._panes)>1: self._close_pane(force=True)  # keep closing non-active
-        elif re.match(r'^[Ee]x(plore)?(\s|$)',cmd) or re.match(r'^[Ll]ex(plore)?(\s|$)',cmd):
-            parts=cmd.split(None,1); path=parts[1].strip() if len(parts)>1 else None
+                    self.status_msg = f"colorscheme: {name}"
+                    self.status_err = False
+        elif cmd in ("noh", "nohlsearch"):
+            self.search_pat = ""
+        elif cmd in ("close", "clo"):
+            self._close_pane()
+        elif cmd in ("close!", "clo!"):
+            self._close_pane(force=True)
+        elif cmd == "only":
+            while len(self._panes) > 1:
+                self._close_pane(force=True)  # keep closing non-active
+        elif re.match(r"^[Ee]x(plore)?(\s|$)", cmd) or re.match(
+            r"^[Ll]ex(plore)?(\s|$)", cmd
+        ):
+            parts = cmd.split(None, 1)
+            path = parts[1].strip() if len(parts) > 1 else None
             self._open_explorer(path)
-        elif cmd in ('history','historyw','undolist'):
-            self.hist_sel=0; self.hist_top=0; self.hist_preview_scroll=0
-            self._hist_git_cache=self._git_hist(); self._hist_preview_cache={}
-            self.mode=Mode.HISTORY
-        elif re.match(r'^earlier\b',cmd):
+        elif cmd in ("history", "historyw", "undolist"):
+            self.hist_sel = 0
+            self.hist_top = 0
+            self.hist_preview_scroll = 0
+            self._hist_git_cache = self._git_hist()
+            self._hist_preview_cache = {}
+            self.mode = Mode.HISTORY
+        elif re.match(r"^earlier\b", cmd):
             self._cmd_earlier_later(cmd, forward=False)
-        elif re.match(r'^later\b',cmd):
+        elif re.match(r"^later\b", cmd):
             self._cmd_earlier_later(cmd, forward=True)
-        elif re.match(r'^[vV]?sp(lit)?(\s|$)',cmd,re.IGNORECASE):
-            m=re.match(r'^([vV]?)sp(?:lit)?\s*(.*)',cmd,re.IGNORECASE)
+        elif re.match(r"^[vV]?sp(lit)?(\s|$)", cmd, re.IGNORECASE):
+            m = re.match(r"^([vV]?)sp(?:lit)?\s*(.*)", cmd, re.IGNORECASE)
             if m:
-                vertical=bool(m.group(1)); fname=m.group(2).strip() or None
-                self._split(vertical=vertical,filename=fname)
-        elif cmd in ('chat', 'claude'):
+                vertical = bool(m.group(1))
+                fname = m.group(2).strip() or None
+                self._split(vertical=vertical, filename=fname)
+        elif cmd in ("chat", "claude"):
             self._open_chat()
-        elif cmd.startswith('!'):
+        elif cmd == "wrap":
+            self.wrap = True
+            self.status_msg = "wrap on"
+        elif cmd == "nowrap":
+            self.wrap = False
+            self.status_msg = "wrap off"
+        elif cmd.startswith("!"):
             import subprocess
+
             try:
-                r=subprocess.run(cmd[1:],shell=True,capture_output=True,text=True,timeout=30)
-                out=(r.stdout+r.stderr).strip()
-                self.status_msg=out[:self.width-1] if out else 'Done'
-            except Exception as e: self.status_msg=str(e); self.status_err=True
+                r = subprocess.run(
+                    cmd[1:], shell=True, capture_output=True, text=True, timeout=30
+                )
+                out = (r.stdout + r.stderr).strip()
+                self.status_msg = out[: self.width - 1] if out else "Done"
+            except Exception as e:
+                self.status_msg = str(e)
+                self.status_err = True
         else:
-            self.status_msg=f'E492: Not a command: {cmd}'; self.status_err=True
+            self.status_msg = f"E492: Not a command: {cmd}"
+            self.status_err = True
 
     def _cmd_find(self, pattern):
         """Fuzzy file finder — collects files via git ls-files (or os.walk) and opens picker."""
         import subprocess as _sp
+
         # Prefer git ls-files (tracked files only — no untracked noise)
         try:
-            res = _sp.run(['git', 'ls-files', '--cached'],
-                          capture_output=True, text=True, cwd=os.getcwd(), timeout=5)
-            root = _sp.run(['git', 'rev-parse', '--show-toplevel'],
-                           capture_output=True, text=True, cwd=os.getcwd()).stdout.strip()
+            res = _sp.run(
+                ["git", "ls-files", "--cached"],
+                capture_output=True,
+                text=True,
+                cwd=os.getcwd(),
+                timeout=5,
+            )
+            root = _sp.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                cwd=os.getcwd(),
+            ).stdout.strip()
             files = res.stdout.splitlines() if res.returncode == 0 else None
         except Exception:
-            files = None; root = os.getcwd()
+            files = None
+            root = os.getcwd()
         if not files:
-            root = os.getcwd(); files = []
+            root = os.getcwd()
+            files = []
             for dp, dns, fns in os.walk(root):
-                dns[:] = [d for d in dns if not d.startswith('.')]
+                dns[:] = [d for d in dns if not d.startswith(".")]
                 for f in fns:
                     files.append(os.path.relpath(os.path.join(dp, f), root))
         # Drop any path whose components include hidden dirs/files
-        files = [f for f in files if not any(p.startswith('.') for p in f.replace('\\', '/').split('/'))]
+        files = [
+            f
+            for f in files
+            if not any(p.startswith(".") for p in f.replace("\\", "/").split("/"))
+        ]
         # Filter by pattern (fuzzy: all chars appear in order, case-insensitive)
         if pattern:
             pl = pattern.lower()
+
             def _match(p):
-                s = p.lower(); i = 0
+                s = p.lower()
+                i = 0
                 for c in pl:
                     i = s.find(c, i)
-                    if i < 0: return False
+                    if i < 0:
+                        return False
                     i += 1
                 return True
+
             files = [f for f in files if _match(f)]
         files = sorted(files)[:1000]
         if not files:
-            self.status_msg = f'No files matching {pattern!r}'; self.status_err = True; return
+            self.status_msg = f"No files matching {pattern!r}"
+            self.status_err = True
+            return
         entries = [(f, 0, 0) for f in files]
         _root = root
+
         def _open(label):
             self._load_file(os.path.join(_root, label))
-        self._open_picker(f'find: {pattern or "*"}', entries, cb=_open)
+
+        self._open_picker(f"find: {pattern or '*'}", entries, cb=_open)
 
     def _exec_sub(self, cmd):
         try:
-            start_r=end_r=self.cursor.row
-            m=re.match(r'^%',cmd)
-            if m: cmd=cmd[1:]; start_r,end_r=0,self.buf.line_count()-1
+            start_r = end_r = self.cursor.row
+            m = re.match(r"^%", cmd)
+            if m:
+                cmd = cmd[1:]
+                start_r, end_r = 0, self.buf.line_count() - 1
             else:
-                m=re.match(r'^(\d+),(\d+)(.*)',cmd)
-                if m: start_r=int(m.group(1))-1; end_r=int(m.group(2))-1; cmd=m.group(3)
-            m=re.match(r'^s(.)(.*)$',cmd)
-            if not m: return
-            delim=m.group(1); parts=m.group(2).split(delim,2)
-            if len(parts)<2: return
-            pat,repl=parts[0],parts[1]; fs=parts[2] if len(parts)>2 else ''
-            gf='g' in fs; inf=re.IGNORECASE if 'i' in fs else 0
-            n=0; self.buf.save_undo()
-            for r in range(start_r,end_r+1):
-                line=self.buf.get_line(r)
-                nl,cnt=(re.subn(pat,repl,line,flags=inf) if gf
-                        else re.subn(pat,repl,line,count=1,flags=inf))
-                if cnt: self.buf.set_line(r,nl); n+=cnt
-            self.status_msg=(f'{n} substitution{"s" if n!=1 else ""}' if n else 'Pattern not found')
-        except re.error as e: self.status_msg=f'Regex error: {e}'; self.status_err=True
+                m = re.match(r"^(\d+),(\d+)(.*)", cmd)
+                if m:
+                    start_r = int(m.group(1)) - 1
+                    end_r = int(m.group(2)) - 1
+                    cmd = m.group(3)
+            m = re.match(r"^s(.)(.*)$", cmd)
+            if not m:
+                return
+            delim = m.group(1)
+            parts = m.group(2).split(delim, 2)
+            if len(parts) < 2:
+                return
+            pat = parts[0]
+            repl = parts[1]
+            fs = parts[2] if len(parts) > 2 else ""
+            gf = "g" in fs
+            inf = re.IGNORECASE if "i" in fs else 0
+            n = 0
+            self.buf.save_undo()
+            for r in range(start_r, end_r + 1):
+                line = self.buf.get_line(r)
+                if gf:
+                    nl, cnt = re.subn(pat, repl, line, flags=inf)
+                else:
+                    nl, cnt = re.subn(pat, repl, line, count=1, flags=inf)
+                if cnt:
+                    self.buf.set_line(r, nl)
+                    n += cnt
+            if n:
+                self.status_msg = f"{n} substitution{'s' if n != 1 else ''}"
+            else:
+                self.status_msg = "Pattern not found"
+        except re.error as e:
+            self.status_msg = f"Regex error: {e}"
+            self.status_err = True
 
     def _exec_set(self, opt):
-        if opt in ('nu','number'):         self.show_numbers=True
-        elif opt in ('nonu','nonumber'):   self.show_numbers=False
-        else: self.status_msg=f'Unknown option: {opt}'
+        if opt in ("nu", "number"):
+            self.show_numbers = True
+        elif opt in ("nonu", "nonumber"):
+            self.show_numbers = False
+        else:
+            self.status_msg = f"Unknown option: {opt}"
 
     # ── Search mode ───────────────────────────────────────────────────────────
 
     def _search_key(self, key):
-        if key==27: self.mode=Mode.NORMAL; self.cmd_line=''; self.search_pat=''
-        elif key in (10,13):
-            pat=self.cmd_line[1:]; self.mode=Mode.NORMAL; self.cmd_line=''
-            if pat: self.search_pat=pat; self._search_next(self.search_dir)
-        elif key in (curses.KEY_BACKSPACE,127,8):
-            if len(self.cmd_line)>1: self.cmd_line=self.cmd_line[:-1]
-            else: self.mode=Mode.NORMAL; self.cmd_line=''; self.search_pat=''
-        elif 32<=key<=126: self.cmd_line+=chr(key)
+        if key == 27:
+            self.mode = Mode.NORMAL
+            self.cmd_line = ""
+            self.search_pat = ""
+        elif key in (10, 13):
+            pat = self.cmd_line[1:]
+            self.mode = Mode.NORMAL
+            self.cmd_line = ""
+            if pat:
+                self.search_pat = pat
+                self._search_next(self.search_dir)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if len(self.cmd_line) > 1:
+                self.cmd_line = self.cmd_line[:-1]
+            else:
+                self.mode = Mode.NORMAL
+                self.cmd_line = ""
+                self.search_pat = ""
+        elif 32 <= key <= 126:
+            self.cmd_line += chr(key)
 
     # ── History ───────────────────────────────────────────────────────────────
 
     def _cmd_earlier_later(self, cmd, forward):
-        parts=cmd.split(None,1); arg=parts[1].strip() if len(parts)>1 else '1'
-        m=re.match(r'^(\d+)([smh]?)$',arg)
-        if not m: self.status_msg=f'Invalid argument: {arg}'; self.status_err=True; return
-        n=int(m.group(1)); unit=m.group(2)
+        parts = cmd.split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else "1"
+        m = re.match(r"^(\d+)([smh]?)$", arg)
+        if not m:
+            self.status_msg = f"Invalid argument: {arg}"
+            self.status_err = True
+            return
+        n = int(m.group(1))
+        unit = m.group(2)
         if unit:
-            secs={'s':1,'m':60,'h':3600}[unit]*n; target=time.time()-secs; steps=0
+            secs = {"s": 1, "m": 60, "h": 3600}[unit] * n
+            target = time.time() - secs
+            steps = 0
             if forward:
-                while self.buf._redo and self.buf._redo[-1][1]>target: self.buf.redo(); steps+=1
+                while self.buf._redo and self.buf._redo[-1][1] > target:
+                    self.buf.redo()
+                    steps += 1
             else:
-                while self.buf._undo and self.buf._undo[-1][1]>=target: self.buf.undo(); steps+=1
-            self.status_msg=f'{"later" if forward else "earlier"} {n}{unit}: {steps} change{"s" if steps!=1 else ""}'
+                while self.buf._undo and self.buf._undo[-1][1] >= target:
+                    self.buf.undo()
+                    steps += 1
+            self.status_msg = f"{'later' if forward else 'earlier'} {n}{unit}: {steps} change{'s' if steps != 1 else ''}"
         else:
-            steps=0
+            steps = 0
             for _ in range(n):
-                ok=self.buf.redo() if forward else self.buf.undo()
-                if not ok: break
-                steps+=1
-            self.status_msg=f'{"Later" if forward else "Earlier"} {steps} change{"s" if steps!=1 else ""}'
+                ok = self.buf.redo() if forward else self.buf.undo()
+                if not ok:
+                    break
+                steps += 1
+            self.status_msg = f"{'Later' if forward else 'Earlier'} {steps} change{'s' if steps != 1 else ''}"
         self._clamp()
 
     @staticmethod
     def _rel_time(ts):
-        d=int(time.time()-ts)
-        if d<60:    return f'{d}s ago'
-        if d<3600:  return f'{d//60}m ago'
-        if d<86400: return f'{d//3600}h ago'
-        return f'{d//86400}d ago'
+        d = int(time.time() - ts)
+        if d < 60:
+            return f"{d}s ago"
+        if d < 3600:
+            return f"{d // 60}m ago"
+        if d < 86400:
+            return f"{d // 3600}h ago"
+        return f"{d // 86400}d ago"
 
     def _git_root_relpath(self):
         """Return (git_root, relpath) for the current buffer, or (None, None)."""
-        fname=self.buf.filename
-        if not fname: return None,None
+        fname = self.buf.filename
+        if not fname:
+            return None, None
         import subprocess
+
         try:
-            r=subprocess.run(['git','rev-parse','--show-toplevel'],
-                capture_output=True,text=True,timeout=3,
-                cwd=os.path.dirname(os.path.abspath(fname)) or '.')
-            if r.returncode!=0: return None,None
-            root=r.stdout.strip()
-            return root,os.path.relpath(os.path.abspath(fname),root)
-        except Exception: return None,None
+            r = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                cwd=os.path.dirname(os.path.abspath(fname)) or ".",
+            )
+            if r.returncode != 0:
+                return None, None
+            root = r.stdout.strip()
+            return root, os.path.relpath(os.path.abspath(fname), root)
+        except Exception:
+            return None, None
 
     def _git_file_at(self, commit_hash):
         """Return list[str] of the current file's lines at commit_hash, or []."""
         if commit_hash in self._hist_preview_cache:
             return self._hist_preview_cache[commit_hash]
-        root,relpath=self._git_root_relpath()
-        if root is None: return []
+        root, relpath = self._git_root_relpath()
+        if root is None:
+            return []
         import subprocess
+
         try:
-            r=subprocess.run(['git','show',f'{commit_hash}:{relpath}'],
-                capture_output=True,text=True,timeout=5,cwd=root)
-            lines=r.stdout.splitlines() if r.returncode==0 else []
-        except Exception: lines=[]
-        self._hist_preview_cache[commit_hash]=lines
+            r = subprocess.run(
+                ["git", "show", f"{commit_hash}:{relpath}"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=root,
+            )
+            lines = r.stdout.splitlines() if r.returncode == 0 else []
+        except Exception:
+            lines = []
+        self._hist_preview_cache[commit_hash] = lines
         return lines
 
     def _git_hist(self):
-        fname=self.buf.filename
-        if not fname: return []
+        fname = self.buf.filename
+        if not fname:
+            return []
         import subprocess
+
         try:
-            r=subprocess.run(
-                ['git','log','--pretty=format:%h\t%at\t%s','--follow','--',fname],
-                capture_output=True,text=True,timeout=3,
-                cwd=os.path.dirname(os.path.abspath(fname)) or '.')
-            if r.returncode!=0 or not r.stdout.strip(): return []
-            out=[]
+            r = subprocess.run(
+                ["git", "log", "--pretty=format:%h\t%at\t%s", "--follow", "--", fname],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                cwd=os.path.dirname(os.path.abspath(fname)) or ".",
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                return []
+            out = []
             for line in r.stdout.strip().splitlines():
-                parts=line.split('\t',2)
-                if len(parts)==3:
-                    out.append({'hash':parts[0],'ts':float(parts[1]),'subject':parts[2]})
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    out.append(
+                        {"hash": parts[0], "ts": float(parts[1]), "subject": parts[2]}
+                    )
             return out
-        except Exception: return []
+        except Exception:
+            return []
 
     def _git_load(self, commit_hash):
-        lines=self._git_file_at(commit_hash)
-        if not lines and not self.buf.filename: return
+        lines = self._git_file_at(commit_hash)
+        if not lines and not self.buf.filename:
+            return
         import subprocess
-        root,relpath=self._git_root_relpath()
+
+        root, relpath = self._git_root_relpath()
         if root is None:
-            self.status_msg='Not in a git repo'; self.status_err=True; return
+            self.status_msg = "Not in a git repo"
+            self.status_err = True
+            return
         self.buf.save_undo()
-        self.buf.lines=lines or ['']
-        self.buf._gen+=1; self.buf.modified=True
-        self.status_msg=f'Loaded {commit_hash}'
+        self.buf.lines = lines or [""]
+        self.buf._gen += 1
+        self.buf.modified = True
+        self.status_msg = f"Loaded {commit_hash}"
 
     def _hist_entries(self):
-        entries=[]
-        entries.append({'kind':'undo','step':0,'nlines':len(self.buf.lines),'ts':time.time()})
-        for i,(snap,ts) in enumerate(reversed(self.buf._undo),1):
-            entries.append({'kind':'undo','step':i,'nlines':len(snap),'ts':ts})
+        entries = []
+        entries.append(
+            {
+                "kind": "undo",
+                "step": 0,
+                "nlines": len(self.buf.lines),
+                "ts": time.time(),
+            }
+        )
+        for i, (snap, ts) in enumerate(reversed(self.buf._undo), 1):
+            entries.append({"kind": "undo", "step": i, "nlines": len(snap), "ts": ts})
         if self._hist_git_cache:
-            entries.append({'kind':'divider','label':'── git history '})
+            entries.append({"kind": "divider", "label": "── git history "})
             for g in self._hist_git_cache:
-                entries.append({'kind':'git','hash':g['hash'],'ts':g['ts'],'subject':g['subject']})
+                entries.append(
+                    {
+                        "kind": "git",
+                        "hash": g["hash"],
+                        "ts": g["ts"],
+                        "subject": g["subject"],
+                    }
+                )
         return entries
 
     def _hist_preview_lines(self, entry):
         """Return (lines, is_diff) for the preview pane."""
         try:
-            if entry['kind']=='undo':
-                step=entry['step']
-                if step==0:
+            if entry["kind"] == "undo":
+                step = entry["step"]
+                if step == 0:
                     if self.hist_diff_mode and self.buf._undo:
                         # Show what changed to get to current state
-                        prev_lines=list(self.buf._undo[-1][0])
-                        diff=list(difflib.unified_diff(prev_lines,self.buf.lines,
-                            fromfile='prev',tofile='now',lineterm='',n=3))
-                        return diff or ['(no changes)'],True
-                    return list(self.buf.lines),False
-                idx=len(self.buf._undo)-step
-                target=list(self.buf._undo[idx][0]) if 0<=idx<len(self.buf._undo) else list(self.buf.lines)
-            elif entry['kind']=='git':
-                target=self._git_file_at(entry['hash'])
+                        prev_lines = list(self.buf._undo[-1][0])
+                        diff = list(
+                            difflib.unified_diff(
+                                prev_lines,
+                                self.buf.lines,
+                                fromfile="prev",
+                                tofile="now",
+                                lineterm="",
+                                n=3,
+                            )
+                        )
+                        return diff or ["(no changes)"], True
+                    return list(self.buf.lines), False
+                idx = len(self.buf._undo) - step
+                target = (
+                    list(self.buf._undo[idx][0])
+                    if 0 <= idx < len(self.buf._undo)
+                    else list(self.buf.lines)
+                )
+            elif entry["kind"] == "git":
+                target = self._git_file_at(entry["hash"])
             else:
-                return [],False
+                return [], False
             if self.hist_diff_mode:
-                diff=list(difflib.unified_diff(target,self.buf.lines,
-                    fromfile=entry.get('hash',f'step {entry.get("step","")}'),tofile='now',
-                    lineterm='',n=3))
-                return diff or ['(no changes)'],True
-            return target,False
+                diff = list(
+                    difflib.unified_diff(
+                        target,
+                        self.buf.lines,
+                        fromfile=entry.get("hash", f"step {entry.get('step', '')}"),
+                        tofile="now",
+                        lineterm="",
+                        n=3,
+                    )
+                )
+                return diff or ["(no changes)"], True
+            return target, False
         except Exception as exc:
-            return [f'Error: {exc}'],False
+            return [f"Error: {exc}"], False
 
     def _draw_history(self):
-        self.stdscr.erase(); w=self.width; h=self.height
-        entries=self._hist_entries(); n=len(entries); body_h=h-4
+        self.stdscr.erase()
+        w = self.width
+        h = self.height
+        entries = self._hist_entries()
+        n = len(entries)
+        body_h = h - 4
 
         # Layout: left list | divider | right preview (only when wide enough)
-        has_preview=(w>=55)
-        left_w=min(36,w//2) if has_preview else w
-        rx=left_w+1; right_w=w-rx
+        has_preview = w >= 55
+        left_w = min(36, w // 2) if has_preview else w
+        rx = left_w + 1
+        right_w = w - rx
 
         # Header
-        fname=self.buf.filename or '[No Name]'
-        mode_lbl='diff' if self.hist_diff_mode else 'content'
-        self._as(0,0,f' History — {fname}  [{mode_lbl}]'[:w-1].ljust(w-1),curses.color_pair(1)|curses.A_BOLD)
-        self._as(1,0,'─'*(w-1),curses.A_DIM)
+        fname = self.buf.filename or "[No Name]"
+        mode_lbl = "diff" if self.hist_diff_mode else "content"
+        self._as(
+            0,
+            0,
+            f" History — {fname}  [{mode_lbl}]"[: w - 1].ljust(w - 1),
+            curses.color_pair(1) | curses.A_BOLD,
+        )
+        self._as(1, 0, "─" * (w - 1), curses.A_DIM)
 
         # Scroll list
-        if self.hist_sel<self.hist_top: self.hist_top=self.hist_sel
-        elif self.hist_sel>=self.hist_top+body_h: self.hist_top=self.hist_sel-body_h+1
+        if self.hist_sel < self.hist_top:
+            self.hist_top = self.hist_sel
+        elif self.hist_sel >= self.hist_top + body_h:
+            self.hist_top = self.hist_sel - body_h + 1
 
         # Left: history list
         for i in range(body_h):
-            idx=self.hist_top+i; sy=2+i
-            if idx>=n: break
-            e=entries[idx]; sel=(idx==self.hist_sel); lw=left_w-1
-            if e['kind']=='divider':
-                self._as(sy,0,(e['label']+'─'*w)[:lw].ljust(lw),curses.A_DIM)
-            elif e['kind']=='undo':
-                ts_str=time.strftime('%H:%M:%S',time.localtime(e['ts']))
-                if e['step']==0:
-                    row=f'  {"now":<6}  {ts_str}  {e["nlines"]}L'
+            idx = self.hist_top + i
+            sy = 2 + i
+            if idx >= n:
+                break
+            e = entries[idx]
+            sel = idx == self.hist_sel
+            lw = left_w - 1
+            if e["kind"] == "divider":
+                self._as(sy, 0, (e["label"] + "─" * w)[:lw].ljust(lw), curses.A_DIM)
+            elif e["kind"] == "undo":
+                ts_str = time.strftime("%H:%M:%S", time.localtime(e["ts"]))
+                if e["step"] == 0:
+                    row = f"  {'now':<6}  {ts_str}  {e['nlines']}L"
                 else:
-                    prev=entries[e['step']-1]['nlines']
-                    d=e['nlines']-prev
-                    row=f'  {e["step"]:<6}  {ts_str}  {e["nlines"]}L'+(f'  {"+"+str(d) if d>0 else str(d)}' if d else '')
-                self._as(sy,0,row[:lw].ljust(lw),curses.color_pair(8)|curses.A_BOLD if sel else 0)
-            elif e['kind']=='git':
-                rel=self._rel_time(e['ts'])
-                row=f'  {e["hash"]}  {rel:<9}  {e["subject"]}'
-                self._as(sy,0,row[:lw].ljust(lw),curses.color_pair(8)|curses.A_BOLD if sel else curses.color_pair(7))
+                    prev = entries[e["step"] - 1]["nlines"]
+                    d = e["nlines"] - prev
+                    row = f"  {e['step']:<6}  {ts_str}  {e['nlines']}L" + (
+                        f"  {'+' + str(d) if d > 0 else str(d)}" if d else ""
+                    )
+                self._as(
+                    sy,
+                    0,
+                    row[:lw].ljust(lw),
+                    curses.color_pair(8) | curses.A_BOLD if sel else 0,
+                )
+            elif e["kind"] == "git":
+                rel = self._rel_time(e["ts"])
+                row = f"  {e['hash']}  {rel:<9}  {e['subject']}"
+                self._as(
+                    sy,
+                    0,
+                    row[:lw].ljust(lw),
+                    curses.color_pair(8) | curses.A_BOLD
+                    if sel
+                    else curses.color_pair(7),
+                )
 
         # Right: preview pane
         if has_preview:
-            for sy in range(2,h-2): self._as(sy,left_w,'│',curses.A_DIM)
-            cur_e=entries[self.hist_sel] if 0<=self.hist_sel<n else None
-            preview,is_diff=(self._hist_preview_lines(cur_e) if cur_e and cur_e['kind']!='divider' else ([],False))
-            max_scroll=max(0,len(preview)-body_h)
-            self.hist_preview_scroll=min(self.hist_preview_scroll,max_scroll)
+            for sy in range(2, h - 2):
+                self._as(sy, left_w, "│", curses.A_DIM)
+            cur_e = entries[self.hist_sel] if 0 <= self.hist_sel < n else None
+            preview, is_diff = (
+                self._hist_preview_lines(cur_e)
+                if cur_e and cur_e["kind"] != "divider"
+                else ([], False)
+            )
+            max_scroll = max(0, len(preview) - body_h)
+            self.hist_preview_scroll = min(self.hist_preview_scroll, max_scroll)
+
             def _diff_style(line):
                 """Return (line_attr, prefix_attr) for a unified diff line."""
-                if not line: return curses.A_DIM, 0
-                if line.startswith('---') or line.startswith('+++'):
+                if not line:
+                    return curses.A_DIM, 0
+                if line.startswith("---") or line.startswith("+++"):
                     return curses.A_DIM, curses.A_DIM
-                c=line[0]
-                if c=='+': return curses.color_pair(20), curses.color_pair(20)|curses.A_BOLD
-                if c=='-': return curses.color_pair(21), curses.color_pair(21)|curses.A_BOLD
-                if c=='@': return curses.color_pair(22)|curses.A_BOLD, curses.color_pair(22)|curses.A_BOLD
+                c = line[0]
+                if c == "+":
+                    return curses.color_pair(20), curses.color_pair(20) | curses.A_BOLD
+                if c == "-":
+                    return curses.color_pair(21), curses.color_pair(21) | curses.A_BOLD
+                if c == "@":
+                    return curses.color_pair(22) | curses.A_BOLD, curses.color_pair(
+                        22
+                    ) | curses.A_BOLD
                 return curses.A_DIM, curses.A_DIM  # context
-            for i in range(body_h):
-                sy=2+i; pidx=self.hist_preview_scroll+i
-                if pidx<len(preview):
-                    line=preview[pidx]
-                    if is_diff:
-                        la,pa=_diff_style(line)
-                        pad=right_w-1
-                        if line and len(line)>1 and pa!=la:
-                            self._as(sy,rx,line[0],pa)
-                            self._as(sy,rx+1,(line[1:pad]).ljust(pad-1),la)
-                        else:
-                            self._as(sy,rx,line[:pad].ljust(pad),la)
-                    else:
-                        self._as(sy,rx,line[:right_w-1].ljust(right_w-1),0)
-                else:
-                    self._as(sy,rx,' '*(right_w-1))
 
-        footer=' j/k:history  J/K:scroll preview  d:diff/content  Enter:restore  q:close'
-        self._as(h-2,0,footer[:w-1].ljust(w-1),curses.color_pair(1))
-        try: self.stdscr.move(h-1,0)
-        except curses.error: pass
+            for i in range(body_h):
+                sy = 2 + i
+                pidx = self.hist_preview_scroll + i
+                if pidx < len(preview):
+                    line = preview[pidx]
+                    if is_diff:
+                        la, pa = _diff_style(line)
+                        pad = right_w - 1
+                        if line and len(line) > 1 and pa != la:
+                            self._as(sy, rx, line[0], pa)
+                            self._as(sy, rx + 1, (line[1:pad]).ljust(pad - 1), la)
+                        else:
+                            self._as(sy, rx, line[:pad].ljust(pad), la)
+                    else:
+                        self._as(sy, rx, line[: right_w - 1].ljust(right_w - 1), 0)
+                else:
+                    self._as(sy, rx, " " * (right_w - 1))
+
+        footer = (
+            " j/k:history  J/K:scroll preview  d:diff/content  Enter:restore  q:close"
+        )
+        self._as(h - 2, 0, footer[: w - 1].ljust(w - 1), curses.color_pair(1))
+        try:
+            self.stdscr.move(h - 1, 0)
+        except curses.error:
+            pass
         self.stdscr.refresh()
 
     def _history_key(self, key):
-        ch=chr(key) if 32<=key<=126 else None
-        entries=self._hist_entries(); n=len(entries)
-        def _skip(idx,step):
-            while 0<=idx<n and entries[idx]['kind']=='divider': idx+=step
-            return max(0,min(n-1,idx))
+        ch = chr(key) if 32 <= key <= 126 else None
+        entries = self._hist_entries()
+        n = len(entries)
+
+        def _skip(idx, step):
+            while 0 <= idx < n and entries[idx]["kind"] == "divider":
+                idx += step
+            return max(0, min(n - 1, idx))
+
         def _nav(new_sel):
-            self.hist_sel=new_sel; self.hist_preview_scroll=0
-        if   key==curses.KEY_UP   or ch=='k': _nav(_skip(self.hist_sel-1,-1))
-        elif key==curses.KEY_DOWN or ch=='j': _nav(_skip(self.hist_sel+1,1))
-        elif key==6  or key==curses.KEY_NPAGE: _nav(_skip(self.hist_sel+max(1,self.height-6),1))
-        elif key==2  or key==curses.KEY_PPAGE: _nav(_skip(self.hist_sel-max(1,self.height-6),-1))
-        elif key==curses.KEY_HOME: _nav(0)
-        elif key==curses.KEY_END:  _nav(_skip(n-1,-1))
-        elif ch=='J': self.hist_preview_scroll+=3
-        elif ch=='K': self.hist_preview_scroll=max(0,self.hist_preview_scroll-3)
-        elif ch=='d': self.hist_diff_mode=not self.hist_diff_mode; self.hist_preview_scroll=0
-        elif key in (10,13):
-            e=entries[self.hist_sel]
-            if e['kind']=='undo':
-                steps=e['step']
-                for _ in range(steps): self.buf.undo()
-                self._clamp(); self.mode=Mode.NORMAL
-                self.status_msg=f'Restored {steps} step{"s" if steps!=1 else ""} back' if steps else ''
-            elif e['kind']=='git':
-                self._git_load(e['hash']); self._clamp(); self.mode=Mode.NORMAL
-        elif ch=='q' or key==27: self.mode=Mode.NORMAL
+            self.hist_sel = new_sel
+            self.hist_preview_scroll = 0
+
+        if key == curses.KEY_UP or ch == "k":
+            _nav(_skip(self.hist_sel - 1, -1))
+        elif key == curses.KEY_DOWN or ch == "j":
+            _nav(_skip(self.hist_sel + 1, 1))
+        elif key == 6 or key == curses.KEY_NPAGE:
+            _nav(_skip(self.hist_sel + max(1, self.height - 6), 1))
+        elif key == 2 or key == curses.KEY_PPAGE:
+            _nav(_skip(self.hist_sel - max(1, self.height - 6), -1))
+        elif key == curses.KEY_HOME:
+            _nav(0)
+        elif key == curses.KEY_END:
+            _nav(_skip(n - 1, -1))
+        elif ch == "J":
+            self.hist_preview_scroll += 3
+        elif ch == "K":
+            self.hist_preview_scroll = max(0, self.hist_preview_scroll - 3)
+        elif ch == "d":
+            self.hist_diff_mode = not self.hist_diff_mode
+            self.hist_preview_scroll = 0
+        elif key in (10, 13):
+            e = entries[self.hist_sel]
+            if e["kind"] == "undo":
+                steps = e["step"]
+                for _ in range(steps):
+                    self.buf.undo()
+                self._clamp()
+                self.mode = Mode.NORMAL
+                self.status_msg = (
+                    f"Restored {steps} step{'s' if steps != 1 else ''} back"
+                    if steps
+                    else ""
+                )
+            elif e["kind"] == "git":
+                self._git_load(e["hash"])
+                self._clamp()
+                self.mode = Mode.NORMAL
+        elif ch == "q" or key == 27:
+            self.mode = Mode.NORMAL
 
     # ── Explorer ──────────────────────────────────────────────────────────────
 
     def _open_explorer(self, path=None):
         if path:
-            target=os.path.abspath(os.path.expanduser(path))
-            if os.path.isfile(target): self._load_file(target); return
+            target = os.path.abspath(os.path.expanduser(path))
+            if os.path.isfile(target):
+                self._load_file(target)
+                return
             if not os.path.isdir(target):
-                self.status_msg=f'Not a directory: {target}'; self.status_err=True; return
-            self.ex_dir=target
+                self.status_msg = f"Not a directory: {target}"
+                self.status_err = True
+                return
+            self.ex_dir = target
         else:
-            self.ex_dir=(os.path.dirname(os.path.abspath(self.buf.filename))
-                         if self.buf.filename else os.getcwd())
-        self._prev_buf=self.buf; self._prev_cursor=(self.cursor.row,self.cursor.col)
-        self._ex_reload(); self.mode=Mode.EXPLORER
+            self.ex_dir = (
+                os.path.dirname(os.path.abspath(self.buf.filename))
+                if self.buf.filename
+                else os.getcwd()
+            )
+        self._prev_buf = self.buf
+        self._prev_cursor = (self.cursor.row, self.cursor.col)
+        self._ex_reload()
+        self.mode = Mode.EXPLORER
 
     def _ex_reload(self):
-        try: entries=os.listdir(self.ex_dir)
-        except PermissionError: self.status_msg='Permission denied'; entries=[]
-        dirs =sorted([e for e in entries if     os.path.isdir(os.path.join(self.ex_dir,e))],key=str.lower)
-        files=sorted([e for e in entries if not os.path.isdir(os.path.join(self.ex_dir,e))],key=str.lower)
-        self.ex_entries=[('..',True)]+[(d,True) for d in dirs]+[(f,False) for f in files]
-        self.ex_sel=0; self.ex_top=0; self.ex_searching=False
+        try:
+            entries = os.listdir(self.ex_dir)
+        except PermissionError:
+            self.status_msg = "Permission denied"
+            entries = []
+        dirs = sorted(
+            [e for e in entries if os.path.isdir(os.path.join(self.ex_dir, e))],
+            key=str.lower,
+        )
+        files = sorted(
+            [e for e in entries if not os.path.isdir(os.path.join(self.ex_dir, e))],
+            key=str.lower,
+        )
+        self.ex_entries = (
+            [("..", True)] + [(d, True) for d in dirs] + [(f, False) for f in files]
+        )
+        self.ex_sel = 0
+        self.ex_top = 0
+        self.ex_searching = False
 
     def _draw_explorer(self):
-        self.stdscr.erase(); w=self.width
-        self._as(0,0,f' {self.ex_dir}'[:w-1].ljust(w-1),curses.color_pair(1)|curses.A_BOLD)
-        self._as(1,0,('─'*(w-1)),curses.A_DIM)
-        body_h=self.height-4
-        if self.ex_sel<self.ex_top: self.ex_top=self.ex_sel
-        elif self.ex_sel>=self.ex_top+body_h: self.ex_top=self.ex_sel-body_h+1
+        self.stdscr.erase()
+        w = self.width
+        self._as(
+            0,
+            0,
+            f" {self.ex_dir}"[: w - 1].ljust(w - 1),
+            curses.color_pair(1) | curses.A_BOLD,
+        )
+        self._as(1, 0, ("─" * (w - 1)), curses.A_DIM)
+        body_h = self.height - 4
+        if self.ex_sel < self.ex_top:
+            self.ex_top = self.ex_sel
+        elif self.ex_sel >= self.ex_top + body_h:
+            self.ex_top = self.ex_sel - body_h + 1
         for i in range(body_h):
-            idx=self.ex_top+i; sy=2+i
-            if idx>=len(self.ex_entries): break
-            name,is_dir=self.ex_entries[idx]
+            idx = self.ex_top + i
+            sy = 2 + i
+            if idx >= len(self.ex_entries):
+                break
+            name, is_dir = self.ex_entries[idx]
             if is_dir:
-                display=('  '+name+'/')[:w-1].ljust(w-1)
-                attr=(curses.color_pair(8)|curses.A_BOLD if idx==self.ex_sel
-                      else curses.color_pair(7)|curses.A_BOLD)
+                display = ("  " + name + "/")[: w - 1].ljust(w - 1)
+                attr = (
+                    curses.color_pair(8) | curses.A_BOLD
+                    if idx == self.ex_sel
+                    else curses.color_pair(7) | curses.A_BOLD
+                )
             else:
-                try: sz=os.path.getsize(os.path.join(self.ex_dir,name))
-                except OSError: sz=0
-                display=('  '+f'{sz:>9}  '+name)[:w-1].ljust(w-1)
-                attr=(curses.color_pair(8)|curses.A_BOLD if idx==self.ex_sel else 0)
-            self._as(sy,0,display,attr)
-        footer=' j/k:move  Enter:open  -:up  q:back  /:search  n/N:next/prev  R:refresh'
-        self._as(self.height-2,0,footer[:w-1].ljust(w-1),curses.color_pair(1))
+                try:
+                    sz = os.path.getsize(os.path.join(self.ex_dir, name))
+                except OSError:
+                    sz = 0
+                display = ("  " + f"{sz:>9}  " + name)[: w - 1].ljust(w - 1)
+                attr = curses.color_pair(8) | curses.A_BOLD if idx == self.ex_sel else 0
+            self._as(sy, 0, display, attr)
+        footer = (
+            " j/k:move  Enter:open  -:up  q:back  /:search  n/N:next/prev  R:refresh"
+        )
+        self._as(self.height - 2, 0, footer[: w - 1].ljust(w - 1), curses.color_pair(1))
         if self.ex_searching:
-            prompt=('/'+self.ex_search_query+' '*w)[:w-1]
-            self._as(self.height-1,0,prompt)
-            try: self.stdscr.move(self.height-1,min(1+len(self.ex_search_query),w-1))
-            except curses.error: pass
+            prompt = ("/" + self.ex_search_query + " " * w)[: w - 1]
+            self._as(self.height - 1, 0, prompt)
+            try:
+                self.stdscr.move(
+                    self.height - 1, min(1 + len(self.ex_search_query), w - 1)
+                )
+            except curses.error:
+                pass
         elif self.status_msg:
-            self._as(self.height-1,0,self.status_msg[:w-1],curses.color_pair(4) if self.status_err else 0)
-            try: self.stdscr.move(self.height-1,0)
-            except curses.error: pass
+            self._as(
+                self.height - 1,
+                0,
+                self.status_msg[: w - 1],
+                curses.color_pair(4) if self.status_err else 0,
+            )
+            try:
+                self.stdscr.move(self.height - 1, 0)
+            except curses.error:
+                pass
         else:
-            try: self.stdscr.move(self.height-1,0)
-            except curses.error: pass
+            try:
+                self.stdscr.move(self.height - 1, 0)
+            except curses.error:
+                pass
         self.stdscr.refresh()
 
     def _ex_search_jump(self, pat, start, forward=True):
         """Jump ex_sel to the next entry whose name matches pat, wrapping around."""
-        if not pat: return
-        n=len(self.ex_entries)
-        step=1 if forward else -1
-        for i in range(1,n+1):
-            idx=(start+i*step)%n
-            name,_=self.ex_entries[idx]
-            if pat.lower() in name.lower(): self.ex_sel=idx; return
-        self.status_msg='(no match)'; self.status_err=True
+        if not pat:
+            return
+        n = len(self.ex_entries)
+        step = 1 if forward else -1
+        for i in range(1, n + 1):
+            idx = (start + i * step) % n
+            name, _ = self.ex_entries[idx]
+            if pat.lower() in name.lower():
+                self.ex_sel = idx
+                return
+        self.status_msg = "(no match)"
+        self.status_err = True
 
     def _explorer_key(self, key):
-        ch=chr(key) if 32<=key<=126 else None; n=len(self.ex_entries)
+        ch = chr(key) if 32 <= key <= 126 else None
+        n = len(self.ex_entries)
         if self.ex_searching:
-            if key==27:                                          # Esc — cancel
-                self.ex_searching=False; self.ex_search_query=''
-            elif key in (10,13):                                 # Enter — confirm
-                self.ex_searching=False
-            elif key in (curses.KEY_BACKSPACE,127,8):
-                self.ex_search_query=self.ex_search_query[:-1]
-                self._ex_search_jump(self.ex_search_query,len(self.ex_entries)-1,True)
-            elif 32<=key<=126:
-                self.ex_search_query+=ch
-                self._ex_search_jump(self.ex_search_query,len(self.ex_entries)-1,True)
+            if key == 27:  # Esc — cancel
+                self.ex_searching = False
+                self.ex_search_query = ""
+            elif key in (10, 13):  # Enter — confirm
+                self.ex_searching = False
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                self.ex_search_query = self.ex_search_query[:-1]
+                self._ex_search_jump(
+                    self.ex_search_query, len(self.ex_entries) - 1, True
+                )
+            elif 32 <= key <= 126:
+                self.ex_search_query += ch
+                self._ex_search_jump(
+                    self.ex_search_query, len(self.ex_entries) - 1, True
+                )
             return
-        if   key==curses.KEY_UP   or ch=='k': self.ex_sel=max(0,self.ex_sel-1)
-        elif key==curses.KEY_DOWN or ch=='j': self.ex_sel=min(n-1,self.ex_sel+1)
-        elif key==6 or key==curses.KEY_NPAGE: self.ex_sel=min(n-1,self.ex_sel+max(1,self.height-6))
-        elif key==2 or key==curses.KEY_PPAGE: self.ex_sel=max(0,self.ex_sel-max(1,self.height-6))
-        elif key==curses.KEY_HOME: self.ex_sel=0
-        elif key==curses.KEY_END:  self.ex_sel=n-1
-        elif key in (10,13) or key==curses.KEY_RIGHT: self._ex_open()
-        elif ch=='-' or key==curses.KEY_LEFT or key in (curses.KEY_BACKSPACE,127,8): self._ex_up()
-        elif ch=='q' or key==27: self._ex_close()
-        elif ch==':': self.mode=Mode.COMMAND; self.cmd_line=':'
-        elif ch=='R': self._ex_reload(); self.status_msg='Refreshed'
-        elif ch=='/': self.ex_searching=True; self.ex_search_query=''
-        elif ch=='n' and self.ex_search_query: self._ex_search_jump(self.ex_search_query,self.ex_sel,True)
-        elif ch=='N' and self.ex_search_query: self._ex_search_jump(self.ex_search_query,self.ex_sel,False)
+        if key == curses.KEY_UP or ch == "k":
+            self.ex_sel = max(0, self.ex_sel - 1)
+        elif key == curses.KEY_DOWN or ch == "j":
+            self.ex_sel = min(n - 1, self.ex_sel + 1)
+        elif key == 6 or key == curses.KEY_NPAGE:
+            self.ex_sel = min(n - 1, self.ex_sel + max(1, self.height - 6))
+        elif key == 2 or key == curses.KEY_PPAGE:
+            self.ex_sel = max(0, self.ex_sel - max(1, self.height - 6))
+        elif key == curses.KEY_HOME:
+            self.ex_sel = 0
+        elif key == curses.KEY_END:
+            self.ex_sel = n - 1
+        elif key in (10, 13) or key == curses.KEY_RIGHT:
+            self._ex_open()
+        elif (
+            ch == "-" or key == curses.KEY_LEFT or key in (curses.KEY_BACKSPACE, 127, 8)
+        ):
+            self._ex_up()
+        elif ch == "q" or key == 27:
+            self._ex_close()
+        elif ch == ":":
+            self.mode = Mode.COMMAND
+            self.cmd_line = ":"
+        elif ch == "R":
+            self._ex_reload()
+            self.status_msg = "Refreshed"
+        elif ch == "/":
+            self.ex_searching = True
+            self.ex_search_query = ""
+        elif ch == "n" and self.ex_search_query:
+            self._ex_search_jump(self.ex_search_query, self.ex_sel, True)
+        elif ch == "N" and self.ex_search_query:
+            self._ex_search_jump(self.ex_search_query, self.ex_sel, False)
 
     def _ex_open(self):
-        if not self.ex_entries: return
-        name,is_dir=self.ex_entries[self.ex_sel]
-        target=os.path.normpath(os.path.join(self.ex_dir,name))
-        if is_dir: self.ex_dir=target; self._ex_reload()
-        else: self._load_file(target)
+        if not self.ex_entries:
+            return
+        name, is_dir = self.ex_entries[self.ex_sel]
+        target = os.path.normpath(os.path.join(self.ex_dir, name))
+        if is_dir:
+            self.ex_dir = target
+            self._ex_reload()
+        else:
+            self._load_file(target)
 
     def _ex_up(self):
-        parent=os.path.dirname(self.ex_dir)
-        if parent!=self.ex_dir:
-            old=os.path.basename(self.ex_dir); self.ex_dir=parent; self._ex_reload()
-            for i,(name,_) in enumerate(self.ex_entries):
-                if name==old: self.ex_sel=i; break
+        parent = os.path.dirname(self.ex_dir)
+        if parent != self.ex_dir:
+            old = os.path.basename(self.ex_dir)
+            self.ex_dir = parent
+            self._ex_reload()
+            for i, (name, _) in enumerate(self.ex_entries):
+                if name == old:
+                    self.ex_sel = i
+                    break
 
     def _ex_close(self):
-        self.mode=Mode.NORMAL
+        self.mode = Mode.NORMAL
         if self._prev_buf is not None:
-            self.buf=self._prev_buf; self.cursor.row,self.cursor.col=self._prev_cursor
-            self._prev_buf=None; self._prev_cursor=None
+            self.buf = self._prev_buf
+            self.cursor.row, self.cursor.col = self._prev_cursor
+            self._prev_buf = None
+            self._prev_cursor = None
 
     def _load_file(self, path):
-        self.buf=Buffer.from_file(path); self.cursor=Cursor()
-        self.top_row=0; self.left_col=0
-        self._prev_buf=None; self._prev_cursor=None
-        self.mode=Mode.NORMAL; self.status_msg=f'"{path}"'
+        self.buf = Buffer.from_file(path)
+        self.cursor = Cursor()
+        self.top_row = 0
+        self.left_col = 0
+        self._prev_buf = None
+        self._prev_cursor = None
+        self.mode = Mode.NORMAL
+        self.status_msg = f'"{path}"'
 
 
 def _probe_sixel() -> bool:
@@ -3359,36 +5071,93 @@ def _probe_sixel() -> bool:
         old = termios.tcgetattr(fd)
         try:
             tty.setraw(fd)
-            sys.stdout.write('\033[c')
+            sys.stdout.write("\033[c")
             sys.stdout.flush()
-            resp = ''
+            resp = ""
             while True:
                 r, _, _ = select.select([fd], [], [], 0.3)
                 if not r:
                     break
-                ch = os.read(fd, 1).decode('latin-1')
+                ch = os.read(fd, 1).decode("latin-1")
                 resp += ch
-                if ch == 'c':
+                if ch == "c":
                     break
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        m = re.search(r'\[\?([0-9;]+)c', resp)
+        m = re.search(r"\[\?([0-9;]+)c", resp)
         if m:
-            return '4' in m.group(1).split(';')
+            return "4" in m.group(1).split(";")
     except Exception:
         pass
     return False
 
-HAS_SIXEL:    bool = False   # populated by _probe_sixel() in main()
-HAS_256COLOR: bool = False   # populated by Editor.__init__ after curses.start_color()
+
+HAS_SIXEL: bool = False  # populated by _probe_sixel() in main()
+HAS_SIXEL: bool = False  # populated by _probe_sixel() in main()
+HAS_256COLOR: bool = False  # populated by Editor.__init__ after curses.start_color()
+
+_DEBUG_OBSERVER_ENABLED = False
+
+
+def debug_observer(event_type, **details):
+    """Print buffer changes to stderr (useful for debugging)"""
+    msg = f"[CHANGE] {event_type}"
+    if details:
+        msg += " " + ", ".join(f"{k}={repr(v)}" for k, v in details.items())
+    print(msg, file=sys.stderr, flush=True)
+
+
+def enable_buffer_debug():
+    """Enable debug observer in all buffers"""
+    global _DEBUG_OBSERVER_ENABLED
+    _DEBUG_OBSERVER_ENABLED = True
+    print("[DEBUG] Buffer observer enabled", file=sys.stderr, flush=True)
+
+
+def disable_buffer_debug():
+    """Disable debug observer"""
+    global _DEBUG_OBSERVER_ENABLED
+    _DEBUG_OBSERVER_ENABLED = False
+    print("[DEBUG] Buffer observer disabled", file=sys.stderr, flush=True)
+
+
+_DEBUG_OBSERVER_ENABLED = False
+
+
+def debug_observer(event_type, **details):
+    """Print buffer changes to stderr (useful for debugging)"""
+    msg = f"[CHANGE] {event_type}"
+    if details:
+        msg += " " + ", ".join(f"{k}={repr(v)}" for k, v in details.items())
+    print(msg, file=sys.stderr, flush=True)
+
+
+def enable_buffer_debug():
+    """Enable debug observer in all buffers"""
+    global _DEBUG_OBSERVER_ENABLED
+    _DEBUG_OBSERVER_ENABLED = True
+    print("[DEBUG] Buffer observer enabled", file=sys.stderr, flush=True)
+
+
+def disable_buffer_debug():
+    """Disable debug observer"""
+    global _DEBUG_OBSERVER_ENABLED
+    _DEBUG_OBSERVER_ENABLED = False
+    print("[DEBUG] Buffer observer disabled", file=sys.stderr, flush=True)
+
 
 def main():
     global HAS_SIXEL
     import argparse
-    parser = argparse.ArgumentParser(prog='pym', description='pyvim editor')
-    parser.add_argument('filename', nargs='?', default=None)
-    parser.add_argument('-f', '--follow', action='store_true',
-                        help='follow mode: tail new content as it arrives')
+
+    parser = argparse.ArgumentParser(prog="pym", description="pyvim editor")
+    parser.add_argument("filename", nargs="?", default=None)
+    parser.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="follow mode: tail new content as it arrives",
+    )
     args = parser.parse_args()
 
     stdin_content = None
@@ -3401,21 +5170,27 @@ def main():
             flags = fcntl.fcntl(follow_fd, fcntl.F_GETFL)
             fcntl.fcntl(follow_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         else:
-            stdin_content = sys.stdin.buffer.read().decode('utf-8', errors='replace')
+            stdin_content = sys.stdin.buffer.read().decode("utf-8", errors="replace")
         # Hand /dev/tty to curses for keyboard input
         try:
-            tty_fd = os.open('/dev/tty', os.O_RDONLY)
+            tty_fd = os.open("/dev/tty", os.O_RDONLY)
             os.dup2(tty_fd, sys.stdin.fileno())
             os.close(tty_fd)
-            sys.stdin = open('/dev/tty', 'r')
+            sys.stdin = open("/dev/tty", "r")
         except OSError as e:
-            sys.exit(f'pym: cannot open /dev/tty: {e}')
+            sys.exit(f"pym: cannot open /dev/tty: {e}")
 
     HAS_SIXEL = _probe_sixel()
-    curses.wrapper(lambda s: Editor(s, args.filename,
-                                    stdin_content=stdin_content,
-                                    follow=args.follow,
-                                    follow_fd=follow_fd).run())
+    curses.wrapper(
+        lambda s: Editor(
+            s,
+            args.filename,
+            stdin_content=stdin_content,
+            follow=args.follow,
+            follow_fd=follow_fd,
+        ).run()
+    )
 
-if __name__=='__main__':
+
+if __name__ == "__main__":
     main()
