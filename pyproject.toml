@@ -16,3 +16,12 @@ pym = "pyvim:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pyvim]
+# Built-in color schemes: default  monokai  nord  gruvbox  solarized  dracula
+colorscheme = "gruvbox"
+
+# Optional per-role color overrides (256-color indices, applied on top of scheme)
+# [tool.pyvim.colors]
+# keyword = 197
+# string  = 148

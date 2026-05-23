@@ -87,3 +87,10 @@ def sort_selection(r1=None, r2=None):
     print(f"sorted lines {r1}–{r2}")
 
 print("sort_selection defined — call sort_selection(r1, r2) from :py")
+
+
+a
+c
+b
+
+sort_selection(91, 95)
