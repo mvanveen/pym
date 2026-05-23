@@ -239,6 +239,7 @@ class Pane:
         self.filter_active    = False # filter is confirmed and in effect
         self.filter_bar_open  = False # filter input bar is currently shown
         self.filter_input     = ''    # text being typed in the filter bar
+        self.filter_col       = 0     # cursor column within filter_input
 
 # ── Layout tree ──────────────────────────────────────────────────────────────
 
@@ -1326,8 +1327,19 @@ class Editor:
         filter_row_offset = 0
         if pane.filter_bar_open and is_active:
             filter_row_offset = 1
-            prompt = ('/ ' + pane.filter_input + ' ' * pane.width)[:pane.width - 1]
-            self._as(pane.y, pane.x, prompt, curses.color_pair(2))
+            # Scroll input horizontally so cursor stays visible
+            avail_input = pane.width - 3   # '/ ' prefix + 1 margin
+            col = pane.filter_col
+            txt = pane.filter_input
+            if len(txt) <= avail_input:
+                view_start = 0
+            else:
+                view_start = max(0, col - avail_input + 1)
+            visible = txt[view_start:view_start + avail_input]
+            # Color: yellow if valid regex (or empty), red if invalid
+            bar_attr = curses.color_pair(2) if (pane.filter_re is not None or not txt) else curses.color_pair(4)
+            prompt = ('/ ' + visible + ' ' * pane.width)[:pane.width - 1]
+            self._as(pane.y, pane.x, prompt, bar_attr)
 
         # Determine if lines should be filtered
         fre = pane.filter_re if pane.filter_active else None
@@ -1583,7 +1595,11 @@ class Editor:
         p = self._pane
         # Filter bar: place cursor in filter input line when open
         if p.filter_bar_open:
-            try: self.stdscr.move(p.y, min(p.x + 2 + len(p.filter_input), self.width-1))
+            avail_input = p.width - 3
+            txt = p.filter_input
+            view_start = max(0, p.filter_col - avail_input + 1) if len(txt) > avail_input else 0
+            scr_col = p.x + 2 + (p.filter_col - view_start)
+            try: self.stdscr.move(p.y, min(scr_col, self.width-1))
             except curses.error: pass
             return
         lnw = self._pane_lnw(p)
@@ -2230,7 +2246,8 @@ class Editor:
     def _open_filter_bar(self):
         p = self._pane
         p.filter_bar_open = True
-        p.filter_input    = p.filter_pat  # pre-populate with current pattern
+        p.filter_input    = p.filter_pat          # pre-populate with current pattern
+        p.filter_col      = len(p.filter_input)   # cursor at end
 
     @staticmethod
     def _compile_filter(pat):
@@ -2259,27 +2276,48 @@ class Editor:
 
     def _filter_key(self, key):
         p = self._pane
-        if key == 27:            # Esc — clear filter entirely
+        txt = p.filter_input
+        col = p.filter_col
+
+        def _update(new_txt, new_col):
+            p.filter_input = new_txt
+            p.filter_col   = max(0, min(new_col, len(new_txt)))
+            try:    p.filter_re = self._compile_filter(new_txt)
+            except re.error: p.filter_re = None
+            p.filter_pat    = new_txt
+            p.filter_active = bool(new_txt) and p.filter_re is not None
+
+        if key == 27:                               # Esc — clear entirely
             p.filter_bar_open = False
-            p.filter_input    = ''
-            p.filter_pat      = ''
-            p.filter_re       = None
-            p.filter_active   = False
-        elif key in (10, 13):    # Enter — confirm filter, close bar
-            self._filter_apply(p, p.filter_input, close=True)
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            p.filter_input = p.filter_input[:-1]
-            # Live preview: silently ignore invalid regex while editing
-            try:    p.filter_re = self._compile_filter(p.filter_input)
-            except re.error: p.filter_re = None
-            p.filter_pat    = p.filter_input
-            p.filter_active = bool(p.filter_input) and p.filter_re is not None
-        elif 32 <= key <= 126:
-            p.filter_input += chr(key)
-            try:    p.filter_re = self._compile_filter(p.filter_input)
-            except re.error: p.filter_re = None
-            p.filter_pat    = p.filter_input
-            p.filter_active = bool(p.filter_input) and p.filter_re is not None
+            p.filter_input = ''; p.filter_col = 0
+            p.filter_pat = ''; p.filter_re = None; p.filter_active = False
+        elif key in (10, 13):                       # Enter — confirm
+            self._filter_apply(p, txt, close=True)
+        elif key in (curses.KEY_LEFT, 2):           # ← / Ctrl-B
+            p.filter_col = max(0, col - 1)
+        elif key in (curses.KEY_RIGHT, 6):          # → / Ctrl-F
+            p.filter_col = min(len(txt), col + 1)
+        elif key in (curses.KEY_HOME, 1):           # Home / Ctrl-A
+            p.filter_col = 0
+        elif key in (curses.KEY_END, 5):            # End / Ctrl-E
+            p.filter_col = len(txt)
+        elif key in (curses.KEY_BACKSPACE, 127, 8): # Backspace
+            if col > 0:
+                _update(txt[:col-1] + txt[col:], col - 1)
+        elif key == curses.KEY_DC or key == 4:      # Del / Ctrl-D
+            if col < len(txt):
+                _update(txt[:col] + txt[col+1:], col)
+        elif key == 23:                             # Ctrl-W — delete word back
+            i = col
+            while i > 0 and txt[i-1] == ' ': i -= 1
+            while i > 0 and txt[i-1] != ' ': i -= 1
+            _update(txt[:i] + txt[col:], i)
+        elif key == 21:                             # Ctrl-U — clear to start
+            _update(txt[col:], 0)
+        elif key == 11:                             # Ctrl-K — kill to end
+            _update(txt[:col], col)
+        elif 32 <= key <= 126:                      # printable — insert at cursor
+            _update(txt[:col] + chr(key) + txt[col:], col + 1)
 
     def _filtered_scroll(self):
         p = self._pane
