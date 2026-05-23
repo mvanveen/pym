@@ -234,7 +234,8 @@ class Pane:
         self.following   = False   # True → auto-tail the file
         self._file_size  = 0       # last known on-disk size for tail detection
         # Filter state
-        self.filter_pat       = ''    # active substring filter (case-insensitive)
+        self.filter_pat       = ''    # active filter pattern string
+        self.filter_re        = None  # compiled regex, or None if pattern invalid/empty
         self.filter_active    = False # filter is confirmed and in effect
         self.filter_bar_open  = False # filter input bar is currently shown
         self.filter_input     = ''    # text being typed in the filter bar
@@ -1329,13 +1330,13 @@ class Editor:
             self._as(pane.y, pane.x, prompt, curses.color_pair(2))
 
         # Determine if lines should be filtered
-        fp_lower = pane.filter_pat.lower() if (pane.filter_active and pane.filter_pat) else ''
+        fre = pane.filter_re if pane.filter_active else None
 
         # When filter is active we must iterate buffer rows differently:
         # we skip non-matching lines and map matching ones to screen rows.
         avail_sy = pane.height - filter_row_offset
 
-        if fp_lower:
+        if fre:
             # We scan from row 0 to find the Nth matching row (pane.top_row)
             # then render avail_sy of them.
             line_count = pane.buf.line_count()
@@ -1345,7 +1346,7 @@ class Editor:
             skipped = 0
             while scan < line_count:
                 ln = pane.buf.get_line(scan)
-                if fp_lower in ln.lower():
+                if fre.search(ln):
                     if skipped >= skip:
                         first_buf_row = scan
                         break
@@ -1359,7 +1360,7 @@ class Editor:
             br = first_buf_row
             while sy_offset < avail_sy and br < line_count:
                 line = pane.buf.get_line(br)
-                if fp_lower not in line.lower():
+                if not fre.search(line):
                     br += 1; continue
                 scr_y = pane.y + filter_row_offset + sy_offset
                 scr_x = pane.x
@@ -1383,7 +1384,7 @@ class Editor:
                     display = line
                     hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
                 self._render_line(scr_y, scr_x + lnw, display, lc, tw,
-                                  vis_rows, vis_range, br, spat, hl_row, is_active)
+                                  vis_rows, vis_range, br, spat, hl_row, is_active, fre)
                 sy_offset += 1
                 br += 1
             # Fill remaining rows with ~
@@ -1467,10 +1468,10 @@ class Editor:
                     display = line
                     hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
                 self._render_line(scr_y, scr_x + lnw, display, lc, tw,
-                                  vis_rows, vis_range, br, spat, hl_row, is_active)
+                                  vis_rows, vis_range, br, spat, hl_row, is_active, fre)
 
     def _render_line(self, sy, sx, line, lc, tw, vis_rows, vis_range, br,
-                     spat, hl_row, is_active):
+                     spat, hl_row, is_active, fre=None):
         # Build span list: (start_in_line, end_in_line, attr)
         spans = []
 
@@ -1479,7 +1480,13 @@ class Editor:
         for ts, te, pg in hl_row:
             spans.append((ts, te, curses.color_pair(pg[0]) | pg[1]))
 
-        # 2. Search matches (override syntax)
+        # 2. Filter matches (above syntax, below search)
+        if fre:
+            for m in fre.finditer(line):
+                if m.start() < m.end():
+                    spans.append((m.start(), m.end(), curses.color_pair(2) | curses.A_UNDERLINE))
+
+        # 3. Search matches (override syntax and filter)
         if spat:
             for m in spat.finditer(line):
                 spans.append((m.start(), m.end(), curses.color_pair(2)))
@@ -1631,15 +1638,15 @@ class Editor:
         th = p.height
         lnw = self._pane_lnw(p)
         tw  = p.width - lnw
-        fp = p.filter_pat.lower() if (p.filter_active and p.filter_pat) else ''
-        if fp:
+        fre = p.filter_re if p.filter_active else None
+        if fre:
             # In filtered mode top_row is the index of the first *matching* row to show.
             # Count matching rows up to (and including) cursor.row to find its match index.
             filter_row_offset = 1 if p.filter_bar_open else 0
             avail = th - filter_row_offset
             match_idx = 0  # 0-based index of cursor in matching rows
             for r in range(p.cursor.row):
-                if fp in p.buf.get_line(r).lower():
+                if fre.search(p.buf.get_line(r)):
                     match_idx += 1
             # Cursor row must be in [top_row, top_row + avail - 1]
             if match_idx < p.top_row:
@@ -2086,9 +2093,8 @@ class Editor:
             if not new_lines:
                 continue
             # Apply filter: silently drop non-matching lines
-            if pane.filter_active and pane.filter_pat:
-                fp = pane.filter_pat.lower()
-                new_lines = [l for l in new_lines if fp in l.lower()]
+            if pane.filter_active and pane.filter_re:
+                new_lines = [l for l in new_lines if pane.filter_re.search(l)]
             if not new_lines:
                 continue
             # Append to buffer (replace trailing empty sentinel if present)
@@ -2226,36 +2232,63 @@ class Editor:
         p.filter_bar_open = True
         p.filter_input    = p.filter_pat  # pre-populate with current pattern
 
+    @staticmethod
+    def _compile_filter(pat):
+        """Compile pat as a regex; auto-IGNORECASE for all-lowercase patterns."""
+        if not pat:
+            return None
+        flags = re.IGNORECASE if pat == pat.lower() else 0
+        return re.compile(pat, flags)
+
+    def _filter_apply(self, p, text, close=False):
+        """Update filter state from text; returns False if regex is invalid."""
+        try:
+            compiled = self._compile_filter(text)
+            p.filter_pat    = text
+            p.filter_re     = compiled
+            p.filter_active = bool(text)
+            if close:
+                p.filter_bar_open = False
+                if p.filter_active:
+                    self._filtered_scroll()
+            return True
+        except re.error as e:
+            self.status_msg = f'Bad regex: {e}'
+            self.status_err = True
+            return False
+
     def _filter_key(self, key):
         p = self._pane
         if key == 27:            # Esc — clear filter entirely
             p.filter_bar_open = False
             p.filter_input    = ''
             p.filter_pat      = ''
+            p.filter_re       = None
             p.filter_active   = False
         elif key in (10, 13):    # Enter — confirm filter, close bar
-            p.filter_pat     = p.filter_input
-            p.filter_active  = bool(p.filter_input)
-            p.filter_bar_open= False
-            if p.filter_active and p.filter_pat:
-                self._filtered_scroll()
+            self._filter_apply(p, p.filter_input, close=True)
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             p.filter_input = p.filter_input[:-1]
+            # Live preview: silently ignore invalid regex while editing
+            try:    p.filter_re = self._compile_filter(p.filter_input)
+            except re.error: p.filter_re = None
             p.filter_pat    = p.filter_input
-            p.filter_active = bool(p.filter_input)
+            p.filter_active = bool(p.filter_input) and p.filter_re is not None
         elif 32 <= key <= 126:
             p.filter_input += chr(key)
+            try:    p.filter_re = self._compile_filter(p.filter_input)
+            except re.error: p.filter_re = None
             p.filter_pat    = p.filter_input
-            p.filter_active = bool(p.filter_input)
+            p.filter_active = bool(p.filter_input) and p.filter_re is not None
 
     def _filtered_scroll(self):
         p = self._pane
-        fp = p.filter_pat.lower() if p.filter_pat else ''
-        if not fp:
+        fre = p.filter_re
+        if not fre:
             return
         match_count = 0
         for r in range(p.cursor.row):
-            if fp in p.buf.get_line(r).lower():
+            if fre.search(p.buf.get_line(r)):
                 match_count += 1
         avail = p.height - 1
         if match_count >= p.top_row + avail:
@@ -2265,15 +2298,15 @@ class Editor:
 
     def _filter_next(self, direction):
         p = self._pane
-        fp = p.filter_pat.lower() if p.filter_pat else ''
-        if not fp:
+        fre = p.filter_re
+        if not fre:
             return
         row = p.cursor.row
         lc  = p.buf.line_count()
         step = 1 if direction > 0 else -1
         r = row + step
         while 0 <= r < lc:
-            if fp in p.buf.get_line(r).lower():
+            if fre.search(p.buf.get_line(r)):
                 p.cursor.row = r; p.cursor.col = 0
                 self._filtered_scroll()
                 return
