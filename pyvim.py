@@ -2057,11 +2057,16 @@ class Editor:
     def _tail_check(self):
         """Called on each -1 timeout tick.  For every pane that is following,
         check if the file has grown; if so, append only the new lines."""
+        follow_file_name = (os.path.abspath(self._follow_file.name)
+                            if self._follow_file else None)
         for pane in _lc_panes(self._layout):
             if not pane.following:
                 continue
             fname = pane.buf.filename
             if not fname:
+                continue
+            # Skip if _follow_check() is already watching this file
+            if follow_file_name and os.path.abspath(fname) == follow_file_name:
                 continue
             try:
                 new_size = os.path.getsize(fname)
