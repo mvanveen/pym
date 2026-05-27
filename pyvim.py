@@ -972,6 +972,14 @@ def _md_highlight(buf):
                         pre = indent + ('• ' if marker in '-*+' else marker + ' ')
                     vis   = pre + vis
                     spans = [(s + len(pre), e + len(pre), st) for s, e, st in spans]
+                elif gi > 0:
+                    # Soft-wrapped continuation line: keep the raw line's
+                    # leading whitespace so wrapped bullet text stays aligned
+                    # under its marker.
+                    ws = re.match(r'^\s*', raw).group(0)
+                    if ws:
+                        vis   = ws + vis
+                        spans = [(s + len(ws), e + len(ws), st) for s, e, st in spans]
                 by_row[r] = (vis, spans)
             i += 1; continue
 
