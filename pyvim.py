@@ -275,6 +275,11 @@ _ACTIVE_SYNTAX_ATTRS: dict = {
     'builtin':   (14, 0),
     'decorator': (15, curses.A_BOLD),
 }
+# Diff-bg variants — same fg, but bg=dark-green / dark-red so syntax colors
+# stay visible inside +/- diff lines. Populated only on 256-color terminals;
+# otherwise these fall back to the normal attrs (no bg).
+_ACTIVE_SYNTAX_ATTRS_ADD: dict = dict(_ACTIVE_SYNTAX_ATTRS)
+_ACTIVE_SYNTAX_ATTRS_REM: dict = dict(_ACTIVE_SYNTAX_ATTRS)
 
 def _load_pyvim_config() -> dict:
     """Read [tool.pyvim] from the nearest pyproject.toml."""
@@ -293,7 +298,7 @@ def _apply_scheme(name: str, overrides: dict | None = None) -> None:
     Falls back to 'default' when the scheme needs 256 colors and the terminal
     doesn't support them.  Call only after curses.start_color().
     """
-    global _ACTIVE_SYNTAX_ATTRS
+    global _ACTIVE_SYNTAX_ATTRS, _ACTIVE_SYNTAX_ATTRS_ADD, _ACTIVE_SYNTAX_ATTRS_REM
     scheme = dict(_SCHEMES.get(name) or _SCHEMES['default'])
     needs_256 = any(v[0] > 7 for v in scheme.values())
     if needs_256 and not HAS_256COLOR:
@@ -303,17 +308,31 @@ def _apply_scheme(name: str, overrides: dict | None = None) -> None:
             if role in scheme and isinstance(fg, int):
                 scheme[role] = (fg, scheme[role][1])
     new_attrs = {}
+    add_attrs = {}
+    rem_attrs = {}
     for role in _SYNTAX_ROLES:
         fg, attr = scheme.get(role, _SCHEMES['default'][role])
         idx = _SYNTAX_PAIR[role]
         curses.init_pair(idx, fg, -1)
         new_attrs[role] = (idx, attr)
+        if HAS_256COLOR:
+            add_idx = 23 + (idx - 9)   # 23..29
+            rem_idx = 30 + (idx - 9)   # 30..36
+            try:
+                curses.init_pair(add_idx, fg, 22)   # role fg on dark green
+                curses.init_pair(rem_idx, fg, 52)   # role fg on dark red
+                add_attrs[role] = (add_idx, attr)
+                rem_attrs[role] = (rem_idx, attr)
+            except Exception: pass
     _ACTIVE_SYNTAX_ATTRS = new_attrs
+    _ACTIVE_SYNTAX_ATTRS_ADD = add_attrs or new_attrs
+    _ACTIVE_SYNTAX_ATTRS_REM = rem_attrs or new_attrs
     _pg_cache.clear()
+    _diff_cache.clear()
 
 # pygments ttype → (color_pair_index, extra_attr) from active scheme
-def _pg_attr(ttype):
-    a = _ACTIVE_SYNTAX_ATTRS
+def _pg_attr(ttype, attrs=None):
+    a = attrs if attrs is not None else _ACTIVE_SYNTAX_ATTRS
     if ttype in Token.Keyword:                                   return a['keyword']
     if ttype in Token.Literal.String or ttype in Token.String:  return a['string']
     if ttype in Token.Comment:                                   return a['comment']
@@ -380,6 +399,125 @@ def _is_markdown(filename):
 
 def _is_notebook(filename):
     return bool(filename and filename.endswith('.ipynb'))
+
+# ── Unified diff highlighter ──────────────────────────────────────────────────
+# Parses unified diff format (git/svn/standard) and colorizes by line role.
+# Reuses color pairs 20/21/22 set up in Editor._setup_colors (full-line bg on
+# 256-color terms, fg-only fallback otherwise).
+
+_DIFF_HUNK_RE = re.compile(r'^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@')
+_DIFF_META_PREFIXES = (
+    'index ', 'new file mode', 'deleted file mode', 'old mode', 'new mode',
+    'similarity index', 'dissimilarity index', 'rename from', 'rename to',
+    'copy from', 'copy to', 'Binary files', 'Only in ', 'GIT binary patch',
+)
+
+def _is_diff(buf):
+    if buf.filename:
+        ext = buf.filename.rsplit('.', 1)[-1].lower()
+        if ext in ('diff', 'patch'): return True
+    for line in buf.lines[:40]:
+        if line.startswith('diff --git ') or line.startswith('Index: '):
+            return True
+        if _DIFF_HUNK_RE.match(line):
+            return True
+    return False
+
+def _diff_file_lexer(path):
+    """Resolve a diff header path (a/foo, b/foo, /dev/null) to a pygments lexer."""
+    if not path or path == '/dev/null': return None
+    if path.startswith('a/') or path.startswith('b/'): path = path[2:]
+    try:
+        return get_lexer_for_filename(path, stripnl=False, ensurenl=False)
+    except ClassNotFound:
+        return None
+
+def _pg_line_spans(lexer, text, start_col, attrs_dict=None):
+    """Tokenize one line, emit (start, end, (pair, attr)) spans offset by start_col."""
+    if not lexer or not text: return []
+    out = []
+    col = start_col
+    try:
+        for ttype, value in lex(text, lexer):
+            # Take only the first segment of any embedded newlines (single-line scope)
+            part = value.split('\n', 1)[0]
+            if part:
+                pg = _pg_attr(ttype, attrs_dict)
+                if pg:
+                    out.append((col, col + len(part), pg))
+                col += len(part)
+            if '\n' in value: break
+    except Exception: pass
+    return out
+
+_diff_cache: dict = {}
+
+def _diff_highlight(buf):
+    key = (id(buf), buf._gen)
+    if key in _diff_cache: return _diff_cache[key]
+    stale = [k for k in _diff_cache if k[0] == id(buf)]
+    for k in stale: del _diff_cache[k]
+    if len(_diff_cache) > 40: _diff_cache.clear()
+
+    ADD_BASE = (20, 0)
+    REM_BASE = (21, 0)
+    HUNK     = (22, curses.A_BOLD)
+    PATH     = (5,  curses.A_BOLD)
+    META     = (0,  curses.A_DIM)
+    use_bg   = HAS_256COLOR  # full-line bg compositing requires extra pairs
+
+    by_row: list[list] = []
+    in_hunk = False
+    old_path = None; new_path = None
+    cur_lexer = None
+
+    for line in buf.lines:
+        spans = []
+        if not line:
+            by_row.append(spans); in_hunk = False; continue
+        c0 = line[0]
+        if in_hunk:
+            if c0 in '+-':
+                is_add = (c0 == '+')
+                base   = ADD_BASE if is_add else REM_BASE
+                attrs  = (_ACTIVE_SYNTAX_ATTRS_ADD if is_add
+                          else _ACTIVE_SYNTAX_ATTRS_REM)
+                if use_bg:
+                    # Paint the full line with the diff bg; pygments spans
+                    # overlay per-cell via last-wins in the render loop.
+                    spans.append((0, len(line), base))
+                else:
+                    # No bg compositing — just bold the prefix char.
+                    spans.append((0, 1, (base[0], curses.A_BOLD)))
+                spans.extend(_pg_line_spans(cur_lexer, line[1:], 1, attrs))
+            elif c0 == '\\':
+                spans.append((0, len(line), META))
+            elif c0 == ' ':
+                spans.extend(_pg_line_spans(cur_lexer, line[1:], 1))
+            else:
+                in_hunk = False  # exited hunk — re-classify as header
+        if not in_hunk and not spans:
+            if _DIFF_HUNK_RE.match(line):
+                spans.append((0, len(line), HUNK)); in_hunk = True
+            elif line.startswith('diff --git ') or line.startswith('Index: '):
+                spans.append((0, len(line), PATH))
+                old_path = new_path = None; cur_lexer = None
+            elif line.startswith('--- ') or line.startswith('+++ '):
+                rest = line[4:].split('\t', 1)[0].rstrip()
+                if line.startswith('--- '): old_path = rest
+                else:                       new_path = rest
+                cur_lexer = None
+                for p in (new_path, old_path):
+                    if p and p != '/dev/null':
+                        cur_lexer = _diff_file_lexer(p)
+                        if cur_lexer: break
+                spans.append((0, len(line), PATH))
+            elif any(line.startswith(p) for p in _DIFF_META_PREFIXES):
+                spans.append((0, len(line), META))
+        by_row.append(spans)
+
+    _diff_cache[key] = by_row
+    return by_row
 
 # ── Notebook (.ipynb) helpers ─────────────────────────────────────────────────
 
@@ -1250,10 +1388,12 @@ class Editor:
 
         is_md = _is_markdown(pane.buf.filename)
         is_nb = _is_notebook(pane.buf.filename)
+        is_diff = not (is_md or is_nb) and _is_diff(pane.buf)
         in_insert = is_active and self.mode == Mode.INSERT
         md_table = (_md_highlight(pane.buf) if is_md else None)
         img_map  = (_md_images(pane.buf) if is_md else {})
         hl_table = (None if is_md or is_nb else
+                    _diff_highlight(pane.buf) if is_diff else
                     _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
         _nb_clist = _nb_cells(pane.buf) if is_nb else []
         _nb_cursor_ci = _nb_cell_idx_at(_nb_clist, pane.cursor.row) if is_nb else None
