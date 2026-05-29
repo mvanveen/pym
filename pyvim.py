@@ -144,6 +144,7 @@ class Pane:
         self.buf    = buf or Buffer()
         self.cursor = Cursor()
         self.top_row = 0; self.left_col = 0
+        self.wrap   = False
         # Screen geometry (set by layout engine)
         self.y = 0; self.x = 0; self.height = 24; self.width = 80
 
@@ -989,6 +990,38 @@ def _md_highlight(buf):
     _md_img_cache[key] = images
     return by_row
 
+_WRAP_MARKER_RE = re.compile(r'^(\s*)([-*+•□■▢]|\d+\.) ')
+
+def _wrap_segments(display, width):
+    """Split `display` into wrapped segments fitting `width` cells each.
+
+    Returns a list of (seg_start, seg_end, hang_prefix). First segment has
+    hang_prefix='' and covers display[0:width]. Continuation segments get a
+    hanging-indent prefix of spaces matching the leading whitespace +
+    bullet/quote marker width, so wrapped bullet text stays under the marker.
+    """
+    if width <= 0 or len(display) <= width:
+        return [(0, len(display), '')]
+    m = _WRAP_MARKER_RE.match(display)
+    if m:
+        hang_w = m.end()
+    elif display.startswith('│ ') or display.startswith('> '):
+        hang_w = 2
+    else:
+        ws = re.match(r'^\s*', display)
+        hang_w = ws.end() if ws else 0
+    if hang_w >= width - 1:
+        hang_w = 0
+    hang = ' ' * hang_w
+    seg_w = width - hang_w
+    segs = [(0, width, '')]
+    pos = width
+    while pos < len(display):
+        end = min(pos + seg_w, len(display))
+        segs.append((pos, end, hang))
+        pos = end
+    return segs
+
 # ── Editor ───────────────────────────────────────────────────────────────────
 
 class Editor:
@@ -1196,7 +1229,7 @@ class Editor:
     def _draw_pane(self, pane, is_active):
         lnw = self._pane_lnw(pane)
         tw  = pane.width - lnw
-        lc  = pane.left_col
+        lc  = 0 if pane.wrap else pane.left_col
 
         vis_rows = set()
         vis_range = {}
@@ -1233,13 +1266,20 @@ class Editor:
         except re.error:
             spat = None
 
-        for sy in range(pane.height):
-            br = pane.top_row + sy
+        sy = 0
+        br = pane.top_row
+        pending_segs = []      # remaining wrap segments for current br
+        pending_display = ''
+        pending_hl_row  = []
+
+        while sy < pane.height:
             scr_y = pane.y + sy
             scr_x = pane.x
 
             if br >= pane.buf.line_count():
-                self._as(scr_y, scr_x, '~', curses.A_DIM); continue
+                self._as(scr_y, scr_x, '~', curses.A_DIM)
+                sy += 1; br += 1
+                continue
 
             line = pane.buf.get_line(br)
 
@@ -1255,77 +1295,94 @@ class Editor:
                 else:
                     attr = curses.color_pair(7) | curses.A_DIM
                 self._as(scr_y, scr_x, bar, attr)
+                sy += 1; br += 1
                 continue
 
-            # Notebook: output lines — comment color, │ prefix gutter
+            # Notebook: output lines — comment color, │ prefix gutter (no wrap)
             if is_nb and line.startswith('# >> '):
                 out_attr = curses.color_pair(_SYNTAX_PAIR['comment']) | curses.A_DIM
                 if lnw > 0:
                     self._as(scr_y, scr_x, ' ' * (lnw - 1) + '│', out_attr)
                 self._as(scr_y, scr_x + lnw, (' ' + line[5:])[lc:lc+tw], out_attr)
+                sy += 1; br += 1
                 continue
 
-            if self.show_numbers:
-                ns = str(br+1).rjust(lnw-1) + ' '
-                na = (curses.color_pair(6)|curses.A_BOLD
-                      if is_active and br == pane.cursor.row
-                      else curses.color_pair(5))
-                self._as(scr_y, scr_x, ns, na)
+            # First visual row of this br: compute display + segments and draw gutter
+            is_first = not pending_segs
+            if is_first:
+                if self.show_numbers:
+                    ns = str(br+1).rjust(lnw-1) + ' '
+                    na = (curses.color_pair(6)|curses.A_BOLD
+                          if is_active and br == pane.cursor.row
+                          else curses.color_pair(5))
+                    self._as(scr_y, scr_x, ns, na)
 
-            # Notebook: │ left-border overlay (replaces trailing space of line-number gutter)
-            if is_nb and lnw > 0:
-                my_ci = _nb_cell_idx_at(_nb_clist, br)
-                if is_active and my_ci == _nb_cursor_ci:
-                    ba = curses.color_pair(1) | curses.A_BOLD
-                else:
-                    ba = curses.color_pair(7) | curses.A_DIM
-                self._as(scr_y, scr_x + lnw - 1, '│', ba)
+                if is_nb and lnw > 0:
+                    my_ci = _nb_cell_idx_at(_nb_clist, br)
+                    if is_active and my_ci == _nb_cursor_ci:
+                        ba = curses.color_pair(1) | curses.A_BOLD
+                    else:
+                        ba = curses.color_pair(7) | curses.A_DIM
+                    self._as(scr_y, scr_x + lnw - 1, '│', ba)
 
-            if br in img_map and not (is_active and br == pane.cursor.row):
-                path, _alt = img_map[br]
-                self._pending_sixels.append(
-                    (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
-            if is_nb and nb_hl is not None:
-                nb_rendered, hl_row = nb_hl[br] if br < len(nb_hl) else (None, [])
-                if nb_rendered is not None:
-                    # Markdown cell line: apply raw/rendered logic same as full md mode
+                if br in img_map and not (is_active and br == pane.cursor.row):
+                    path, _alt = img_map[br]
+                    self._pending_sixels.append(
+                        (scr_y, scr_x + lnw, path, pane.width - lnw, pane.height // 2))
+
+                if is_nb and nb_hl is not None:
+                    nb_rendered, hl_row = nb_hl[br] if br < len(nb_hl) else (None, [])
+                    if nb_rendered is not None:
+                        is_cur = is_active and br == pane.cursor.row
+                        show_raw = (is_cur and (in_insert or not _is_table_row(line))) or br in vis_rows
+                        display = line if show_raw else nb_rendered
+                        if show_raw: hl_row = []
+                    else:
+                        display = line  # code cell: raw text, python spans in hl_row
+                elif md_table:
                     is_cur = is_active and br == pane.cursor.row
-                    show_raw = (is_cur and (in_insert or not _is_table_row(line))) or br in vis_rows
-                    display = line if show_raw else nb_rendered
-                    if show_raw: hl_row = []
+                    show_raw_cur = is_cur and (in_insert or not _is_table_row(line))
+                    raw = show_raw_cur or br in vis_rows
+                    display, hl_row = (line, []) if raw else (
+                        md_table[br] if br < len(md_table) else (line, []))
                 else:
-                    display = line  # code cell: raw text, python spans in hl_row
-            elif md_table:
-                is_cur = is_active and br == pane.cursor.row
-                # Table rows in normal mode: always show rendered (cell nav keeps
-                # cursor at cell-start so column accuracy isn't needed).
-                # Insert mode or non-table cursor row: show raw for accurate editing.
-                show_raw_cur = is_cur and (in_insert or not _is_table_row(line))
-                raw = show_raw_cur or br in vis_rows
-                display, hl_row = (line, []) if raw else (
-                    md_table[br] if br < len(md_table) else (line, []))
+                    display = line
+                    hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
+
+                pending_display = display
+                pending_hl_row  = hl_row
+                pending_segs    = (list(_wrap_segments(display, tw))
+                                   if pane.wrap else [(0, len(display), '')])
             else:
-                display = line
-                hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
-            self._render_line(scr_y, scr_x + lnw, display, lc, tw,
-                              vis_rows, vis_range, br, spat, hl_row, is_active)
+                # Continuation row: blank line-number gutter, keep nb │ border
+                if self.show_numbers:
+                    self._as(scr_y, scr_x, ' ' * lnw, curses.color_pair(5))
+                if is_nb and lnw > 0:
+                    my_ci = _nb_cell_idx_at(_nb_clist, br)
+                    ba = (curses.color_pair(1) | curses.A_BOLD
+                          if is_active and my_ci == _nb_cursor_ci
+                          else curses.color_pair(7) | curses.A_DIM)
+                    self._as(scr_y, scr_x + lnw - 1, '│', ba)
+
+            seg_start, seg_end, hang = pending_segs.pop(0)
+            self._render_line(scr_y, scr_x + lnw, pending_display, lc, tw,
+                              vis_rows, vis_range, br, spat, pending_hl_row, is_active,
+                              seg_start=seg_start, seg_end=seg_end, hang=hang)
+
+            sy += 1
+            if not pending_segs:
+                br += 1
 
     def _render_line(self, sy, sx, line, lc, tw, vis_rows, vis_range, br,
-                     spat, hl_row, is_active):
-        # Build span list: (start_in_line, end_in_line, attr)
+                     spat, hl_row, is_active, seg_start=0, seg_end=None, hang=''):
+        if seg_end is None: seg_end = len(line)
+        # Build span list against the full `line`: (start, end, attr)
         spans = []
-
-        # 1. Syntax tokens from pygments (lowest priority)
-        # hl_row entries: (start, end, (pair_idx, extra_attr)) — resolve here
         for ts, te, pg in hl_row:
             spans.append((ts, te, curses.color_pair(pg[0]) | pg[1]))
-
-        # 2. Search matches (override syntax)
         if spat:
             for m in spat.finditer(line):
                 spans.append((m.start(), m.end(), curses.color_pair(2)))
-
-        # 3. Visual selection (highest priority, active pane only)
         if is_active and br in vis_rows:
             rng = vis_range.get(br)
             if rng is None:
@@ -1334,36 +1391,36 @@ class Editor:
                 sc2, ec2 = rng
                 spans.append((sc2, ec2+1, curses.color_pair(3)))
 
-        # Sort spans so that higher-priority (later-added) ones can override
-        # We draw in priority order: paint low→high, last wins per cell
-        # Use a simple per-character attr array for the visible slice
-        vis_len = tw
-        attrs = [0] * vis_len
+        # Visible-row layout: [hang_prefix][body slice of line[slice_start:slice_end]]
+        # Non-wrap: seg_start=0, seg_end=len(line), hang='' → body = line[lc:lc+tw]
+        # Wrap:     lc=0, seg covers a wrap chunk → body = line[seg_start:seg_end]
+        hl = len(hang)
+        body_budget = max(0, tw - hl)
+        slice_start = seg_start + lc
+        slice_end   = min(seg_end, slice_start + body_budget)
+        body = line[slice_start:slice_end] if slice_end > slice_start else ''
+        visible = hang + body
 
+        # Map spans (line coords) → visible row cells [0, tw)
+        attrs = [0] * tw
         for ts, te, attr in spans:
-            for i in range(max(0, ts-lc), min(vis_len, te-lc)):
+            a = max(0, ts - slice_start) + hl
+            b = min(tw, te - slice_start + hl)
+            for i in range(a, b):
                 attrs[i] = attr
 
-        # Draw character by character (group consecutive same-attr runs)
-        col_in_line = lc
         scr_col = sx
         i = 0
-        while i < vis_len and col_in_line < len(line):
+        n = len(visible)
+        while i < n:
             a = attrs[i]
             j = i + 1
-            while j < vis_len and attrs[j] == a and col_in_line + (j-i) < len(line):
+            while j < n and attrs[j] == a:
                 j += 1
-            seg = line[col_in_line: col_in_line + (j-i)]
-            if a:
-                self._as(sy, scr_col, seg, a)
-            else:
-                self._as(sy, scr_col, seg)
-            scr_col += len(seg); col_in_line += len(seg); i = j
-
-        # Fill remainder with spaces (clear to end of pane width)
-        rest = line[lc + i: lc + tw] if lc + i < len(line) else ''
-        if rest:
-            self._as(sy, scr_col, rest)
+            seg = visible[i:j]
+            if a: self._as(sy, scr_col, seg, a)
+            else: self._as(sy, scr_col, seg)
+            scr_col += len(seg); i = j
 
     def _draw_statusbar(self):
         _tbl_nm = (self.mode == Mode.NORMAL and
@@ -1409,7 +1466,7 @@ class Editor:
             return
         p = self._pane
         lnw = self._pane_lnw(p)
-        sy  = p.y + p.cursor.row - p.top_row
+        sy  = p.y + self._cursor_visual_offset(p)
         col = p.cursor.col
         # TABLE mode: cursor.col is a buffer col, but the screen shows rendered
         # box-drawing where cells are padded to equal widths.  Map to visual col.
@@ -1430,7 +1487,14 @@ class Editor:
             try: self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)), p.x)
             except curses.error: pass
             return
-        sx = p.x + lnw + col - p.left_col
+        if p.wrap:
+            line = p.buf.get_line(p.cursor.row)
+            segs = _wrap_segments(line, p.width - lnw)
+            seg_idx = self._cursor_seg_idx(p)
+            seg_start, _seg_end, hang = segs[seg_idx]
+            sx = p.x + lnw + (col - seg_start) + len(hang)
+        else:
+            sx = p.x + lnw + col - p.left_col
         try:
             self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)),
                              max(p.x, min(sx, p.x+p.width-1)))
@@ -1454,15 +1518,49 @@ class Editor:
         mc = len(line) if self.mode == Mode.INSERT else max(0, len(line)-1)
         p.cursor.col = max(0, min(p.cursor.col, mc))
 
+    def _row_visual_count(self, p, br):
+        if not p.wrap: return 1
+        line = p.buf.get_line(br)
+        tw = p.width - self._pane_lnw(p)
+        return len(_wrap_segments(line, tw))
+
+    def _cursor_seg_idx(self, p):
+        """Index of the wrap segment containing the cursor on its own row."""
+        if not p.wrap: return 0
+        line = p.buf.get_line(p.cursor.row)
+        tw = p.width - self._pane_lnw(p)
+        segs = _wrap_segments(line, tw)
+        for i, (_s, e, _h) in enumerate(segs):
+            if p.cursor.col < e: return i
+        return len(segs) - 1
+
+    def _cursor_visual_offset(self, p):
+        """Visual rows from top_row to the cursor's visual row (inclusive 0-based)."""
+        if not p.wrap: return p.cursor.row - p.top_row
+        off = 0
+        for br in range(p.top_row, p.cursor.row):
+            off += self._row_visual_count(p, br)
+        return off + self._cursor_seg_idx(p)
+
     def _scroll(self):
         p = self._pane
         th = p.height
         lnw = self._pane_lnw(p)
         tw  = p.width - lnw
-        if p.cursor.row < p.top_row: p.top_row = p.cursor.row
-        elif p.cursor.row >= p.top_row + th: p.top_row = p.cursor.row - th + 1
-        if p.cursor.col < p.left_col: p.left_col = max(0, p.cursor.col-5)
-        elif p.cursor.col >= p.left_col + tw: p.left_col = p.cursor.col - tw + 6
+        if p.cursor.row < p.top_row:
+            p.top_row = p.cursor.row
+        elif not p.wrap:
+            if p.cursor.row >= p.top_row + th:
+                p.top_row = p.cursor.row - th + 1
+        else:
+            # Advance top_row until cursor's visual row fits in the pane.
+            while p.top_row < p.cursor.row and self._cursor_visual_offset(p) >= th:
+                p.top_row += 1
+        if p.wrap:
+            p.left_col = 0
+        else:
+            if p.cursor.col < p.left_col: p.left_col = max(0, p.cursor.col-5)
+            elif p.cursor.col >= p.left_col + tw: p.left_col = p.cursor.col - tw + 6
 
     def _move(self, dr, dc):
         p = self._pane
@@ -2325,6 +2423,40 @@ class Editor:
         elif ch2=='E': self._word_end(True)
         elif ch2=='d': self._gd()
         elif ch2=='r': self._gr()
+        elif ch2=='j': [self._visual_move(1)  for _ in range(max(1,count))]
+        elif ch2=='k': [self._visual_move(-1) for _ in range(max(1,count))]
+
+    def _visual_move(self, dr):
+        """Move cursor one visual (wrapped) row. With wrap off, equivalent to j/k."""
+        p = self._pane
+        if not p.wrap:
+            self._move(dr, 0); return
+        tw = p.width - self._pane_lnw(p)
+        line = p.buf.get_line(p.cursor.row)
+        segs = _wrap_segments(line, tw)
+        seg_idx = self._cursor_seg_idx(p)
+        seg_start, _seg_end, hang = segs[seg_idx]
+        want = p.cursor.col_want - seg_start + len(hang)  # visual column want
+        if dr > 0 and seg_idx + 1 < len(segs):
+            ns, ne, nh = segs[seg_idx + 1]
+            p.cursor.col = max(ns, min(ne - 1, ns + max(0, want - len(nh))))
+        elif dr < 0 and seg_idx > 0:
+            ns, ne, nh = segs[seg_idx - 1]
+            p.cursor.col = max(ns, min(ne - 1, ns + max(0, want - len(nh))))
+        else:
+            # Cross row boundary — fall back to buffer-line move, landing on the
+            # appropriate end segment of the new row.
+            self._move(dr, 0)
+            if not p.wrap: return
+            line2 = p.buf.get_line(p.cursor.row)
+            segs2 = _wrap_segments(line2, tw)
+            if dr > 0:
+                target = segs2[0]
+            else:
+                target = segs2[-1]
+            ns, ne, nh = target
+            p.cursor.col = max(ns, min(ne - (0 if self.mode == Mode.INSERT else 1),
+                                       ns + max(0, want - len(nh))))
 
     def _normal_z(self):
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
@@ -3196,10 +3328,10 @@ class Editor:
         elif re.match(r'^fin?d?\b', cmd):
             parts = cmd.split(None, 1)
             self._cmd_find(parts[1].strip() if len(parts) > 1 else '')
-        elif re.match(r'^(%|\.|\d+(,(\d+|\.|\$))?)?s',cmd):
-            self._exec_sub(cmd)
         elif cmd.startswith('set ') or cmd=='set':
             self._exec_set(cmd[4:].strip() if cmd.startswith('set ') else '')
+        elif re.match(r'^(%|\.|\d+(,(\d+|\.|\$))?)?s',cmd):
+            self._exec_sub(cmd)
         elif cmd.startswith('colorscheme') or cmd.startswith('colo'):
             parts=cmd.split(None,1)
             if len(parts)<2:
@@ -3308,6 +3440,9 @@ class Editor:
     def _exec_set(self, opt):
         if opt in ('nu','number'):         self.show_numbers=True
         elif opt in ('nonu','nonumber'):   self.show_numbers=False
+        elif opt in ('wrap', 'nowrap', 'wrap!'):
+            self._pane.wrap = (opt == 'wrap' if opt != 'wrap!' else not self._pane.wrap)
+            if self._pane.wrap: self._pane.left_col = 0
         else: self.status_msg=f'Unknown option: {opt}'
 
     # ── Search mode ───────────────────────────────────────────────────────────
