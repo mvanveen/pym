@@ -3422,7 +3422,7 @@ class Editor:
                 self._close_pane()
         elif cmd in ('q!','quit!'):
             self._close_pane(force=True)
-        elif re.match(r'^wq?!?$',cmd) or cmd in ('x','wq','x!'):
+        elif re.match(r'^wq!?$',cmd) or cmd in ('x','x!'):
             parts=cmd.split(None,1); fname=parts[1] if len(parts)>1 else None
             force='!' in cmd or cmd=='x'
             if not force and self._disk_changed(fname):
