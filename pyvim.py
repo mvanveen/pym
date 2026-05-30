@@ -450,6 +450,70 @@ def _pg_line_spans(lexer, text, start_col, attrs_dict=None):
     except Exception: pass
     return out
 
+# GitHub-style intra-line ("word") diff: within a hunk, pair each removed line
+# with the corresponding added line and emphasize only the substrings that
+# actually differ, so a 1-character change stands out from the line tint.
+_WORD_RE = re.compile(r'\w+|\s+|[^\w\s]')
+
+def _word_diff_ranges(old, new):
+    """Char ranges that differ between two strings, at word granularity.
+
+    Returns (old_ranges, new_ranges), each a list of (start, end) half-open
+    spans into `old` / `new` respectively. Returns (None, None) when the two
+    lines are too dissimilar to be a meaningful edit (treat as a full rewrite —
+    the whole-line tint already conveys that).
+    """
+    o_toks = _WORD_RE.findall(old)
+    n_toks = _WORD_RE.findall(new)
+    o_off = []; c = 0
+    for t in o_toks: o_off.append(c); c += len(t)
+    n_off = []; c = 0
+    for t in n_toks: n_off.append(c); c += len(t)
+    sm = difflib.SequenceMatcher(None, o_toks, n_toks, autojunk=False)
+    o_ranges = []; n_ranges = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'equal': continue
+        if i2 > i1:
+            o_ranges.append((o_off[i1], o_off[i2-1] + len(o_toks[i2-1])))
+        if j2 > j1:
+            n_ranges.append((n_off[j1], n_off[j2-1] + len(n_toks[j2-1])))
+    changed = sum(e - s for s, e in o_ranges) + sum(e - s for s, e in n_ranges)
+    if changed > 0.7 * ((len(old) + len(new)) or 1):
+        return None, None
+    return o_ranges, n_ranges
+
+def _compute_word_hi(lines):
+    """Map row index → list of (start, end) char ranges to emphasize.
+
+    Pairs maximal runs of removed lines with the following run of added lines
+    inside each hunk (the i-th '-' with the i-th '+'), as git/GitHub do.
+    """
+    hi: dict = {}
+    in_hunk = False
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        c0 = line[:1]
+        if not in_hunk:
+            if line and _DIFF_HUNK_RE.match(line): in_hunk = True
+            i += 1; continue
+        if c0 == '-':
+            j = i
+            while j < n and lines[j][:1] == '-': j += 1
+            k = j
+            while k < n and lines[k][:1] == '+': k += 1
+            if k > j:  # a '-' run followed by a '+' run → pair them up
+                for idx in range(min(j - i, k - j)):
+                    old = lines[i + idx][1:]; new = lines[j + idx][1:]
+                    o_r, n_r = _word_diff_ranges(old, new)
+                    if o_r: hi[i + idx] = [(s + 1, e + 1) for s, e in o_r]
+                    if n_r: hi[j + idx] = [(s + 1, e + 1) for s, e in n_r]
+            i = k; continue
+        if c0 in '+ \\':
+            i += 1; continue
+        in_hunk = False  # '@@'/'diff'/blank ends the hunk — reprocess this line
+    return hi
+
 _diff_cache: dict = {}
 
 def _diff_highlight(buf):
@@ -461,17 +525,21 @@ def _diff_highlight(buf):
 
     ADD_BASE = (20, 0)
     REM_BASE = (21, 0)
+    ADD_HI   = (37, curses.A_BOLD)   # changed substring on a '+' line
+    REM_HI   = (38, curses.A_BOLD)   # changed substring on a '-' line
     HUNK     = (22, curses.A_BOLD)
     PATH     = (5,  curses.A_BOLD)
     META     = (0,  curses.A_DIM)
     use_bg   = HAS_256COLOR  # full-line bg compositing requires extra pairs
+
+    word_hi = _compute_word_hi(buf.lines) if use_bg else {}
 
     by_row: list[list] = []
     in_hunk = False
     old_path = None; new_path = None
     cur_lexer = None
 
-    for line in buf.lines:
+    for ri, line in enumerate(buf.lines):
         spans = []
         if not line:
             by_row.append(spans); in_hunk = False; continue
@@ -490,6 +558,9 @@ def _diff_highlight(buf):
                     # No bg compositing — just bold the prefix char.
                     spans.append((0, 1, (base[0], curses.A_BOLD)))
                 spans.extend(_pg_line_spans(cur_lexer, line[1:], 1, attrs))
+                # Brighten only the changed substrings (last-wins over syntax).
+                for hs, he in word_hi.get(ri, ()):
+                    spans.append((hs, he, ADD_HI if is_add else REM_HI))
             elif c0 == '\\':
                 spans.append((0, len(line), META))
             elif c0 == ' ':
@@ -1265,6 +1336,8 @@ class Editor:
                 curses.init_pair(20, 255, 22)   # white on dark green
                 curses.init_pair(21, 255, 52)   # white on dark red
                 curses.init_pair(22, 255, 17)   # white on dark blue (hunk header)
+                curses.init_pair(37, 255, 34)   # white on vivid green (changed word)
+                curses.init_pair(38, 255, 124)  # white on vivid red   (changed word)
                 _diff_256=True
             except Exception: pass
         if not _diff_256:
