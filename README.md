@@ -53,6 +53,7 @@ Ctrl-W q       close pane
 :qa!           force quit all
 :e <file>      open file
 :Ex            file explorer
+:jp            toggle JSON structure preview (.json buffers)
 :set nu        line numbers on/off
 :noh           clear search highlight
 ```
@@ -66,6 +67,37 @@ Pygments — supports every language pygments knows. Full-file tokenization so m
 `.md` files render inline: heading markers dim, heading text bold+yellow, `**bold**` is bold, `*italic*` is underlined, `` `code` `` is green, `[links](url)` show the text in cyan with the URL dimmed, fenced code blocks are colored through.
 
 The cursor line always shows raw markdown so editing column positions are exact. Move away and it renders. Move back and it opens up. Feels like rich-text editing with a vim brain.
+
+## CSV / TSV rendering
+
+`.csv` and `.tsv` files render as an aligned column grid — box-drawing borders, columns padded to width, the first row treated as a bold header, and each column tinted a different syntax color so fields stay distinct. Quoted cells with embedded delimiters (`"San Francisco, CA"`) parse correctly; over-wide cells truncate with `…`.
+
+It plugs into the same **TABLE mode** as markdown tables — like Excel with vim bindings. The grid stays rendered while you navigate, the status bar shows `TABLE`, and motions move cell-to-cell instead of char-to-char:
+
+```
+h / l          previous / next cell (wraps across rows)
+j / k          same column, row up / down
+Tab / Shift-Tab next / previous cell
+```
+
+The cursor snaps to the rendered cell. Press `i` (or any insert key) and the row under the cursor drops back to raw text so buffer columns map 1:1 for exact editing — `Tab` in insert jumps to the next cell too. Move off the row, or leave insert, and it renders back into the grid.
+
+## JSON structure preview
+
+`:jpreview` (aliases `:jp`, `:JsonPreview`) on a `.json` buffer opens a live inspector in a vertical split. Move the cursor over any value and the pane shows **just that subtree**, pretty-printed and pygments-colorized; the status line shows its path, e.g. `json  $.orders[1].id`. Hover a key to preview its value; hover a container to preview the whole thing. Run `:jpreview` again to close it.
+
+```
+:jp            toggle the preview pane
+               (move over a value → its subtree renders on the right)
+```
+
+It parses with a position-aware JSON parser (not line-based), so it works on **minified single-line JSON** too — park the cursor anywhere in a 5KB one-liner and the pane resolves the exact node under it. Long string values wrap inside the pane so row ends aren't clipped. Invalid JSON shows `// invalid JSON` until the buffer parses again. The source stays the focused, editable pane; the preview just follows along.
+
+`:jp` also works on a **`.csv`/`.tsv` buffer** — a common case is a column of giant JSON blobs (API responses) too wide to read in the grid. Open the preview and walk the cells in TABLE mode (`h/j/k/l`); each cell's value is parsed and pretty-printed on the right, with the column name in the status line (`json  raw_exa_response`). Cells that aren't JSON show their raw value instead.
+
+When a value is taller than the pane, jump into the preview with `Ctrl-W l` (or `Ctrl-W w`) and scroll it with normal vim bindings — `j`/`k`, `Ctrl-D`/`Ctrl-U`, `gg`/`G`, `/search`. It stays put while focused; `Ctrl-W h` returns to the source, and moving to a new value/cell refreshes the preview from the top.
+
+Unlike the markdown/csv overlays — which are bound one-screen-line-per-buffer-line — this is a separate pane, which is what lets it reflow a node into a multi-line tree regardless of how the source is formatted.
 
 ## Python eval
 
@@ -131,6 +163,10 @@ Syntax highlighting: `_pg_highlight(buf)` tokenizes the full buffer once with py
 
 Markdown rendering: `_md_highlight(buf)` — separate path from pygments, returns `(visual_line, spans)` per row. Cursor row and visual-selected rows shown raw so buffer column positions stay valid.
 
+CSV rendering: `_csv_highlight(buf)` — parses each line with the `csv` module (honors quoted delimiters), computes per-column widths, and returns the same `(visual_line, spans)` shape, cached by `(id(buf), buf._gen)`. The cell-navigation operators (`_cell_next/_prev/_down/_up`) are shared with markdown tables via dispatch helpers (`_cells_at_row`, `_cell_at_in_row`, `_on_cell_row`) that pick pipe-table vs comma/tab geometry, so one set of TABLE-mode bindings drives both. Insert-mode and visual rows show raw; `_place_cursor` remaps the buffer column onto the rendered cell.
+
+JSON preview: `_json_parse(text)` is a hand-rolled tokenizer + recursive-descent parser that annotates every value node with its `(start, end)` char span (stdlib `json` has no source positions), cached per `(id(buf), buf._gen)`. `_json_node_at(root, offset)` finds the smallest node under the cursor (key hover → its value); the `(source_pane, preview_pane)` tuple in `self._json_preview` is refreshed each `draw()` from the source pane's cursor, writing the pretty-printed subtree into a `[json-preview].json` buffer so the normal pygments path colorizes it for free.
+
 Python eval: `_resolve_deps(r1, r2)` does AST analysis to find what a selection's free variables need, then runs exactly those imports/defs in order.
 
 ## Running
@@ -154,3 +190,4 @@ Requires Python 3.9+ (uses `ast.unparse`). The only dependency is `pygments`, wh
 - Ctrl-W navigation has been through several iterations of geometry bugs and may still have edge cases
 - No `%` bracket matching yet
 
+![](mona_lisa.png)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """pyvim - A pure Python vim-like editor"""
 import ast
+import csv
 import curses
 import difflib
 import os
@@ -399,6 +400,9 @@ def _is_markdown(filename):
 
 def _is_notebook(filename):
     return bool(filename and filename.endswith('.ipynb'))
+
+def _is_csv(filename):
+    return bool(filename and filename.rsplit('.', 1)[-1].lower() in ('csv', 'tsv'))
 
 # ── Unified diff highlighter ──────────────────────────────────────────────────
 # Parses unified diff format (git/svn/standard) and colorizes by line role.
@@ -1056,6 +1060,91 @@ def _render_table_tokens(toks, lines):
     return result
 
 
+# ── CSV / TSV column-aligned rendering ───────────────────────────────────────
+# Renders .csv/.tsv as an aligned grid (same box-drawing style as md tables).
+# Row 0 is treated as a header (bold); columns cycle through syntax colors so
+# fields stay visually distinct. The cursor row is shown raw by the caller so
+# the buffer column maps 1:1 to the underlying text for editing.
+
+_csv_cache: dict = {}
+_CSV_COL_PAIRS = [(14, 0), (13, 0), (10, 0), (12, 0), (9, 0), (11, 0)]
+_CSV_MAX_W = 32   # cap per-column display width; longer cells get truncated with …
+
+def _csv_delim(filename):
+    return '\t' if (filename or '').rsplit('.', 1)[-1].lower() == 'tsv' else ','
+
+def _csv_parse_line(line, delim):
+    """Parse one buffer line into fields, honouring quoted delimiters."""
+    try:
+        return next(csv.reader([line], delimiter=delim))
+    except Exception:
+        return line.split(delim)
+
+def _csv_delim_cols(line, delim):
+    """Char indices of top-level (unquoted) delimiters in `line`."""
+    out = []; inq = False; i = 0; n = len(line)
+    while i < n:
+        c = line[i]
+        if c == '"':
+            if inq and i + 1 < n and line[i + 1] == '"':
+                i += 2; continue       # escaped "" inside a quoted field
+            inq = not inq
+        elif c == delim and not inq:
+            out.append(i)
+        i += 1
+    return out
+
+def _csv_cells(line, delim):
+    """Return [(start, end)] char ranges for each field (raw, untrimmed)."""
+    ds = _csv_delim_cols(line, delim)
+    bounds = [-1] + ds + [len(line)]
+    return [(a + 1, b) for a, b in zip(bounds, bounds[1:])]
+
+def _csv_cell_at(line, col, delim):
+    """Return (cell_idx, start, end) for the field containing `col`, or None."""
+    for i, (a, b) in enumerate(_csv_cells(line, delim)):
+        if a <= col <= b:
+            return (i, a, b)
+    return None
+
+def _csv_highlight(buf):
+    key = (id(buf), buf._gen)
+    if key in _csv_cache: return _csv_cache[key]
+    stale = [k for k in _csv_cache if k[0] == id(buf)]
+    for k in stale: del _csv_cache[k]
+    if len(_csv_cache) > 20: _csv_cache.clear()
+
+    DIM   = (11, curses.A_DIM)
+    delim = _csv_delim(buf.filename)
+    rows  = [_csv_parse_line(ln, delim) for ln in buf.lines]
+    ncols = max((len(r) for r in rows), default=0)
+    widths = [1] * ncols
+    for r in rows:
+        for ci, c in enumerate(r[:ncols]):
+            widths[ci] = max(widths[ci], min(len(c), _CSV_MAX_W))
+
+    by_row = []
+    for ri, cells in enumerate(rows):
+        # Leave genuinely blank lines untouched (no grid box around nothing).
+        if buf.lines[ri] == '':
+            by_row.append((buf.lines[ri], [])); continue
+        parts = ['│']; spans = [(0, 1, DIM)]; pos = 1
+        for ci in range(ncols):
+            cell = cells[ci] if ci < len(cells) else ''
+            if len(cell) > widths[ci]:
+                cell = cell[:max(0, widths[ci] - 1)] + '…'
+            padded = ' ' + cell.ljust(widths[ci]) + ' '
+            pair, extra = _CSV_COL_PAIRS[ci % len(_CSV_COL_PAIRS)]
+            if ri == 0: extra |= curses.A_BOLD
+            spans.append((pos, pos + len(padded), (pair, extra)))
+            parts.append(padded); pos += len(padded)
+            parts.append('│'); spans.append((pos, pos + 1, DIM)); pos += 1
+        by_row.append((''.join(parts), spans))
+
+    _csv_cache[key] = by_row
+    return by_row
+
+
 def _md_highlight(buf):
     key = (id(buf), buf._gen)
     if key in _md_cache: return _md_cache[key]
@@ -1231,6 +1320,113 @@ def _wrap_segments(display, width):
         pos = end
     return segs
 
+# ── JSON structure preview ───────────────────────────────────────────────────
+# A position-aware JSON parser: every value node records its (start, end) char
+# span in the source text so we can find the smallest node under the cursor and
+# pretty-print just that subtree into the live side-preview pane.  stdlib `json`
+# has no source positions, so we tokenize + recursive-descent ourselves.
+
+import json as _json
+
+_JSON_TOK_RE = re.compile(r'''
+      [ \t\r\n]+
+    | (?P<punct>[{}\[\]:,])
+    | (?P<str>"(?:\\.|[^"\\\x00-\x1f])*")
+    | (?P<num>-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)
+    | (?P<lit>true|false|null)
+''', re.VERBOSE)
+
+class _JsonNode:
+    __slots__ = ('start', 'end', 'kind', 'path', 'members')
+    # kind: 'object' | 'array' | 'scalar'
+    # members: object -> [(key_start, key_end, value_node)]; array -> [value_node]
+    def __init__(self, start, kind, path):
+        self.start = start; self.end = start
+        self.kind = kind; self.path = path; self.members = None
+
+def _json_tokenize(text):
+    """Return [(kind, text, start, end)] or None if `text` isn't well-formed."""
+    toks = []; i = 0; n = len(text)
+    for m in _JSON_TOK_RE.finditer(text):
+        if m.start() != i: return None        # gap = unexpected character
+        i = m.end()
+        if m.lastgroup is None: continue       # whitespace
+        toks.append((m.lastgroup, m.group(), m.start(), m.end()))
+    return toks if i == n else None
+
+def _json_parse(text):
+    """Parse `text` into a span-annotated _JsonNode tree, or None if invalid."""
+    toks = _json_tokenize(text)
+    if toks is None: return None
+    pos = 0
+    def parse_value(path):
+        nonlocal pos
+        if pos >= len(toks): raise ValueError
+        kind, txt, s, e = toks[pos]
+        if kind == 'punct' and txt == '{':
+            node = _JsonNode(s, 'object', path); node.members = []; pos += 1
+            if pos < len(toks) and toks[pos][1] == '}':
+                node.end = toks[pos][3]; pos += 1; return node
+            while True:
+                if pos >= len(toks) or toks[pos][0] != 'str': raise ValueError
+                ks, ke = toks[pos][2], toks[pos][3]; key = _json.loads(toks[pos][1]); pos += 1
+                if pos >= len(toks) or toks[pos][1] != ':': raise ValueError
+                pos += 1
+                child = parse_value(path + [key])
+                node.members.append((ks, ke, child))
+                if pos < len(toks) and toks[pos][1] == ',': pos += 1; continue
+                if pos < len(toks) and toks[pos][1] == '}':
+                    node.end = toks[pos][3]; pos += 1; return node
+                raise ValueError
+        if kind == 'punct' and txt == '[':
+            node = _JsonNode(s, 'array', path); node.members = []; pos += 1
+            if pos < len(toks) and toks[pos][1] == ']':
+                node.end = toks[pos][3]; pos += 1; return node
+            idx = 0
+            while True:
+                node.members.append(parse_value(path + [idx])); idx += 1
+                if pos < len(toks) and toks[pos][1] == ',': pos += 1; continue
+                if pos < len(toks) and toks[pos][1] == ']':
+                    node.end = toks[pos][3]; pos += 1; return node
+                raise ValueError
+        if kind in ('str', 'num', 'lit'):
+            node = _JsonNode(s, 'scalar', path); node.end = e; pos += 1; return node
+        raise ValueError
+    try:
+        root = parse_value([])
+        return root if pos == len(toks) else None
+    except (ValueError, IndexError):
+        return None
+
+def _json_node_at(node, off):
+    """Smallest value node whose span contains `off`. Hovering a key → its value."""
+    if node is None: return None
+    if node.kind == 'object':
+        for ks, ke, child in node.members:
+            if ks <= off <= ke: return child                  # on the key
+            if child.start <= off <= child.end: return _json_node_at(child, off)
+    elif node.kind == 'array':
+        for child in node.members:
+            if child.start <= off <= child.end: return _json_node_at(child, off)
+    return node
+
+def _json_path_str(path):
+    s = '$'
+    for p in path:
+        if isinstance(p, int): s += f'[{p}]'
+        elif re.match(r'^[A-Za-z_]\w*$', p): s += '.' + p
+        else: s += '[' + _json.dumps(p) + ']'
+    return s
+
+_json_cache: dict = {}
+def _json_parse_cached(buf):
+    key = (id(buf), buf._gen)
+    if key not in _json_cache:
+        for k in [k for k in _json_cache if k[0] == id(buf)]: del _json_cache[k]
+        if len(_json_cache) > 8: _json_cache.clear()
+        _json_cache[key] = _json_parse('\n'.join(buf.lines))
+    return _json_cache[key]
+
 # ── Editor ───────────────────────────────────────────────────────────────────
 
 class Editor:
@@ -1289,6 +1485,9 @@ class Editor:
         self._prev_cursor = None
         self.ex_search_query  = ''
         self.ex_searching     = False
+
+        # JSON side-preview: (source_pane, preview_pane) or None
+        self._json_preview = None
 
         # Jump stack + picker state
         self._jump_stack    = []   # list of (row, col) for Ctrl-O
@@ -1387,6 +1586,7 @@ class Editor:
         if self.mode == Mode.PICKER:
             self._draw_picker(); return
         self._pending_sixels = []
+        if self._json_preview: self._update_json_preview()
         self.stdscr.erase()
 
         avail_h = self.height - 2
@@ -1461,11 +1661,13 @@ class Editor:
 
         is_md = _is_markdown(pane.buf.filename)
         is_nb = _is_notebook(pane.buf.filename)
-        is_diff = not (is_md or is_nb) and _is_diff(pane.buf)
+        is_csv = not (is_md or is_nb) and _is_csv(pane.buf.filename)
+        is_diff = not (is_md or is_nb or is_csv) and _is_diff(pane.buf)
         in_insert = is_active and self.mode == Mode.INSERT
         md_table = (_md_highlight(pane.buf) if is_md else None)
+        csv_table = (_csv_highlight(pane.buf) if is_csv else None)
         img_map  = (_md_images(pane.buf) if is_md else {})
-        hl_table = (None if is_md or is_nb else
+        hl_table = (None if is_md or is_nb or is_csv else
                     _diff_highlight(pane.buf) if is_diff else
                     _pg_highlight(pane.buf) if _detect_lang(pane.buf.filename) else None)
         _nb_clist = _nb_cells(pane.buf) if is_nb else []
@@ -1558,6 +1760,15 @@ class Editor:
                     raw = show_raw_cur or br in vis_rows
                     display, hl_row = (line, []) if raw else (
                         md_table[br] if br < len(md_table) else (line, []))
+                elif csv_table:
+                    # Grid stays rendered under the cursor in normal mode (the
+                    # cursor is remapped to the rendered cell in _place_cursor);
+                    # only insert mode / visual selection drop back to raw text.
+                    is_cur = is_active and br == pane.cursor.row
+                    show_raw_cur = is_cur and (in_insert or line.strip() == '')
+                    raw = show_raw_cur or br in vis_rows
+                    display, hl_row = (line, []) if raw else (
+                        csv_table[br] if br < len(csv_table) else (line, []))
                 else:
                     display = line
                     hl_row = (hl_table[br] if hl_table and br < len(hl_table) else [])
@@ -1636,8 +1847,7 @@ class Editor:
             scr_col += len(seg); i = j
 
     def _draw_statusbar(self):
-        _tbl_nm = (self.mode == Mode.NORMAL and
-                   _is_table_row(self.buf.get_line(self.cursor.row)))
+        _tbl_nm = (self.mode == Mode.NORMAL and self._on_cell_row())
         _nb_nav = (self.mode == Mode.NORMAL and _is_notebook(self.buf.filename) and
                    self.buf.get_line(self.cursor.row).startswith('# %% '))
         if _nb_nav:
@@ -1672,6 +1882,38 @@ class Editor:
         bar2 = (ml+cnt).ljust(self.width-1)
         self._as(self.height-2, 0, bar2[:self.width-1], curses.color_pair(1))
 
+    def _display_col(self, p):
+        """Cursor column in rendered-display coords.
+
+        For markdown/csv grids the on-screen line is box-drawing with cells
+        padded to equal widths, so a raw buffer column (which can be huge for a
+        long JSON cell) must be mapped to the much smaller grid column.  Both the
+        cursor placement and the horizontal-scroll math must use this, or they
+        disagree and the grid scrolls off-screen.
+        """
+        col = p.cursor.col
+        # The grid renders in every mode except insert / visual (where the
+        # cursor row drops to raw text), so remap in normal/command/search too —
+        # otherwise pressing ':' would let left_col run away and blank the grid.
+        if self.mode in (Mode.INSERT, Mode.VISUAL, Mode.VISUAL_LINE):
+            return col
+        raw = p.buf.get_line(p.cursor.row)
+        vis_line = info = None
+        if _is_markdown(p.buf.filename) and _is_table_row(raw):
+            md = _md_highlight(p.buf)
+            if p.cursor.row < len(md):
+                vis_line = md[p.cursor.row][0]; info = _table_cell_at(raw, col)
+        elif _is_csv(p.buf.filename) and raw.strip() != '':
+            cv = _csv_highlight(p.buf)
+            if p.cursor.row < len(cv):
+                vis_line = cv[p.cursor.row][0]
+                info = _csv_cell_at(raw, col, _csv_delim(p.buf.filename))
+        if vis_line is not None and info is not None:
+            pipes = [i for i, c in enumerate(vis_line) if c == '│']
+            if info[0] + 1 < len(pipes):
+                return pipes[info[0]] + 2  # land after '│ '
+        return col
+
     def _place_cursor(self):
         if self.mode in (Mode.COMMAND, Mode.SEARCH):
             try: self.stdscr.move(self.height-1, min(len(self.cmd_line), self.width-1))
@@ -1680,21 +1922,7 @@ class Editor:
         p = self._pane
         lnw = self._pane_lnw(p)
         sy  = p.y + self._cursor_visual_offset(p)
-        col = p.cursor.col
-        # TABLE mode: cursor.col is a buffer col, but the screen shows rendered
-        # box-drawing where cells are padded to equal widths.  Map to visual col.
-        if (self.mode == Mode.NORMAL and _is_markdown(p.buf.filename)):
-            raw = p.buf.get_line(p.cursor.row)
-            if _is_table_row(raw):
-                md = _md_highlight(p.buf)
-                if p.cursor.row < len(md):
-                    vis_line, _ = md[p.cursor.row]
-                    info = _table_cell_at(raw, col)
-                    if info:
-                        pipes = [i for i, c in enumerate(vis_line) if c == '│']
-                        ci = info[0]
-                        if ci + 1 < len(pipes):
-                            col = pipes[ci] + 2  # land after '│ '
+        col = self._display_col(p)
         # Notebook separator: cursor sits at left edge of the bar
         if _is_notebook(p.buf.filename) and p.buf.get_line(p.cursor.row).startswith('# %% '):
             try: self.stdscr.move(max(p.y, min(sy, p.y+p.height-1)), p.x)
@@ -1772,8 +2000,11 @@ class Editor:
         if p.wrap:
             p.left_col = 0
         else:
-            if p.cursor.col < p.left_col: p.left_col = max(0, p.cursor.col-5)
-            elif p.cursor.col >= p.left_col + tw: p.left_col = p.cursor.col - tw + 6
+            # Use display coords so a long raw cell (e.g. a big JSON value in a
+            # csv column) doesn't scroll the aligned grid off-screen.
+            ccol = self._display_col(p)
+            if ccol < p.left_col: p.left_col = max(0, ccol-5)
+            elif ccol >= p.left_col + tw: p.left_col = ccol - tw + 6
 
     def _move(self, dr, dc):
         p = self._pane
@@ -1788,11 +2019,39 @@ class Editor:
             p.cursor.col = max(0, min(p.cursor.col+dc, mc))
             p.cursor.col_want = p.cursor.col
 
+    # ── Cell geometry dispatch (markdown tables ‖ csv/tsv grids) ───────────────
+    # The cell-navigation operators below are shared between markdown pipe tables
+    # and csv/tsv files; these helpers pick the right delimiter geometry so the
+    # same h/j/k/l/Tab bindings drive both — vim motions over a spreadsheet grid.
+
+    def _cells_at_row(self, row):
+        line = self.buf.get_line(row)
+        if _is_csv(self.buf.filename):
+            return [] if line.strip() == '' else _csv_cells(line, _csv_delim(self.buf.filename))
+        return _table_cells(line)
+
+    def _cell_at_in_row(self, row, col):
+        line = self.buf.get_line(row)
+        if _is_csv(self.buf.filename):
+            if line.strip() == '': return None
+            return _csv_cell_at(line, col, _csv_delim(self.buf.filename))
+        return _table_cell_at(line, col)
+
+    def _is_cell_sep_row(self, row):
+        # csv grids have no separator row; markdown tables do.
+        if _is_csv(self.buf.filename): return False
+        return bool(_TABLE_SEP_RE.match(self.buf.get_line(row)))
+
+    def _on_cell_row(self, row=None):
+        r = self.cursor.row if row is None else row
+        if _is_csv(self.buf.filename):
+            return self.buf.get_line(r).strip() != ''
+        return _is_table_row(self.buf.get_line(r))
+
     def _cell_next(self):
-        line = self.buf.get_line(self.cursor.row)
-        cells = _table_cells(line)
+        cells = self._cells_at_row(self.cursor.row)
         if not cells: return
-        info = _table_cell_at(line, self.cursor.col)
+        info = self._cell_at_in_row(self.cursor.row, self.cursor.col)
         idx = info[0] if info else -1
         if idx + 1 < len(cells):
             self.cursor.col = cells[idx + 1][0]
@@ -1800,14 +2059,13 @@ class Editor:
             nr = self.cursor.row + 1
             if nr < self.buf.line_count():
                 self.cursor.row = nr
-                c2 = _table_cells(self.buf.get_line(nr))
+                c2 = self._cells_at_row(nr)
                 if c2: self.cursor.col = c2[0][0]
 
     def _cell_prev(self):
-        line = self.buf.get_line(self.cursor.row)
-        cells = _table_cells(line)
+        cells = self._cells_at_row(self.cursor.row)
         if not cells: return
-        info = _table_cell_at(line, self.cursor.col)
+        info = self._cell_at_in_row(self.cursor.row, self.cursor.col)
         idx = info[0] if info else len(cells)
         if idx > 0:
             self.cursor.col = cells[idx - 1][0]
@@ -1815,18 +2073,16 @@ class Editor:
             nr = self.cursor.row - 1
             if nr >= 0:
                 self.cursor.row = nr
-                c2 = _table_cells(self.buf.get_line(nr))
+                c2 = self._cells_at_row(nr)
                 if c2: self.cursor.col = c2[-1][0]
 
     def _cell_down(self):
-        line = self.buf.get_line(self.cursor.row)
-        info = _table_cell_at(line, self.cursor.col)
+        info = self._cell_at_in_row(self.cursor.row, self.cursor.col)
         idx = info[0] if info else 0
         nr = self.cursor.row + 1
         while nr < self.buf.line_count():
-            nl = self.buf.get_line(nr)
-            if _TABLE_SEP_RE.match(nl): nr += 1; continue
-            c2 = _table_cells(nl)
+            if self._is_cell_sep_row(nr): nr += 1; continue
+            c2 = self._cells_at_row(nr)
             if c2:
                 self.cursor.row = nr
                 self.cursor.col = c2[min(idx, len(c2) - 1)][0]
@@ -1835,14 +2091,12 @@ class Editor:
         self._move(1, 0)
 
     def _cell_up(self):
-        line = self.buf.get_line(self.cursor.row)
-        info = _table_cell_at(line, self.cursor.col)
+        info = self._cell_at_in_row(self.cursor.row, self.cursor.col)
         idx = info[0] if info else 0
         nr = self.cursor.row - 1
         while nr >= 0:
-            nl = self.buf.get_line(nr)
-            if _TABLE_SEP_RE.match(nl): nr -= 1; continue
-            c2 = _table_cells(nl)
+            if self._is_cell_sep_row(nr): nr -= 1; continue
+            c2 = self._cells_at_row(nr)
             if c2:
                 self.cursor.row = nr
                 self.cursor.col = c2[min(idx, len(c2) - 1)][0]
@@ -2127,6 +2381,98 @@ class Editor:
         self._panes=[x for x in self._panes if x is not p]
         self._pane_i=min(self._pane_i, len(self._panes)-1)
 
+    # ── JSON side preview ──────────────────────────────────────────────────────
+    def _toggle_json_preview(self):
+        if self._json_preview:
+            _src, prev = self._json_preview
+            self._json_preview = None
+            if prev in self._panes and len(self._panes) > 1:
+                self._layout = _lc_close(self._layout, prev) or self._layout
+                self._panes = [x for x in self._panes if x is not prev]
+                self._pane_i = min(self._pane_i, len(self._panes) - 1)
+            self.status_msg = 'json preview off'
+            return
+        fn = self.buf.filename or ''
+        if not (fn.endswith('.json') or _is_csv(fn)):
+            self.status_msg = 'json preview needs a .json or .csv/.tsv buffer'; self.status_err = True; return
+        src = self._pane
+        prev_buf = Buffer(['']); prev_buf.filename = '[json-preview].json'
+        prev_pane = Pane(prev_buf)
+        prev_pane.wrap = True        # wrap long values so row ends aren't clipped
+        orig_i = self._pane_i
+        self._layout = _lc_split(self._layout, src, prev_pane, True)  # vertical split
+        self._panes.append(prev_pane)
+        self._pane_i = orig_i        # keep focus in the source buffer
+        self._json_preview = (src, prev_pane)
+        self.status_msg = ('json preview on — move over a cell' if _is_csv(fn)
+                           else 'json preview on — move the cursor over any value')
+
+    def _abs_offset(self, buf, row, col):
+        off = 0
+        for i in range(min(row, len(buf.lines))):
+            off += len(buf.lines[i]) + 1
+        return off + col
+
+    def _set_preview_lines(self, prev, lines):
+        if prev.buf.lines != lines:
+            prev.buf.lines = lines; prev.buf._gen += 1
+            prev.cursor.row = prev.cursor.col = 0; prev.top_row = 0
+
+    def _update_json_preview(self):
+        src, prev = self._json_preview
+        if src not in self._panes or prev not in self._panes:
+            self._json_preview = None; return
+        # While the preview pane itself is focused, leave it alone so the user
+        # can scroll/search it with normal vim bindings without it resetting.
+        if self._pane is prev:
+            return
+        buf = src.buf
+        if _is_csv(buf.filename):
+            self._update_json_preview_cell(src, prev); return
+        if not (buf.filename and buf.filename.endswith('.json')):
+            self._set_preview_lines(prev, ['// source is not a .json or .csv buffer']); return
+        root = _json_parse_cached(buf)
+        if root is None:
+            self._set_preview_lines(prev, ['// invalid JSON']); return
+        # Snap to the first meaningful char on the line so hovering anywhere on a
+        # row (including its leading indent) resolves to that row's value, not root.
+        ln = buf.get_line(src.cursor.row); col = min(src.cursor.col, len(ln))
+        snap = next((i for i in range(col, len(ln)) if ln[i] not in ' \t'), None)
+        if snap is None:
+            snap = next((i for i in range(col - 1, -1, -1) if ln[i] not in ' \t'), col)
+        off  = self._abs_offset(buf, src.cursor.row, snap)
+        node = _json_node_at(root, off) or root
+        raw  = '\n'.join(buf.lines)[node.start:node.end]
+        try:    pretty = _json.dumps(_json.loads(raw), indent=2, ensure_ascii=False)
+        except Exception: pretty = raw
+        self._set_preview_lines(prev, pretty.split('\n'))
+        if not self.status_msg:
+            self.status_msg = 'json  ' + _json_path_str(node.path)
+
+    def _update_json_preview_cell(self, src, prev):
+        """Preview the JSON content of the CSV/TSV cell under the cursor."""
+        buf   = src.buf
+        delim = _csv_delim(buf.filename)
+        raw   = buf.get_line(src.cursor.row)
+        cells = _csv_parse_line(raw, delim)
+        info  = _csv_cell_at(raw, src.cursor.col, delim)
+        ci    = info[0] if info else 0
+        hdr   = _csv_parse_line(buf.lines[0], delim) if buf.lines else []
+        name  = hdr[ci] if ci < len(hdr) else f'col {ci}'
+        text  = (cells[ci] if ci < len(cells) else '').strip()
+        if not text:
+            self._set_preview_lines(prev, ['// empty cell'])
+            if not self.status_msg: self.status_msg = f'json  {name}: (empty)'
+            return
+        try:
+            pretty = _json.dumps(_json.loads(text), indent=2, ensure_ascii=False)
+            self._set_preview_lines(prev, pretty.split('\n'))
+            if not self.status_msg: self.status_msg = f'json  {name}'
+        except Exception:
+            # Not JSON — still show the raw value so the pane is useful.
+            self._set_preview_lines(prev, ['// cell is not JSON', text])
+            if not self.status_msg: self.status_msg = f'json  {name}: not JSON'
+
     def _rotate_panes(self, delta=1):
         ordered = _lc_panes(self._layout)
         n = len(ordered)
@@ -2264,7 +2610,7 @@ class Editor:
         count=int(self.pending_count) if self.pending_count else 1
         self.pending_count=''
 
-        _on_tbl = _is_table_row(self.buf.get_line(self.cursor.row))
+        _on_tbl = self._on_cell_row()
         _on_nb  = _is_notebook(self.buf.filename)
         if   key in (curses.KEY_LEFT,)  or ch=='h':
             if _on_tbl: [self._cell_prev() for _ in range(count)]
@@ -2785,11 +3131,11 @@ class Editor:
             self.cursor.row+=1; self.cursor.col=len(ind)
             self.buf.set_line(self.cursor.row,ind+self.buf.get_line(self.cursor.row))
         elif key==9:
-            if _is_table_row(self.buf.get_line(self.cursor.row)): self._cell_next()
+            if self._on_cell_row(): self._cell_next()
             else:
                 for _ in range(4): self.buf.insert_char(self.cursor.row,self.cursor.col,' '); self.cursor.col+=1
         elif key==353:  # Shift-Tab
-            if _is_table_row(self.buf.get_line(self.cursor.row)): self._cell_prev()
+            if self._on_cell_row(): self._cell_prev()
         elif key==23:  # Ctrl-W delete word back
             line=self.buf.get_line(self.cursor.row); c=self.cursor.col
             while c>0 and line[c-1]==' ': c-=1
@@ -3557,6 +3903,7 @@ class Editor:
                     _apply_scheme(name)
                     self.status_msg=f'colorscheme: {name}'; self.status_err=False
         elif cmd in ('noh','nohlsearch'): self.search_pat=''
+        elif cmd in ('jpreview','jp','JsonPreview','jsonpreview'): self._toggle_json_preview()
         elif cmd in ('close','clo'): self._close_pane()
         elif cmd in ('close!','clo!'): self._close_pane(force=True)
         elif cmd=='only':
