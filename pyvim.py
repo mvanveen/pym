@@ -1496,6 +1496,9 @@ class Editor:
         self.picker_top     = 0
         self.picker_title   = ''
         self.picker_cb      = None  # if set, called with label on Enter instead of jumping
+        self.picker_live    = False # interactive type-to-filter picker (Ctrl-P)
+        self.picker_query   = ''    # current live-filter text
+        self.picker_source  = []    # full label list for live filtering
 
         # Follow mode (tail -f)
         self._follow         = follow
@@ -2788,6 +2791,8 @@ class Editor:
             if _is_notebook(self.buf.filename): self._nb_eval_cell()
             else: self._eval_region(self.cursor.row, self.cursor.row)
         elif key==15: self._jump_back()   # Ctrl-O
+        elif key==16:                  # Ctrl-P: fuzzy file finder
+            self._push_jump(); self._cmd_find('')
         elif key==23: self._ctrl_w()   # Ctrl-W
         elif key==26:                  # Ctrl-Z suspend
             import signal
@@ -2925,18 +2930,35 @@ class Editor:
 
     # ── Picker (multi-result navigation) ─────────────────────────────────────
 
-    def _open_picker(self, title, entries, cb=None):
+    def _open_picker(self, title, entries, cb=None, live=False, source=None):
         self.picker_title = title
         self.picker_entries = entries
         self.picker_sel = 0; self.picker_top = 0
         self.picker_cb = cb
+        self.picker_live = live          # interactive (type-to-filter) picker
+        self.picker_query = ''           # current filter text
+        self.picker_source = source or []  # full label list for live filtering
         self.mode = Mode.PICKER
+
+    def _picker_refilter(self):
+        """Rebuild picker_entries from picker_source using the current query."""
+        q = self.picker_query
+        labels = ([f for f in self.picker_source if self._fuzzy_match(q, f)]
+                  if q else self.picker_source)
+        self.picker_entries = [(f, 0, 0) for f in labels[:1000]]
+        self.picker_sel = 0; self.picker_top = 0
 
     def _draw_picker(self):
         self.stdscr.erase(); w = self.width
-        self._as(0, 0, f' {self.picker_title} '[:w-1].ljust(w-1), curses.color_pair(1)|curses.A_BOLD)
-        self._as(1, 0, '─'*(w-1), curses.A_DIM)
-        body_h = self.height - 4; n = len(self.picker_entries)
+        n = len(self.picker_entries)
+        if self.picker_live:
+            title = f' {self.picker_title} ({n}) '
+            self._as(0, 0, title[:w-1].ljust(w-1), curses.color_pair(1)|curses.A_BOLD)
+            self._as(1, 0, ('> '+self.picker_query)[:w-1].ljust(w-1), curses.A_BOLD)
+        else:
+            self._as(0, 0, f' {self.picker_title} '[:w-1].ljust(w-1), curses.color_pair(1)|curses.A_BOLD)
+            self._as(1, 0, '─'*(w-1), curses.A_DIM)
+        body_h = self.height - 4
         if self.picker_sel < self.picker_top: self.picker_top = self.picker_sel
         elif self.picker_sel >= self.picker_top+body_h: self.picker_top = self.picker_sel-body_h+1
         for i in range(body_h):
@@ -2946,7 +2968,9 @@ class Editor:
             display = ('  '+label)[:w-1].ljust(w-1)
             attr = (curses.color_pair(8)|curses.A_BOLD if idx == self.picker_sel else 0)
             self._as(2+i, 0, display, attr)
-        footer = ' j/k:move  Enter:jump  q/Esc:close  Ctrl-O:back '
+        footer = (' type:filter  ↑↓/Ctrl-N/P:move  Enter:open  Esc:close '
+                  if self.picker_live else
+                  ' j/k:move  Enter:jump  q/Esc:close  Ctrl-O:back ')
         self._as(self.height-2, 0, footer[:w-1].ljust(w-1), curses.color_pair(1))
         if self.status_msg:
             self._as(self.height-1, 0, self.status_msg[:w-1],
@@ -2954,15 +2978,18 @@ class Editor:
         self.stdscr.refresh()
 
     def _picker_key(self, key):
+        live = self.picker_live
         ch = chr(key) if 32<=key<=126 else None
         n = len(self.picker_entries)
-        if   key==curses.KEY_UP   or ch=='k': self.picker_sel = max(0, self.picker_sel-1)
-        elif key==curses.KEY_DOWN or ch=='j': self.picker_sel = min(n-1, self.picker_sel+1)
+        if   key==curses.KEY_UP   or key==16 or (not live and ch=='k'):
+            self.picker_sel = max(0, self.picker_sel-1)
+        elif key==curses.KEY_DOWN or key==14 or (not live and ch=='j'):
+            self.picker_sel = min(n-1, self.picker_sel+1)
         elif key==6  or key==curses.KEY_NPAGE: self.picker_sel=min(n-1,self.picker_sel+max(1,self.height-6))
-        elif key==2  or key==curses.KEY_PPAGE: self.picker_sel=max(0,self.picker_sel-max(1,self.height-6))
+        elif (key==2 and not live) or key==curses.KEY_PPAGE: self.picker_sel=max(0,self.picker_sel-max(1,self.height-6))
         elif key==curses.KEY_HOME: self.picker_sel = 0
         elif key==curses.KEY_END:  self.picker_sel = n-1
-        elif key in (10, 13) or key==curses.KEY_RIGHT:
+        elif key in (10, 13) or (key==curses.KEY_RIGHT and not live):
             if self.picker_entries:
                 label, row, col = self.picker_entries[self.picker_sel]
                 self.mode = Mode.NORMAL
@@ -2970,8 +2997,14 @@ class Editor:
                     cb = self.picker_cb; self.picker_cb = None; cb(label)
                 else:
                     self.cursor.row = row; self.cursor.col = col; self._clamp()
-        elif ch=='q' or key==27 or key==15:   # q / Esc / Ctrl-O
-            self.picker_cb = None; self.mode = Mode.NORMAL; self._jump_back()
+        elif key==27 or (not live and (ch=='q' or key==15)):   # Esc (always) / q / Ctrl-O
+            self.picker_cb = None; self.picker_live = False; self.mode = Mode.NORMAL; self._jump_back()
+        elif live and key in (curses.KEY_BACKSPACE, 127, 8):
+            self.picker_query = self.picker_query[:-1]; self._picker_refilter()
+        elif live and key==21:   # Ctrl-U: clear query
+            self.picker_query = ''; self._picker_refilter()
+        elif live and ch is not None:
+            self.picker_query += ch; self._picker_refilter()
 
     def _normal_g(self, count):
         k2=self.stdscr.getch(); ch2=chr(k2) if 32<=k2<=126 else None
@@ -3934,8 +3967,8 @@ class Editor:
         else:
             self.status_msg=f'E492: Not a command: {cmd}'; self.status_err=True
 
-    def _cmd_find(self, pattern):
-        """Fuzzy file finder — collects files via git ls-files (or os.walk) and opens picker."""
+    def _collect_project_files(self):
+        """Return (files, root): project files (git-tracked from repo top, else os.walk)."""
         import subprocess as _sp
         # Prefer git ls-files (tracked files only — no untracked noise)
         try:
@@ -3954,25 +3987,40 @@ class Editor:
                     files.append(os.path.relpath(os.path.join(dp, f), root))
         # Drop any path whose components include hidden dirs/files
         files = [f for f in files if not any(p.startswith('.') for p in f.replace('\\', '/').split('/'))]
-        # Filter by pattern (fuzzy: all chars appear in order, case-insensitive)
-        if pattern:
-            pl = pattern.lower()
-            def _match(p):
-                s = p.lower(); i = 0
-                for c in pl:
-                    i = s.find(c, i)
-                    if i < 0: return False
-                    i += 1
-                return True
-            files = [f for f in files if _match(f)]
-        files = sorted(files)[:1000]
+        return sorted(files), (root or os.getcwd())
+
+    @staticmethod
+    def _fuzzy_match(pattern, path):
+        """True if every char of pattern appears in path in order (case-insensitive)."""
+        s = path.lower(); i = 0
+        for c in pattern.lower():
+            i = s.find(c, i)
+            if i < 0: return False
+            i += 1
+        return True
+
+    def _cmd_find(self, pattern):
+        """Fuzzy file finder. With a pattern, filters and opens a static picker;
+        with none, opens an interactive Ctrl-P style picker that filters as you type."""
+        files, root = self._collect_project_files()
+        if not pattern:
+            self._open_file_picker(files, root); return
+        files = [f for f in files if self._fuzzy_match(pattern, f)][:1000]
         if not files:
             self.status_msg = f'No files matching {pattern!r}'; self.status_err = True; return
         entries = [(f, 0, 0) for f in files]
         _root = root
         def _open(label):
             self._load_file(os.path.join(_root, label))
-        self._open_picker(f'find: {pattern or "*"}', entries, cb=_open)
+        self._open_picker(f'find: {pattern}', entries, cb=_open)
+
+    def _open_file_picker(self, files, root):
+        """Open an interactive (live-filtering) file picker rooted at root."""
+        _root = root
+        def _open(label):
+            self._load_file(os.path.join(_root, label))
+        self._open_picker('Find file', [(f, 0, 0) for f in files], cb=_open,
+                          live=True, source=files)
 
     def _exec_sub(self, cmd):
         try:
